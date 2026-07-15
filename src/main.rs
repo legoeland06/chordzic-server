@@ -58,6 +58,8 @@ fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,1,2,9]{cc(c,ch,123,0)}}
 
 const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
 const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
+const HH_BEAT:u8=80; // vélocité HH sur les temps
+const HH_8TH:u8=65;  // vélocité HH sur les croches
 
 fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool){
     if!on_beat&&!on_eighth{return}
@@ -72,9 +74,9 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             2=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_KICK,50);}3=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_SNARE,55);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,35);}
         _=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_HH,65);}1=>{no(c,9,DRUM_SNARE,75);no(c,9,DRUM_HH,60);}
-            2=>{no(c,9,DRUM_KICK,80);no(c,9,DRUM_HH,65);}3=>{no(c,9,DRUM_SNARE,70);no(c,9,DRUM_HH,60);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,50);}
+            0=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_HH,HH_BEAT);}1=>{no(c,9,DRUM_SNARE,75);no(c,9,DRUM_HH,HH_BEAT);}
+            2=>{no(c,9,DRUM_KICK,80);no(c,9,DRUM_HH,HH_BEAT);}3=>{no(c,9,DRUM_SNARE,70);no(c,9,DRUM_HH,HH_BEAT);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,HH_8TH);}
     }
 }
 
@@ -91,6 +93,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
     rch(c);
     for&ch in&[0u8,1,2]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
     pc(c,0,51);pc(c,1,24);pc(c,2,50);
+    pc(c,9,1); // Standard Kit
+    std::thread::sleep(Duration::from_millis(2));
 
     for(i,e)in ev.iter().enumerate(){
         let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
@@ -124,12 +128,12 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
                 let beat=(elapsed_ms/bd_ms)as u64;
                 if last_b==u64::MAX||beat>last_b{
                     drum_hit(c,beat,pt,true,false);
-                    // Croche f64
-                    let beat_pos=elapsed_ms%bd_ms;
-                    if beat_pos>bd_ms/2.0-5.0&&beat_pos<bd_ms/2.0+5.0{
-                        drum_hit(c,beat,pt,false,true);
-                    }
                     last_b=beat;
+                }
+                // Croche: vérifiée à chaque tick, indépendamment du beat
+                let beat_pos=elapsed_ms%bd_ms;
+                if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
+                    drum_hit(c,beat,pt,false,true);
                 }
             }
 
