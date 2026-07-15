@@ -84,7 +84,7 @@ fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
     let mut v:Vec<u8>=vec![];for n in notes{if let Ok(m)=note_midi(n){v.push(m)}}if v.is_empty(){return}
     rch(c);
     for&ch in&[0u8,1,2]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
-    pc(c,0,51);pc(c,1,24);pc(c,2,50);
+    pc(c,0,51);pc(c,1,24);pc(c,2,33);
     for _ in 0..2{for&n in&v{std::thread::sleep(Duration::from_millis(240));if n<48{no(c,2,n,35)}else{no(c,0,n,15);no(c,1,n,15)}}}
     rch(c);println!("  notes: {v:?}");
 }
@@ -92,7 +92,7 @@ fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
 fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
     rch(c);
     for&ch in&[0u8,1,2]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
-    pc(c,0,51);pc(c,1,24);pc(c,2,50);
+    pc(c,0,51);pc(c,1,24);pc(c,2,33);
     pc(c,9,1); // Standard Kit
     std::thread::sleep(Duration::from_millis(2));
 
@@ -123,17 +123,20 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
             let ar=cfg.arpeggios.load(Ordering::Relaxed);
             let pt=cfg.pattern.load(Ordering::Relaxed);
 
-            // Batterie: beat basé sur elapsed f64
-            if dr{
-                let beat=(elapsed_ms/bd_ms)as u64;
+            // Batterie + basse sur chaque beat
+            let beat=(elapsed_ms/bd_ms)as u64;
+            if dr||ba{
                 if last_b==u64::MAX||beat>last_b{
-                    drum_hit(c,beat,pt,true,false);
+                    if dr{drum_hit(c,beat,pt,true,false);}
+                    if ba{no(c,2,root,40);if last_b!=u64::MAX{no(c,2,root,0)}}
                     last_b=beat;
                 }
-                // Croche: vérifiée à chaque tick, indépendamment du beat
-                let beat_pos=elapsed_ms%bd_ms;
-                if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
-                    drum_hit(c,beat,pt,false,true);
+                // Croche (batterie uniquement)
+                if dr{
+                    let beat_pos=elapsed_ms%bd_ms;
+                    if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
+                        drum_hit(c,beat,pt,false,true);
+                    }
                 }
             }
 
@@ -142,12 +145,6 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
             if ar&&!arp.is_empty(){
                 if idx>0{let p=arp[((idx-1)%arp.len()as u64)as usize];no(c,0,p,0);no(c,1,p,0)}
                 no(c,0,arp[tick as usize],15);no(c,1,arp[tick as usize],15);
-            }
-
-            // Basse
-            if ba&&idx%4==0{
-                if idx>=4{no(c,2,root,0)}
-                no(c,2,root,40);
             }
 
             idx+=1;
