@@ -56,22 +56,25 @@ fn pc(c:&mut MidiOutputConnection,ch:u8,v:u8){snd(c,&[0xC0|ch,v])}
 fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v])}
 fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,1,2,9]{cc(c,ch,123,0)}}
 
+const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
+const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
+
 fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool){
     if!on_beat&&!on_eighth{return}
     let b=beat%4;
     match pat{
         PAT_REGGAE=>if on_beat{match b{
-            0=>{no(c,9,42,60);}1=>{no(c,9,37,70);no(c,9,42,60);}
-            2=>{no(c,9,36,85);no(c,9,42,65);}3=>{no(c,9,37,70);no(c,9,42,60);}_=>{}
-        }}else if on_eighth{no(c,9,42,55);}
+            0=>{no(c,9,DRUM_HH,60);}1=>{no(c,9,DRUM_RIM,70);no(c,9,DRUM_HH,60);}
+            2=>{no(c,9,DRUM_KICK,85);no(c,9,DRUM_HH,65);}3=>{no(c,9,DRUM_RIM,70);no(c,9,DRUM_HH,60);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,55);}
         PAT_JAZZ=>if on_beat{match b{
-            0=>{no(c,9,51,60);no(c,9,36,50);}1=>{no(c,9,51,60);no(c,9,38,55);}
-            2=>{no(c,9,51,60);no(c,9,36,50);}3=>{no(c,9,51,60);no(c,9,38,55);}_=>{}
-        }}else if on_eighth{no(c,9,42,35);}
+            0=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_KICK,50);}1=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_SNARE,55);}
+            2=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_KICK,50);}3=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_SNARE,55);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,35);}
         _=>if on_beat{match b{
-            0=>{no(c,9,36,90);no(c,9,42,65);}1=>{no(c,9,38,75);no(c,9,42,60);}
-            2=>{no(c,9,36,80);no(c,9,42,65);}3=>{no(c,9,38,70);no(c,9,42,60);}_=>{}
-        }}else if on_eighth{no(c,9,42,50);}
+            0=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_HH,65);}1=>{no(c,9,DRUM_SNARE,75);no(c,9,DRUM_HH,60);}
+            2=>{no(c,9,DRUM_KICK,80);no(c,9,DRUM_HH,65);}3=>{no(c,9,DRUM_SNARE,70);no(c,9,DRUM_HH,60);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,50);}
     }
 }
 
@@ -97,29 +100,37 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
         let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
         let dur=(60_000.0/cfg.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
         let start=std::time::Instant::now();
-        let delay=(60_000.0/cfg.tempo.load(Ordering::Relaxed).max(20)as f64/4.0).max(30.0)as u64;
         let mut idx=0u64;
         let mut last_b=u64::MAX;
 
         while(start.elapsed().as_millis()as u64)<dur&&!cfg.stop.load(Ordering::Relaxed){
-            let target=start+Duration::from_millis(idx*delay);
+            let tempo_f=cfg.tempo.load(Ordering::Relaxed).max(20)as f64;
+            let bd_ms=60_000.0/tempo_f;
+            let delay_ms=(bd_ms/4.0).max(30.0);
+
+            // Timer compensé: target absolu basé sur idx (f64)
+            let target=start+Duration::from_secs_f64(idx as f64*delay_ms/1000.0);
             let now=std::time::Instant::now();
             if target>now{std::thread::sleep(target-now)}
 
-            let elapsed=start.elapsed().as_millis()as u64;
-            let bd=60_000.0/cfg.tempo.load(Ordering::Relaxed).max(20)as f64;
-            let beat=(elapsed as f64/bd)as u64;
+            let elapsed_ms=start.elapsed().as_secs_f64()*1000.0;
             let dr=cfg.drums.load(Ordering::Relaxed);
             let ba=cfg.bass.load(Ordering::Relaxed);
             let ar=cfg.arpeggios.load(Ordering::Relaxed);
             let pt=cfg.pattern.load(Ordering::Relaxed);
 
-            // Batterie sur chaque beat
-            if dr&&beat!=last_b{
-                let eighth=(elapsed as f64%bd>bd/2.0-5.0)&&(elapsed as f64%bd<bd/2.0+5.0);
-                drum_hit(c,beat,pt,true,false);
-                if eighth{drum_hit(c,beat,pt,false,true)}
-                last_b=beat;
+            // Batterie: beat basé sur elapsed f64
+            if dr{
+                let beat=(elapsed_ms/bd_ms)as u64;
+                if last_b==u64::MAX||beat>last_b{
+                    drum_hit(c,beat,pt,true,false);
+                    // Croche f64
+                    let beat_pos=elapsed_ms%bd_ms;
+                    if beat_pos>bd_ms/2.0-5.0&&beat_pos<bd_ms/2.0+5.0{
+                        drum_hit(c,beat,pt,false,true);
+                    }
+                    last_b=beat;
+                }
             }
 
             // Arpège
@@ -129,7 +140,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
                 no(c,0,arp[tick as usize],15);no(c,1,arp[tick as usize],15);
             }
 
-            // Basse tous les 4 ticks
+            // Basse
             if ba&&idx%4==0{
                 if idx>=4{no(c,2,root,0)}
                 no(c,2,root,40);
