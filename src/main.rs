@@ -99,7 +99,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],cfg:&Live){
     for(i,e)in ev.iter().enumerate(){
         let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
         if m.is_empty(){continue}
-        if i>0{rch(c)}
+        if i>0{rch(c);cc(c,9,120,0)} // All Sound Off sur drums
 
         let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
         let dur=(60_000.0/cfg.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
