@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Modèle de Monde Interactif - Gemini</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    <style>
+        body { margin: 0; background: #1f0000; overflow: hidden; color: #4facfe; font-family: 'Segoe UI', sans-serif; }
+        canvas { display: block; }
+        .ui { position: absolute; top: 20px; left: 20px; pointer-events: none; }
+        .instructions { position: absolute; bottom: 20px; left: 20px; font-size: 0.8em; opacity: 0.6; }
+    </style>
+</head>
+<body>
+    <div class="ui">
+        <h1><span style="color: rgb(0, 255, 0);">432 Hz</span> Architecture Fractale v.2026</h1>
+        <p>Traitement : <strong>Harmonies Musicales</strong></p>
+    </div>
+    <div class="instructions">Glissez les nœuds pour perturber le réseau. CTRL + Molette pour zoomer.</div>
+    <canvas id="network"></canvas>
+
+<script>
+const canvas = document.getElementById('network');
+const ctx = canvas.getContext('2d');
+let coeff=1;
+let width, height;
+let selectedNode;
+let nbOfChords = 2; // Nombre d'accords à afficher dans le sous-graphe
+let nbOfLoops = 1; // Nombre de boucles d'expansion du sous-graphe
+const noteToMidi = {
+        'C': 0, 'C#': 1, 'D': 2, 'D#': 3, 'E': 4, 'F': 5, 'F#': 6, 'G': 7, 'G#': 8, 'A': 9, 'A#': 10, 'B': 11
+    };
+
+const tonalities = {
+        10: "C",
+        11: "G",
+        12: "D",
+        13: "A",
+        14: "E",
+        15: "B",
+        16: "F#",
+        17: "C#",
+        18: "G#",
+        19: "D#",
+        20: "A#",
+        21: "F"
+    };
+    
+// Simulation de données : plusieurs couches d'abstraction
+const musicNodes = [
+    // --- TONALITÉ DE DO (C) - Groupe 10
+    { id: "C_Ion", group: 10, r: 12, label: "CM7", notes: ["C","E","G","B"], mode: "Ionien" },
+    { id: "D_Dor", group: 10, r: 8, label: "Dm7", notes: ["D","F","A","C"], mode: "Dorien" },
+    { id: "E_Phr", group: 10, r: 7, label: "Em7", notes: ["E","G","B","D"], mode: "Phrygien" },
+    { id: "F_Lyd", group: 10, r: 9, label: "FM7", notes: ["F","A","C","E"], mode: "Lydien" },
+    { id: "G_Mix", group: 10, r: 10, label: "G7", notes: ["G","B","D","F"], mode: "Mixolydien" },
+    { id: "A_Aeo", group: 10, r: 11, label: "Am7", notes: ["A","C","E","G"], mode: "Eolien" },
+    { id: "B_Loc", group: 10, r: 5, label: "Bm7b5", notes: ["B","D","F","A"], mode: "Locrien" },
+
+    // --- TONALITÉ DE SOL (G) - Groupe 11
+    { id: "G_Ion", group: 11, r: 12, label: "GM7", notes: ["G","B","D","F#"], mode: "Ionien" },
+    { id: "A_Dor", group: 11, r: 8, label: "Am7", notes: ["A","C","E","G"], mode: "Dorien" },
+    { id: "B_Phr", group: 11, r: 7, label: "Bm7", notes: ["B","D","F#|Gb","A"], mode: "Phrygien" },
+    { id: "C_Lyd", group: 11, r: 9, label: "CM7", notes: ["C","E","G","B"], mode: "Lydien" },
+    { id: "D_Mix", group: 11, r: 10, label: "D7", notes: ["D","F#|Gb","A","C"], mode: "Mixolydien" },
+    { id: "E_Aeo", group: 11, r: 11, label: "Em7", notes: ["E","G","B","D"], mode: "Eolien" },
+    { id: "Fs_Loc", group: 11, r: 5, label: "F#m7b5", notes: ["F#|Gb","A","C","E"], mode: "Locrien" },
+
+    // --- TONALITÉ DE RÉ (D) - Groupe 12
+    { id: "D_Ion", group: 12, r: 12, label: "DM7", notes: ["D","F#|Gb","A","C#|Db"], mode: "Ionien" },
+    { id: "E_Dor", group: 12, r: 8, label: "Em7", notes: ["E","G","B","D"], mode: "Dorien" },
+    { id: "Fs_Phr", group: 12, r: 7, label: "F#m7", notes: ["F#|Gb","A","C#|Db","E"], mode: "Phrygien" },
+    { id: "G_Lyd", group: 12, r: 9, label: "GM7", notes: ["G","B","D","F#|Gb"], mode: "Lydien" },
+    { id: "A_Mix", group: 12, r: 10, label: "A7", notes: ["A","C#|Db","E","G"], mode: "Mixolydien" },
+    { id: "B_Aeo", group: 12, r: 11, label: "Bm7", notes: ["B","D","F#|Gb","A"], mode: "Eolien" },
+    { id: "Cs_Loc", group: 12, r: 5, label: "C#m7b5", notes: ["C#|Db","E","G","B"], mode: "Locrien" },
+
+    // --- TONALITÉ DE LA (A) - Groupe 13
+    { id: "A_Ion", group: 13, r: 12, label: "AM7", notes: ["A","C#|Db","E","G#"], mode: "Ionien" },
+    { id: "B_Dor", group: 13, r: 8, label: "Bm7", notes: ["B","D","F#|Gb","A"], mode: "Dorien" },
+    { id: "Cs_Phr", group: 13, r: 7, label: "C#m7", notes: ["C#|Db","E","G#|Ab","B"], mode: "Phrygien" },
+    { id: "D_Lyd", group: 13, r: 9, label: "DM7", notes: ["D","F#|Gb","A","C#|Db"], mode: "Lydien" },
+    { id: "E_Mix", group: 13, r: 10, label: "E7", notes: ["E","G#|Ab","B","D"], mode: "Mixolydien" },
+    { id: "Fs_Aeo", group: 13, r: 11, label: "F#m7", notes: ["F#|Gb","A","C#|Db","E"], mode: "Eolien" },
+    { id: "Gs_Loc", group: 13, r: 5, label: "G#m7b5", notes: ["G#|Ab","B","D","F#|Gb"], mode: "Locrien" },
+
+    // --- TONALITÉ DE MI (E) - Groupe 14
+    { id: "E_Ion", group: 14, r: 12, label: "EM7", notes: ["E","G#|Ab","B","D#|Eb"], mode: "Ionien" },
+    { id: "Fs_Dor", group: 14, r: 8, label: "F#m7", notes: ["F#|Gb","A","C#|Db","E"], mode: "Dorien" },
+    { id: "Gs_Phr", group: 14, r: 7, label: "G#m7", notes: ["G#|Ab","B","D#|Eb","F#|Gb"], mode:"Phrygien" },
+    { id:"A_Lyd", group : 14, r :9 , label: "AM7", notes: ["A","C#|Db","E","G#|Ab"], mode:"Lydien"},
+    { id: "B_Mix", group: 14, r: 10, label: "B7", notes: ["B","D#|Eb","F#|Gb","A"], mode: "Mixolydien" },
+    { id: "Cs_Aeo", group: 14, r: 11, label: "C#m7", notes: ["C#|Db","E","G#|Ab","B"], mode: "Eolien" },
+    { id: "Ds_Loc", group: 14, r: 5, label: "D#m7b5", notes: ["D#|Eb","F#|Gb","A","C#|Db"], mode: "Locrien" },
+
+    // --- TONALITÉ DE SI (B) - Groupe 15
+    { id: "B_Ion", group: 15, r: 12, label: "BM7", notes: ["B","D#|Eb","F#|Gb","A#|Bb"], mode: "Ionien" },
+    { id: "Cs_Dor", group: 15, r: 8, label: "C#m7", notes: ["C#|Db","E","G#|Ab","B"], mode: "Dorien" },
+    { id: "Ds_Phr", group: 15, r: 7, label: "D#m7", notes: ["D#|Eb","F#|Gb","A#|Bb","C#|Db"], mode:"Phrygien"},
+    { id:"E_Lyd", group : 15, r :9 , label: "EM7", notes: ["E","G#|Ab","B","D#|Eb"], mode:"Lydien"},
+    { id:"Fs_Mix", group : 15, r :10 , label: "F#7", notes: ["F#|Gb","A#|Bb","C#|Db","E"], mode:"Mixolydien"},
+    { id: "Gs_Aeo", group: 15, r: 11, label: "G#m7", notes: ["G#|Ab","B","D#|Eb","F#|Gb"], mode: "Eolien" },
+    { id: "As_Loc", group: 15, r: 5, label: "A#m7b5", notes: ["A#|Bb","C#|Db","E","G#|Ab"], mode: "Locrien" },
+
+    // --- TONALITÉ DE FA# (F#) - Groupe 16
+    { id: "Fs_Ion", group: 16, r: 12, label: "F#M7", notes: ["F#|Gb","A#|Bb","C#|Db","F"], mode: "Ionien" },
+    { id: "Gs_Dor", group: 16, r: 8, label: "G#m7", notes: ["G#|Ab","B","D#|Eb","F#|Gb"], mode: "Dorien" },
+    { id: "As_Phr", group: 16, r: 7, label: "A#m7", notes: ["A#|Bb","C#|Db","F","G#|Ab"], mode: "Phrygien" },
+    { id: "B_Lyd", group: 16, r: 9, label: "BM7", notes: ["B","D#|Eb","F#|Gb","A#|Bb"], mode:"Lydien"},
+    { id: "Cs_Mix", group: 16, r: 10, label: "C#7", notes: ["C#|Db","F","G#|Ab","B"], mode:"Mixolydien"},
+    { id:"Ds_Aeo", group : 16, r :11 , label: "D#m7", notes: ["D#|Eb","F#|Gb","A#|Bb","C#|Db"], mode:"Eolien"},
+    { id: "Es_Loc", group: 16, r: 5, label: "Fm7b5", notes: ["F","G#|Ab","B","D#|Eb"], mode: "Locrien" },
+
+    // --- TONALITÉ DE RÉb (Db) - Groupe 17
+    { id: "Db_Ion", group: 17, r: 12, label: "C#M7", notes: ["C#|Db","F","G#|Ab","C"], mode: "Ionien" },
+    { id: "Eb_Dor", group: 17, r: 8, label: "D#m7", notes: ["D#|Eb","F#|Gb","A#|Bb","C#|Db"], mode: "Dorien" },
+    { id: "F_Phr", group: 17, r: 7, label: "Fm7", notes: ["F","G#|Ab","C","D#|Eb"], mode: "Phrygien" },
+    { id: "Gb_Lyd", group: 17, r: 9, label: "F#M7", notes: ["F#|Gb","A#|Bb","C#|Db","F"], mode:"Lydien"},
+    { id:"Ab_Mix", group : 17, r :10 , label: "G#7", notes: ["G#|Ab","C","D#|Eb","F#|Gb",], mode:"Mixolydien"},
+    { id:"Bb_Aeo", group : 17, r :11 , label: "A#m7", notes: ["A#|Bb","C#|Db","F","G#|Ab"], mode:"Eolien"},
+    { id:"C_Loc", group : 17, r :5 , label: "Cm7b5", notes: ["C","D#|Eb|","F#|Gb","A#|Bb"], mode:"Locrien" },
+
+    // --- TONALITÉ DE LAb (Ab) - Groupe 18
+    { id: "Ab_Ion", group: 18, r: 12, label: "G#M7", notes: ["G#|Ab","C","D#|Eb","G"], mode: "Ionien" },
+    { id: "Bb_Dor", group: 18, r: 8, label: "A#m7", notes: ["A#|Bb","C#|Db","F","G#|Ab"], mode: "Dorien" },
+    { id: "C_Phr", group: 18, r: 7, label: "Cm7", notes: ["C","D#|Eb","G","A#|Bb"], mode: "Phrygien" },
+    { id: "Db_Lyd", group: 18, r: 9, label: "C#M7", notes: ["C#|Db","F","G#|Ab","C"], mode:"Lydien"},
+    { id: "Eb_Mix", group: 18, r: 10, label: "D#7", notes: ["D#|Eb","G","A#|Bb","C#|Db"], mode:"Mixolydien"},
+    { id: "F_Aeo", group: 18, r: 11, label: "Fm7", notes: ["F","G#|Ab","C","D#|Eb"], mode: "Eolien" },
+    { id: "G_Loc", group: 18, r: 5, label: "Gm7b5", notes: ["G","A#|Bb","C#|Db","F"], mode: "Locrien" },
+
+    // --- TONALITÉ DE MIb (Eb) - Groupe 19
+    { id: "Eb_Ion", group: 19, r: 12, label: "D#M7", notes: ["D#|Eb","G","A#|Bb","D"], mode: "Ionien" },
+    { id: "F_Dor", group: 19, r: 8, label: "Fm7", notes: ["F","G#|Ab","C","D#|Eb"], mode: "Dorien" },
+    { id: "G_Phr", group: 19, r: 7, label: "Gm7", notes: ["G","A#|Bb","D","F"], mode:"Phrygien"},
+    { id:"Ab_Lyd", group : 19, r :9 , label: "G#M7", notes: ["G#|Ab","C","D#|Eb","G"], mode:"Lydien"},
+    { id: "Bb_Mix", group: 19, r: 10, label: "A#7", notes: ["A#|Bb","D","F","G#|Ab"], mode: "Mixolydien" },
+    { id: "C_Aeo", group: 19, r: 11, label: "Cm7", notes: ["C","D#|Eb","G","A#|Bb"], mode: "Eolien" },
+    { id: "D_Loc", group: 19, r: 5, label: "Dm7b5", notes: ["D","F","G#|Ab","C"], mode: "Locrien" },
+
+    // --- TONALITÉ DE SIb (Bb) - Groupe 20
+    { id: "Bb_Ion", group: 20, r: 12, label: "A#M7", notes: ["A#|Bb","D","F","A"], mode: "Ionien" },
+    { id: "C_Dor", group: 20, r: 8, label: "Cm7", notes: ["C","D#|Eb","G","A#|Bb"], mode: "Dorien" },
+    { id: "D_Phr", group: 20, r: 7, label: "Dm7", notes: ["D","F","A","C"], mode: "Phrygien" },
+    { id: "Eb_Lyd", group: 20, r: 9, label: "D#M7", notes: ["D#|Eb","G","A#|Bb","D"], mode:"Lydien"},
+    { id:"F_Mix", group : 20, r :10 , label: "F7", notes: ["F","A","C","D#|Eb"], mode:"Mixolydien"},
+    { id:"G_Aeo", group : 20, r :11 , label: "Gm7", notes: ["G","A#|Bb","D","F"], mode:"Eolien"},
+    { id:"A_Loc", group : 20, r :5 , label: "Am7b5", notes: ["A","C","D#|Eb","G",], mode:"Locrien"},
+
+    // --- TONALITÉ DE FA (F) - Groupe 21
+    { id: "F_Ion", group: 21, r: 12, label: "FM7", notes: ["F","A","C","E"], mode: "Ionien" },
+    { id: "G_Dor", group: 21, r: 8, label: "Gm7", notes: ["G","A#|Bb","D","F"], mode: "Dorien" },
+    { id: "A_Phr", group: 21, r: 7, label: "Am7", notes: ["A","C","E","G"], mode: "Phrygien" },
+    { id: "Bb_Lyd", group: 21, r: 9, label: "A#M7", notes: ["A#|Bb","D","F","A"], mode: "Lydien" },
+    { id: "C_Mix", group: 21, r: 10, label: "C7", notes: ["C","E","G","A#|Bb"], mode: "Mixolydien" },
+    { id: "D_Aeo", group: 21, r: 11, label: "Dm7", notes: ["D","F","A","C"], mode: "Eolien" },
+    { id: "E_Loc", group: 21, r: 5, label: "Em7b5", notes: ["E","G","A#|Bb","D"], mode: "Locrien" }
+];
+
+const nodes_finales = musicNodes.map(node => {
+    return {  ...node, notes: node.notes.map(note => note.split('|')[0]) };
+});
+
+
+// Nettoyage des doublons de nœuds (ex: CM7 et CM7 qui sont en réalité 
+// le même accord mais dans des modes différents) en fusionnant leurs notes 
+// et en gardant le plus grand rayon pour l'affichage
+// let uniqueNodesMap = new Map();
+// nodes_finales.forEach(node => {
+//     if (uniqueNodesMap.has(node.id )) {
+//         const existingNode = uniqueNodesMap.get(node.id);
+//         existingNode.notes = Array.from(new Set([...existingNode.notes, ...node.notes]));
+//         existingNode.r = 20 ; //Math.max(existingNode.r, node.r)*1.618;
+//         uniqueNodesMap.delete(node)
+//         uniqueNodesMap.set(existingNode.id, { ...node });
+
+//     } else {
+//         uniqueNodesMap.set(node.id, { ...node });
+//     }
+// });
+
+// Convertir la Map en tableau pour l'utilisation dans le reste du code
+let uniqueNodes = [...nodes_finales.values()];
+console.log(uniqueNodes.length)
+
+// supprime les doublons qui ont le meme label
+let setUniqueNode=new Map();
+let uniques = [...new Map(uniqueNodes.map(item => [item.label, item])).values()];
+uniqueNodes=uniques;
+uniqueNodes.sort(() => Math.random() - 0.5);
+
+// Regroupement par group(Tonalité) pour les placer à proximité les uns des autres
+uniqueNodes.sort((a, b) => a.group - b.group);
+
+
+
+if (uniqueNodes.length <= 0) {
+    console.error("Erreur : Aucun nœud unique trouvé après le nettoyage des doublons.");
+    window.alert("Erreur : Aucun nœud unique trouvé après le nettoyage des doublons. Veuillez vérifier les données d'entrée.");
+} else {
+    console.log("Nœuds uniques générés avec succès :", uniqueNodes.length);
+}
+
+// Génération de liens pour l'aspect "Toile"
+function make_links(links_to_use=[],nodes_to_use=uniqueNodes) {
+    const ze_links = [];
+    for(let i=0; i<nodes_to_use.length; i++) {
+        // pas de doublons de liens entre les mêmes nœuds, et pas de lien d'un nœud à lui-même
+        for(let j=0; j<nodes_to_use.length; j++) {
+            // if (i === j) continue;
+            // if (nodes_to_use[i].label === nodes_to_use[j].label) continue;
+            // gestion des notes communes entre les nœuds : plus il y a de notes communes, plus le lien est épais et plus cyan, sinon plus fin et plus magenta
+            let sharedNotes = nodes_to_use[i].notes.filter(note => nodes_to_use[j].notes.includes(note));
+            ze_links.push({ source: nodes_to_use[i].id, target: nodes_to_use[j].id ,
+                radius: (nodes_to_use[i].r + nodes_to_use[j].r)/2,group:nodes_to_use[i].group ,mode:nodes_to_use[i].mode,notes:sharedNotes });
+            }
+        }
+        return ze_links;
+    }
+    
+let links = make_links();
+
+// État de transformation (Zoom/Pan)
+let transform = d3.zoomIdentity;
+
+const simulation = d3.forceSimulation(uniqueNodes)
+    .force("center", d3.forceCenter(width / 2, height / 2))
+    .force("link", d3.forceLink(links).id(d => d.id).distance(5))
+    .force("group", d3.forceManyBody().strength(d => -Math.pow(d.r, 2) * 0.5)) // Force de répulsion basée sur la taille du nœud
+    
+// const simulationMinilabels = d3.forceSimulation()
+//     .force("center", d3.forceCenter(width / 2, height / 2))
+//     .force("group", d3.forceManyBody().strength(d => -Math.pow(d.width,2) * 0.5))
+//     .force("link", d3.forceLink().id(d => d.id).distance(50))
+
+// Gestionnaire de Zoom
+const zoom = d3.zoom()
+.scaleExtent([0.2, 5])
+.on("zoom", (event) => {
+    transform = event.transform;
+});
+
+function resize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+    simulation.force("center", d3.forceCenter(width / 2, height / 2));
+    simulation.force("link").distance(500 * transform.k); // Adapter la distance des liens au zoom
+    simulation.alpha(1).restart(); // Relancer la simulation pour réajuster les positions
+    simulation.force("charge").strength(-1000 * transform.k); // Adapter la force de charge au zoom
+    simulation.force("group").strength(d => -Math.pow(d.r, 2) * 0.5 * transform.k); // Adapter la force de groupe au zoom
+    // simulation.force("link", d3.forceManyBody().strength(d => -Math.pow(d.r, 2) * 0.5 * transform.k)); // Adapter la force de lien au zoom
+}
+
+function trace_lines(source,target) {
+    ctx.beginPath();
+    ctx.moveTo(source.x, source.y);
+    ctx.lineTo(target.x, target.y);
+    ctx.stroke();
+}
+
+function draw(links_to_use=links,nodes_to_use=uniqueNodes) {
+    ctx.clearRect(0, 0, width, height);
+    const time = Date.now() * 0.0002;
+    
+    links_to_use.forEach(d => {
+        const linkNotes=d.notes;
+
+        const speed = (0.1 + (d.radius / 20 * 0.2));
+        const pos = (time * speed) % 1;
+        const px = d.source.x + (d.target.x - d.source.x) * pos;
+        const py = d.source.y + (d.target.y - d.source.y) * pos;
+        const distToSource = Math.sqrt(Math.pow(px-d.source.x, 2) + Math.pow(py-d.source.y, 2));
+        const distToTarget = Math.sqrt(Math.pow(d.target.x-px, 2) + Math.pow(d.target.y-py, 2));
+        
+        // Dessin des liens
+        // récupère la valeur de l'envergure globale du graphe 
+        // (distance entre les nœuds les plus éloignés) pour normaliser la largeur des liens    
+        const maxRadius = 300;
+        const normalizedRadius = d.radius / maxRadius;
+        
+        if (linkNotes.length >= 3 ) {
+            ctx.lineWidth = (Math.pow(d.radius*2+linkNotes.length/16.18,2) / 2000*coeff);
+            ctx.strokeStyle = "rgba(200,50, "+String(250-linkNotes.length*2)+", "+String(0.5*coeff)+")";
+            ctx.fillStyle = "rgba(200, 50, "+String(250-linkNotes.length*2)+", "+String(0.5*coeff)+")";
+            trace_lines(d.source, d.target);
+            
+            // Particules de Flux (MPE Data Transfer simulation)
+            if (!d.radius) d.radius = 10; // Valeur par défaut si radius n'est pas définive
+            if (d.source.group === d.target.group) {
+                // si la particule est plus proche de la source que de la cible, elle est plus rouge, sinon plus cyan
+                if (distToSource < distToTarget) {
+                    ctx.fillStyle = "rgba(0, 0, 255, 1)";
+                } else {
+                    ctx.fillStyle = "rgba(50, 255, 100, 1)";
+                }
+                ctx.beginPath();
+                ctx.arc(px, py, d.radius / 10, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
+        // Mise en subrillance des autres accords liés à la source sélectionnée
+        if (selectedNode && d.source.id.split('|')[0] === selectedNode.id.split('|')[0] || d.source.id.split('|')[1] === selectedNode.id.split('|')[0]) {
+            ctx.beginPath();
+            ctx.strokeStyle = "rgba(0, 255, 0, 1)";
+            if (linkNotes.length >2) {
+                ctx.lineWidth = (Math.pow(linkNotes.length,4) / 30)
+                trace_lines(d.source, d.target);
+            } else if (linkNotes.length <= 2) {
+                ctx.lineWidth = (Math.pow(linkNotes.length,2) / 30);
+                trace_lines(d.source, d.target);
+            }
+            ctx.stroke();
+            
+            
+            ctx.beginPath();
+            ctx.fillStyle =  "rgba(0, 255, 255, 1)";
+            ctx.strokeStyle = "rgba(0, 255, 255, 0.5)";
+            ctx.arc(d.target.x, d.target.y, 3, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+            
+        }
+    });
+    
+    // Dessin des nœuds
+    nodes_to_use.forEach(d => {
+        ctx.beginPath();
+        const grad = ctx.createRadialGradient(d.x, d.y, 0, d.x, d.y, d.r*.05);
+        grad.addColorStop(0, "rgba("+String(79+d.r*4)+", "+String(120-d.r)+", "+String(100-d.r*3)+", .8)");
+        grad.addColorStop(1, "transparent",1);
+        ctx.fillStyle = grad;
+        ctx.arc(d.x, d.y, d.r , 0, Math.PI * 2);
+        ctx.fill();
+        
+        if (selectedNode && (d.id.split('|')[0] === selectedNode.id.split('|')[0] || d.id.split('|')[1] === selectedNode.id.split('|')[0])) {
+            ctx.beginPath();
+            ctx.strokeStyle = "rgba(255, 255, 255, 1)";
+            ctx.lineWidth = 2;
+            ctx.arc(d.x, d.y, d.r + 5, 0, Math.PI * 2);
+            ctx.stroke();
+
+            ctx.fillStyle = "rgba(255, 255, 255, 1)";
+            ctx.font = "24px monospace" 
+            // ctx.fillText(d.label, d.x + 5, d.y + 5);
+
+        } else {
+            ctx.beginPath();
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.5)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
+            ctx.font = "14px monospace";
+            ctx.fillText(d.label, d.x + 5, d.y + 5);
+        }
+
+    });
+    requestAnimationFrame(() => draw(links_to_use,nodes_to_use));
+}
+
+// Mise en place d'une nouvelle liste de noeuds liés les uns aux autres 
+// par le nombre de notes communes 7 noeuds seront choisis au hasard parmi 
+// tous les noeuds.
+function generateRandomSubgraph(links_to_use=links) {
+    const firstPositionNode = Math.floor(Math.random() * uniqueNodes.length);
+
+    // // augmentation du contenu par concaténations 
+    // const multiNodes = Array.from({ length: n * uniqueNodes.length }, (_, i) => ({
+        //     ...uniqueNodes[i % uniqueNodes.length]
+        // }));
+        // multiNodes.sort(() => Math.random() - 0.5);
+        
+        // // on réassigne tout ça vers le tableau uniqueNodes réinitialisé avec la nouvelle longueur
+        
+        const n = 3;
+        const multiNodes = Array.from({ length: uniqueNodes.length * n }, (_, i) => {
+            // On récupère l'élément d'origine (modulo la taille du tableau source)
+            const original = uniqueNodes[i % uniqueNodes.length];
+            
+            return {
+                ...original, // On copie toutes les propriétés (notes, group, r, etc.)
+                id: `${original.id}_copy_${Math.floor(i / uniqueNodes.length)}`, // Nouvel ID unique
+                notes: [...original.notes] // On clone aussi le tableau de notes pour éviter les références partagées
+            };
+        });
+    uniqueNodes = [...multiNodes.values()];
+        
+    const selectedNodes = uniqueNodes.slice(firstPositionNode % uniqueNodes.length-1, (firstPositionNode + nbOfChords) % uniqueNodes.length-1);
+    const filteredLinks = make_links(links_to_use,selectedNodes);
+
+    console.log("Nœuds sélectionnés pour le sous-graphe :", selectedNodes.length);
+    console.log("Liens filtrés pour le sous-graphe :", filteredLinks.length);
+
+    return { nodes: selectedNodes, links: filteredLinks };
+}
+
+function playChord(node) {
+
+    // Arrangement de l'ordre des notes pour que la fondamentale soit la plus basse,
+    // et les autres notes arrangées en fonction de leur intervalle par rapport à la fondamentale
+    // (ex: pour CM7 -> C4 , E4 , G4 , B4)
+    // (ex: pour AM7 -> A4 , C#5 , E5 , G#5)
+
+    const fundamental = node.notes[0];
+    const fundamentalMidi = noteToMidi[fundamental];
+
+    const sortedNotes = node.notes.map(note => {
+        let midiValue = noteToMidi[note];
+        if (midiValue < fundamentalMidi) {
+            midiValue += 12;
+        } else if (midiValue - fundamentalMidi > 12) { // Si l'intervalle est plus grand qu'une octave et une sixte, on ramène la note dans l'octave suivante pour éviter les notes trop aiguës
+            midiValue -= 12;
+        }
+        return { note, midi: fundamentalMidi + 60+ midiValue };
+    }).map(n => n.note + Math.floor((n.midi) / 18)); // Convertir le MIDI en notation avec octave (ex: C4, E4, G4, B4)
+
+    // ici on ajoute au début de la séquence de notes la fondamentale deux octaves plus bas pour renforcer la perception de la tonalité (ex: pour CM7 -> C2 , C4 , E4 , G4 , B4)
+    sortedNotes.unshift(fundamental + "2");
+
+
+    // Appel au backend Flask via POST JSON
+    fetch('/play', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: sortedNotes })
+    }).then(resp => resp.json())
+    .then(data => console.log('Play response:', data))
+    .catch(err => console.error('Play error:', err));
+   
+}
+
+// ajouter un bouton pour déclencher la génération d'un nouveau sous-graphe aléatoire qui 
+// affichera les noeuds un apres l'autre avec une animation de transition
+const bouton_replay = document.createElement('button');
+const button = document.createElement('button');
+const sliderNbOfChords = document.createElement('input');
+const sliderNbOfLoops = document.createElement('input');
+const label = document.createElement('label');
+const _miniLabel = document.createElement('label');
+const _miniLabelLeft = document.createElement("label");
+const _miniLabelRight = document.createElement("label");
+
+button.innerHTML = "SUBGRAPH";
+button.style.position = "absolute";
+button.style.top = "220px";
+button.style.left = "20px";
+button.style.padding = ".5em 1em";
+button.style.background = "none";
+button.style.border = "1px solid #fff";
+button.style.borderRadius = "5px";
+button.style.color = "#0f8";
+button.style.fontSize = ".8em";
+button.style.textAlign = "left";
+button.style.cursor = "pointer";
+
+bouton_replay.innerHTML = "REPLAY";
+bouton_replay.style.position = "absolute";
+bouton_replay.style.left = "20px";
+bouton_replay.style.padding = ".5em 1em";
+bouton_replay.style.background = "none";
+bouton_replay.style.border = "1px solid #fff";
+bouton_replay.style.borderRadius = "5px";
+bouton_replay.style.color = "#0f8";
+bouton_replay.style.fontSize = ".8em";
+bouton_replay.style.textAlign = "left";
+bouton_replay.style.cursor = "pointer";
+
+sliderNbOfChords.title = "Number of chords in the subgraph";
+sliderNbOfChords.type = "range";
+sliderNbOfChords.min = 2;
+sliderNbOfChords.max = 78;
+sliderNbOfChords.value = nbOfChords;
+sliderNbOfChords.style.position = "absolute";
+sliderNbOfChords.style.top = "150px";
+sliderNbOfChords.style.left = "20px";
+sliderNbOfChords.style.width = "400px";
+sliderNbOfChords.addEventListener('input', () => {
+    nbOfChords = parseInt(sliderNbOfChords.value);
+    button.innerHTML = "<span style='color: #08f;'>SUBGRAPH</span><hr>"+nbOfChords+" chords, "+nbOfLoops+" loops";
+});
+
+sliderNbOfLoops.title = "Number of loops for the subgraph animation";
+sliderNbOfLoops.type = "range";
+sliderNbOfLoops.min = 1;
+sliderNbOfLoops.max = 100;
+sliderNbOfLoops.value = nbOfLoops;
+sliderNbOfLoops.style.position = "absolute";
+sliderNbOfLoops.style.top = "180px";
+sliderNbOfLoops.style.left = "20px";
+sliderNbOfLoops.style.width = "400px";
+sliderNbOfLoops.addEventListener('input', () => {
+    nbOfLoops = parseInt(sliderNbOfLoops.value);
+    button.innerHTML = "<span style='color: #08f;'>SUBGRAPH</span><hr>"+nbOfChords+" chords, "+nbOfLoops+" loops";
+});
+
+
+
+
+const handleMouseMove = (event) => {
+    // 1. Récupérer les coordonnées de la souris par rapport au canvas
+    const [mx, my] = d3.pointer(event);
+    
+    // 2. Trouver le nœud le plus proche (avec un rayon de recherche, ex: 20px)
+    const hoveredNode = simulation.find(mx, my, 20);
+    
+    // Action au survol (Ex: mise à jour du label ou prévisualisation MPE)
+    if (hoveredNode) {
+        selectedNode = hoveredNode;
+        
+        initMinilabelPrincipal(_miniLabel,selectedNode,false);
+        _miniLabel.hidden = false;
+        // trouver la tonalité de l'accord survolé en fonction de son groupe
+        
+        selectedNode.tonality = tonalities[selectedNode.group] || "Unknown";
+        _miniLabel.innerHTML = "Tonalité: " + selectedNode.tonality + "<hr><h2 style='color: #0f8;'>" + selectedNode.label + "</h2><hr>" + selectedNode.mode +"<br>"+selectedNode.notes.join(", ");
+
+        // Optionnel : Changer le curseur pour indiquer l'interaction
+        canvas.style.cursor = "pointer";
+    } else {
+        canvas.style.cursor = "default";
+        _miniLabel.hidden = true;
+    }
+}
+
+button.addEventListener('click', () => {
+    coeff=3;
+    const { nodes: newNodes, links: newLinks } = generateRandomSubgraph();
+    let zeTimer;
+    clearTimeout(zeTimer); 
+
+    function envois() {
+        if (bouton_replay.hidden) {    
+            // concaténer tout le tableau de noeuds sélectionnés pour avoir une sequence de noeuds plus N fois plus longue.
+            const extendedNodes = [];
+            for (let i = 0; i < nbOfLoops; i++) {
+                extendedNodes.push(...newNodes.map(node => ({ ...node, id: node.id + "_" + i })));
+            }
+            
+            simulation.nodes(newNodes);
+            requestAnimationFrame(() => draw(newLinks, newNodes));
+            
+            simulation.force("center", d3.forceCenter(width / 2, height / 2));
+            simulation.force("link").links(newLinks);
+            simulation.alpha(1).restart();
+            
+            button.innerHTML = "<span style='color: #08f;'>SUBGRAPH</span><hr>"+newNodes.map(n => "<span>"+n.label+"</span>&nbsp;&nbsp;&nbsp;<small style='color: #08f;'>("+tonalities[n.group]+")</small>").join("<br>");
+            bouton_replay.style.top = (button.offsetTop + button.offsetHeight + 16*nbOfChords)+(nbOfChords+16*2)*parseInt(button.style.padding) + "px";
+            bouton_replay.hidden = false;
+            clearTimeout(zeTimer); 
+            extendedNodes.forEach((node, index) => {
+                zeTimer=setTimeout(() => {
+                    _miniLabel.hidden = false;
+                    _miniLabelLeft.hidden=false;
+                    _miniLabelRight.hidden=false;
+                    const playing=true;
+                    // Mettre à jour le nœud sélectionné pour afficher les détails dans le mini label
+                    selectedNode = extendedNodes[index+1] ; // Passer au nœud suivant ou revenir au premier si on atteint la fin
+                    
+                    // trouver la tonalité de l'accord survolé en fonction de son groupe
+                    selectedNode.tonality = tonalities[selectedNode.group] || "Unknown";
+
+
+                        
+                    // affiche le minilabel avec les détails du nœud sélectionné (tonalité, mode, notes) en positionnant le minilabel à côté du nœud sélectionné
+                    _miniLabelLeft.style.position = "absolute";
+                    _miniLabelLeft.style.top = "350px";
+                    _miniLabelLeft.style.left = "210px";
+                    _miniLabelLeft.style.fontSize = "1em";
+                    _miniLabelLeft.style.background = "rgba(0, 0, 0, 0.25)";
+                    _miniLabelLeft.style.padding = ".5em 1em";
+                    _miniLabelLeft.style.border = "1px solid white";
+                    _miniLabelLeft.style.borderRadius = ".5em";
+                    _miniLabelLeft.style.color = "#08f";
+                    _miniLabelLeft.style.textAlign = "center";
+                    _miniLabelLeft.innerHTML = "Tonalité: " + tonalities[node.group] + "<hr><h2 style='color: #0f8;'>" + node.label + "</h2><hr>" + node.mode +"<br>"+node.notes.join(", ");
+                    _miniLabelLeft.style.opacity=".618";
+                    document.body.appendChild(_miniLabelLeft);
+                    
+                    initMinilabelPrincipal(_miniLabel,selectedNode,true);
+                    
+                    _miniLabelRight.style.position = "absolute";
+                    _miniLabelRight.style.top = "350px";
+                    _miniLabelRight.style.right = "50px";
+                    _miniLabelRight.style.fontSize = "1em";
+                    _miniLabelRight.style.background = "rgba(0, 0, 0, 0.25)";
+                    _miniLabelRight.style.padding = ".5em 1em";
+                    _miniLabelRight.style.border = "1px solid white";
+                    _miniLabelRight.style.borderRadius = ".5em";
+                    _miniLabelRight.style.color = "#08f";
+                    _miniLabelRight.style.textAlign = "center";
+                    _miniLabelRight.innerHTML = "Tonalité: " + tonalities[extendedNodes[index+2].group] + "<hr><h2 style='color: #0f8;'>" + extendedNodes[index+2].label + "</h2><hr>" + extendedNodes[index+2].mode +"<br>"+extendedNodes[index+2].notes.join(", ");
+                    _miniLabelRight.style.opacity=".618";
+                    document.body.appendChild(_miniLabelRight);
+
+                    _miniLabel.innerHTML = "Tonalité: " + selectedNode.tonality + "<hr><h2 style='color: #0f8;'>" + selectedNode.label + "</h2><hr>" + selectedNode.mode +"<br>"+selectedNode.notes.join(", ");
+
+                    
+
+                    playChord(node);
+                }, index * (5000)+.25*extendedNodes.length); // Délai entre chaque nœud (ex: 3 secondes + 250ms par nœud pour l'animation)
+                _miniLabelLeft.hidden=true;
+                _miniLabelRight.hidden=true;
+            });
+            bouton_replay.addEventListener('click', () => {
+                // Annule tous les timeouts en cours pour arrêter l'animation en cours
+                envois();   
+            }); 
+        } else {
+            bouton_replay.hidden = true;
+            envois();
+        }
+    }
+    envois();
+});
+
+
+    
+// Initialiser avec le premier nœud au hazard avec un rayon significatif pour éviter les problèmes d'interaction au démarrage
+const n_random = Math.floor(Math.random() * uniqueNodes.length);
+selectedNode = uniqueNodes[n_random];
+
+document.body.appendChild(button);
+document.body.appendChild(_miniLabel);
+document.body.appendChild(sliderNbOfChords);
+document.body.appendChild(sliderNbOfLoops);
+document.body.appendChild(bouton_replay);
+
+// Interaction basique
+d3.select(canvas).call(d3.drag()
+.container(canvas)
+.subject(e => simulation.find(e.x, e.y))
+
+.on("start", e => {
+    if (!e.active) simulation.alphaTarget(0.3).restart();
+    e.subject.fx = e.subject.x;
+    e.subject.fy = e.subject.y;
+    selectedNode = e.subject;
+    playChord(selectedNode);
+})
+.on("drag", e => {
+    e.subject.fx = e.x;
+    e.subject.fy = e.y;
+    selectedNode = e.subject;
+})
+.on("end", e => {
+    if (!e.active) simulation.alphaTarget(0);
+    e.subject.fx = null;
+    e.subject.fy = null;
+    selectedNode = e.subject;
+})
+);
+function initMinilabelPrincipal(_miniLabel,hoveredNode,playing=false) {
+    _miniLabel.style.position = "absolute";
+
+    if (playing) {
+        _miniLabel.style.top = "250px";
+        _miniLabel.style.left = "425px";
+        _miniLabel.style.fontSize = "2.5em";
+        _miniLabel.style.width="240px";
+        _miniLabel.style.forceCenter;
+        _miniLabel.style.background = "rgba(0, 0, 0, 0.5)";
+        _miniLabel.style.padding = ".25em .25em";
+    } else {
+        _miniLabel.style.top = String(2+hoveredNode.y)+"px";
+        _miniLabel.style.right = String(width - hoveredNode.x - 100)+"px";
+        _miniLabel.style.background = "rgba(0, 0, 0, 0.8)";
+    }
+    _miniLabel.style.padding = ".5em 1em";
+    _miniLabel.style.border = "1px solid white";
+    _miniLabel.style.borderRadius = ".5em";
+    _miniLabel.style.color = "#08f";
+    _miniLabel.style.textAlign = "center";
+}
+
+d3.select(canvas).on("mousemove", handleMouseMove);
+
+window.addEventListener('resize', resize);
+requestAnimationFrame(() => draw(links));
+resize();
+</script>
+</body>
+</html>
