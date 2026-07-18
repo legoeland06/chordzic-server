@@ -288,6 +288,14 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 seed = seed.wrapping_add(1);
             }
 
+            // Basse : jouer le premier temps IMMEDIATEMENT (pas via le tick)
+            if !t_bass.mute.load(Ordering::Relaxed) {
+                let bvol=t_bass.volume.load(Ordering::Relaxed);
+                let bass_note = if walking { walking_notes[0] } else { root };
+                no(c,ch_bass,bass_note,bvol);
+                prev_bass_note=bass_note;
+            }
+
             // Nappes (Strings)
             if !t_str.mute.load(Ordering::Relaxed) {
                 for n in &prev_nappe{no(c,ch_str,*n,0)}
