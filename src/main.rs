@@ -50,9 +50,9 @@ fn init_midi()->Option<MidiHandle>{
     let mo=MidiOutput::new("cs").ok()?;let p=mo.ports();
     if p.is_empty(){eprintln!("no port");return None}
     println!("Ports:");for(i,x)in p.iter().enumerate(){if let Ok(n)=mo.port_name(x){println!(" [{i}] {n}")}}
-    let i:usize=if let Ok(e)=std::env::var("MIDI_PORT"){e.parse().unwrap_or(0)}
-    else if let Some((i,_))=p.iter().enumerate().find(|(_,x)|mo.port_name(x).map(|n|n.contains("Roland")).unwrap_or(false)){println!("  Roland");i}
-    else{p.len().saturating_sub(1)};
+    // Par défaut : port 2 (FluidSynth). Surcharge via MIDI_PORT.
+    let i:usize=if let Ok(e)=std::env::var("MIDI_PORT"){e.parse().unwrap_or(2)}
+    else{2};
     if i>=p.len(){eprintln!("port {i} invalid");return None}
     println!("Connecte {}",mo.port_name(&p[i]).unwrap_or_default());
     mo.connect(&p[i],"cs").ok().map(|c|Arc::new(Mutex::new(c)))
