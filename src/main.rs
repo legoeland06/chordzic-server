@@ -176,8 +176,6 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         let ch_str=t_str.channel;
 
         for(i,e)in ev.iter().enumerate(){
-            // Re-sync les tracks a chaque accord (prend en compte les changements temps reel)
-            setup_tracks(c,lc);
             let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
             if m.is_empty(){continue}
             if i>0{rch(c);cc(c,9,120,0)}
