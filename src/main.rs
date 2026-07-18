@@ -284,12 +284,14 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
     // Tracks via le nouveau systeme
     if let Some(ref t)=b.tracks{apply_tracks(lv,t)}
 
-    // Compat anciens flags (temporaire)
-    lv.tracks[TRACK_LEAD].program.store(b.inst_val,Ordering::Relaxed);
-    lv.tracks[TRACK_LEAD].mute.store(!b.arps,Ordering::Relaxed);
-    lv.tracks[TRACK_BASS].mute.store(!b.bass,Ordering::Relaxed);
-    lv.tracks[TRACK_STR].mute.store(!b.nappes,Ordering::Relaxed);
-    lv.tracks[TRACK_DRUMS].mute.store(!b.drums,Ordering::Relaxed);
+    // Compat anciens flags : n'applique que si le nouveau systeme tracks n'est PAS utilise
+    if b.tracks.is_none() {
+        lv.tracks[TRACK_LEAD].program.store(b.inst_val,Ordering::Relaxed);
+        lv.tracks[TRACK_LEAD].mute.store(!b.arps,Ordering::Relaxed);
+        lv.tracks[TRACK_BASS].mute.store(!b.bass,Ordering::Relaxed);
+        lv.tracks[TRACK_STR].mute.store(!b.nappes,Ordering::Relaxed);
+        lv.tracks[TRACK_DRUMS].mute.store(!b.drums,Ordering::Relaxed);
+    }
 
     let do_loop=b.loop_enabled.unwrap_or(false);
     let ev:&[ChordEv]=if!b.seq.is_empty(){b.seq.as_slice()}else if!b.sequence.is_empty(){b.sequence.as_slice()}else{&[]};
