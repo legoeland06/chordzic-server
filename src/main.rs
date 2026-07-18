@@ -16,10 +16,9 @@ fn sig_code(s:&str)->u16{
     let bot:u16=parts[1].parse().unwrap_or(4);
     top*10+bot
 }
-fn sig_str(code:u16)->String{format!("{}/{}",code/10,code%10)}
 
 struct Live{
-    drums:AtomicBool, bass:AtomicBool, arpeggios:AtomicBool,
+    drums:AtomicBool, bass:AtomicBool, arpeggios:AtomicBool, nappes:AtomicBool,
     pattern:AtomicU8, tempo:AtomicU16, stop:AtomicBool, sig:AtomicU16, inst_val:AtomicU16,
 }
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
@@ -28,15 +27,16 @@ struct Live{
 struct PlayReq{
     notes:Option<Vec<String>>,#[serde(default)]seq:Vec<ChordEv>,#[serde(default)]sequence:Vec<ChordEv>,
     #[serde(default="t120")]tempo:u32,#[serde(default="y")]drums:bool,
-    #[serde(default="y")]bass:bool,#[serde(default="y")]arps:bool,#[serde(default="s44")]sig:String,#[serde(default="rk")]pattern:String,#[serde(default="i51")]inst_val:u16,
+    #[serde(default="y")]bass:bool,#[serde(default="y")]arps:bool,#[serde(default="n")]nappes:bool,
+    #[serde(default="s44")]sig:String,#[serde(default="rk")]pattern:String,#[serde(default="i51")]inst_val:u16,
 }
 #[derive(Deserialize,Clone)] struct ChordEv{notes:Vec<String>,#[serde(default="b4")]beats:f64}
 #[derive(Serialize)] struct Rsp{status:String}
 #[derive(Deserialize)] struct Cfg{
-    drums:Option<bool>,bass:Option<bool>,arpeggios:Option<bool>,
+    drums:Option<bool>,bass:Option<bool>,arpeggios:Option<bool>,nappes:Option<bool>,
     pattern:Option<String>,tempo:Option<u16>,sig:Option<String>,instrument:Option<u16>,
 }
-fn t120()->u32{120}fn y()->bool{true}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
+fn t120()->u32{120}fn y()->bool{true}fn n()->bool{false}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
 
 fn note_midi(s:&str)->Result<u8,String>{
     let s=s.trim();let(nl,np)=if s.len()>1&&(s.as_bytes()[1]==b'#'||s.as_bytes()[1]==b'b'){(2,&s[..2])}else{(1,&s[..1])};
@@ -62,12 +62,12 @@ fn snd(c:&mut MidiOutputConnection,m:&[u8]){if let Err(e)=c.send(m){eprintln!("�
 fn cc(c:&mut MidiOutputConnection,ch:u8,ctl:u8,v:u8){snd(c,&[0xB0|ch,ctl,v])}
 fn pc(c:&mut MidiOutputConnection,ch:u8,v:u8){snd(c,&[0xC0|ch,v])}
 fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v])}
-fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,1,2,9]{cc(c,ch,123,0)}}
+fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,1,2,3,9]{cc(c,ch,123,0)}}
 
 const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
 const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
-const HH_BEAT:u8=80; // vélocité HH sur les temps
-const HH_8TH:u8=65;  // vélocité HH sur les croches
+const HH_BEAT:u8=80;
+const HH_8TH:u8=65;
 
 fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64){
     if!on_beat&&!on_eighth{return}
@@ -99,28 +99,43 @@ fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
 
 fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
     rch(c);
-    for&ch in&[0u8,1,2]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
+    for&ch in&[0u8,1,2,3]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
     let iv=lc.inst_val.load(Ordering::Relaxed)as u8;pc(c,0,iv);pc(c,1,iv);pc(c,2,33);
+    pc(c,3,48); // String Ensemble 1 pour les nappes
     pc(c,9,1); // Standard Kit
     std::thread::sleep(Duration::from_millis(2));
+
+    // Notes nappes précédentes (pour noteoff)
+    let mut prev_nappe:Vec<u8>=vec![];
 
     for(i,e)in ev.iter().enumerate(){
         let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
         if m.is_empty(){continue}
-        if i>0{rch(c);cc(c,9,120,0)} // All Sound Off sur drums
+        if i>0{rch(c);cc(c,9,120,0)}
 
         let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
+        // Les nappes tiennent toutes les notes (sauf la basse)
+        let nappe_notes:Vec<u8>=m[1..].to_vec();
         let dur=(60_000.0/lc.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
         let start=std::time::Instant::now();
         let mut idx=0u64;
         let mut last_b=u64::MAX;
+
+        // Nappes : début d'accord → NOTE_ON, fin → NOTE_OFF
+        let np=lc.nappes.load(Ordering::Relaxed);
+        if np{
+            // Couper les notes nappes précédentes
+            for n in &prev_nappe{no(c,3,*n,0)}
+            // Jouer les notes nappes sur canal 3 (strings, vel 55)
+            for n in &nappe_notes{no(c,3,*n,55)}
+            prev_nappe=nappe_notes.clone();
+        }
 
         while(start.elapsed().as_millis()as u64)<dur&&!lc.stop.load(Ordering::Relaxed){
             let tempo_f=lc.tempo.load(Ordering::Relaxed).max(20)as f64;
             let bd_ms=60_000.0/tempo_f;
             let delay_ms=(bd_ms/4.0).max(30.0);
 
-            // Timer compensé: target absolu basé sur idx (f64)
             let target=start+Duration::from_secs_f64(idx as f64*delay_ms/1000.0);
             let now=std::time::Instant::now();
             if target>now{std::thread::sleep(target-now)}
@@ -133,7 +148,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
             let sig=lc.sig.load(Ordering::Relaxed);
             let bars=(sig/10).max(1)as u64;
 
-            // Batterie + basse sur chaque beat
+            // Batterie + basse
             let beat=(elapsed_ms/bd_ms)as u64;
             if dr||ba{
                 if last_b==u64::MAX||beat>last_b{
@@ -141,7 +156,6 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
                     if ba{no(c,2,root,40);if last_b!=u64::MAX{no(c,2,root,0)}}
                     last_b=beat;
                 }
-                // Croche (batterie uniquement)
                 if dr{
                     let beat_pos=elapsed_ms%bd_ms;
                     if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
@@ -161,6 +175,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
         }
         if lc.stop.load(Ordering::Relaxed){break}
     }
+    // Couper les nappes résiduelles
+    for n in &prev_nappe{no(c,3,*n,0)}
     rch(c);
     println!("  done ({} evts)",ev.len());
 }
@@ -171,6 +187,7 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
     s.live.drums.store(b.drums,Ordering::Relaxed);
     s.live.bass.store(b.bass,Ordering::Relaxed);
     s.live.arpeggios.store(b.arps,Ordering::Relaxed);
+    s.live.nappes.store(b.nappes,Ordering::Relaxed);
     s.live.pattern.store(pat(&b.pattern),Ordering::Relaxed);
     s.live.sig.store(sig_code(&b.sig),Ordering::Relaxed);
     s.live.inst_val.store(b.inst_val,Ordering::Relaxed);
@@ -192,6 +209,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     if let Some(v)=b.drums{s.live.drums.store(v,Ordering::Relaxed)}
     if let Some(v)=b.bass{s.live.bass.store(v,Ordering::Relaxed)}
     if let Some(v)=b.arpeggios{s.live.arpeggios.store(v,Ordering::Relaxed)}
+    if let Some(v)=b.nappes{s.live.nappes.store(v,Ordering::Relaxed)}
     if let Some(ref p)=b.pattern{s.live.pattern.store(pat(p),Ordering::Relaxed)}
     if let Some(t)=b.tempo{s.live.tempo.store(t,Ordering::Relaxed)}
     if let Some(ref sg)=b.sig{s.live.sig.store(sig_code(sg),Ordering::Relaxed)}
@@ -209,7 +227,7 @@ async fn stop(State(s):State<AppState>)->impl IntoResponse{
 async fn main(){
     println!("csrs");let midi=init_midi();
     let state=AppState{midi,live:Arc::new(Live{
-        drums:AtomicBool::new(true),bass:AtomicBool::new(true),arpeggios:AtomicBool::new(true),
+        drums:AtomicBool::new(true),bass:AtomicBool::new(true),arpeggios:AtomicBool::new(true),nappes:AtomicBool::new(false),
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),inst_val:AtomicU16::new(51),
     })};
     let app=Router::new().route("/",get(idx)).route("/play",post(play))
