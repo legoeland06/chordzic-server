@@ -93,7 +93,7 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
         }}else if on_eighth{no(c,9,DRUM_HH,40);}
         PAT_ONEDROP=>if on_beat{match b{
             0=>{no(c,9,DRUM_HH,55);}1=>{no(c,9,DRUM_RIM,60);no(c,9,DRUM_HH,55);}
-            2=>{no(c,9,DRUM_HH,55);}3=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_RIM,65);no(c,9,DRUM_HH,60);}_=>{}
+            2=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_RIM,65);no(c,9,DRUM_HH,60);}3=>{no(c,9,DRUM_HH,55);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,50);}
         _=>if on_beat{match b{
             0=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_HH,HH_BEAT);}1=>{no(c,9,DRUM_SNARE,75);no(c,9,DRUM_HH,HH_BEAT);}
