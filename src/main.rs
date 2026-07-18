@@ -264,7 +264,43 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
         for(i,e)in ev.iter().enumerate(){
             let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
-            if m.is_empty(){continue}
+            if m.is_empty(){
+                // Silence : seule la batterie continue
+                if i>0{rch(c);cc(c,9,120,0)}
+                let dur=(60_000.0/lc.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
+                let start=std::time::Instant::now();
+                let mut idx=0u64;
+                let mut last_b_drums=u64::MAX;
+                while(start.elapsed().as_millis()as u64)<dur&&!lc.stop.load(Ordering::Relaxed){
+                    let tempo_f=lc.tempo.load(Ordering::Relaxed).max(20)as f64;
+                    let bd_ms=60_000.0/tempo_f;
+                    let delay_ms=(bd_ms/4.0).max(30.0);
+                    let target=start+Duration::from_secs_f64(idx as f64*delay_ms/1000.0);
+                    let now=std::time::Instant::now();
+                    if target>now{std::thread::sleep(target-now)}
+                    let elapsed_ms=start.elapsed().as_secs_f64()*1000.0;
+                    let pt=lc.pattern.load(Ordering::Relaxed);
+                    let sig=lc.sig.load(Ordering::Relaxed);
+                    let bars=(sig/10).max(1)as u64;
+                    let beat=(elapsed_ms/bd_ms)as u64;
+                    // Batterie seulement
+                    if !t_drums.mute.load(Ordering::Relaxed){
+                        if last_b_drums==u64::MAX||beat>last_b_drums{
+                            let dvol=t_drums.volume.load(Ordering::Relaxed);
+                            drum_hit(c,beat,pt,true,false,bars,dvol);
+                            last_b_drums=beat;
+                        }
+                        let beat_pos=elapsed_ms%bd_ms;
+                        if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
+                            let dvol=t_drums.volume.load(Ordering::Relaxed);
+                            drum_hit(c,beat,pt,false,true,bars,dvol);
+                        }
+                    }
+                    idx+=1;
+                }
+                if lc.stop.load(Ordering::Relaxed){break}
+                continue;
+            }
             if i>0{rch(c);cc(c,9,120,0)}
 
             let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
