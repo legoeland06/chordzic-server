@@ -187,7 +187,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             let dur=(60_000.0/lc.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
             let start=std::time::Instant::now();
             let mut idx=0u64;
-            let mut last_b=u64::MAX;
+            let mut last_b_drums=u64::MAX;
+            let mut last_b_bass=u64::MAX;
 
             // Nappes (Strings)
             if !t_str.mute.load(Ordering::Relaxed) {
@@ -214,10 +215,10 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
                 // Batterie
                 if !t_drums.mute.load(Ordering::Relaxed){
-                    if last_b==u64::MAX||beat>last_b{
+                    if last_b_drums==u64::MAX||beat>last_b_drums{
                         let dvol=t_drums.volume.load(Ordering::Relaxed);
                         drum_hit(c,beat,pt,true,false,bars,dvol);
-                        last_b=beat;
+                        last_b_drums=beat;
                     }
                     let beat_pos=elapsed_ms%bd_ms;
                     if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
@@ -228,10 +229,11 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
                 // Basse (sur le beat)
                 if !t_bass.mute.load(Ordering::Relaxed){
-                    if last_b==u64::MAX||beat>last_b{
+                    if last_b_bass==u64::MAX||beat>last_b_bass{
                         let bvol=t_bass.volume.load(Ordering::Relaxed);
                         no(c,ch_bass,root,bvol);
-                        if last_b!=u64::MAX{no(c,ch_bass,root,0)}
+                        if last_b_bass!=u64::MAX{no(c,ch_bass,root,0)}
+                        last_b_bass=beat;
                     }
                 }
 
