@@ -8,7 +8,8 @@ use tower_http::cors::CorsLayer;
 
 type MidiHandle = Arc<Mutex<MidiOutputConnection>>;
 const PAT_ROCK:u8=0; const PAT_REGGAE:u8=1; const PAT_JAZZ:u8=2;
-fn pat(s:&str)->u8{match s{"reggae"=>PAT_REGGAE,"jazz"=>PAT_JAZZ,_=>PAT_ROCK}}
+const PAT_POP:u8=3; const PAT_BOSSA:u8=4; const PAT_ONEDROP:u8=5;
+fn pat(s:&str)->u8{match s{"reggae"=>PAT_REGGAE,"jazz"=>PAT_JAZZ,"pop"=>PAT_POP,"bossa"=>PAT_BOSSA,"onedrop"=>PAT_ONEDROP,_=>PAT_ROCK}}
 fn sig_code(s:&str)->u16{
     let parts:Vec<&str>=s.split('/').collect();
     if parts.len()!=2{return 44}
@@ -81,6 +82,18 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             0=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_KICK,50);}1=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_SNARE,55);}
             2=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_KICK,50);}3=>{no(c,9,DRUM_RIDE,60);no(c,9,DRUM_SNARE,55);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,35);}
+        PAT_POP=>if on_beat{match b{
+            0=>{no(c,9,DRUM_KICK,85);no(c,9,DRUM_HH,50);}1=>{no(c,9,DRUM_SNARE,70);no(c,9,DRUM_HH,50);}
+            2=>{no(c,9,DRUM_KICK,75);no(c,9,DRUM_HH,50);}3=>{no(c,9,DRUM_SNARE,65);no(c,9,DRUM_HH,50);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,45);}
+        PAT_BOSSA=>if on_beat{match b{
+            0=>{no(c,9,DRUM_KICK,55);no(c,9,DRUM_HH,45);}1=>{no(c,9,DRUM_SNARE,30);no(c,9,DRUM_HH,45);} // snare tres leger
+            2=>{no(c,9,DRUM_KICK,60);no(c,9,DRUM_HH,45);}3=>{no(c,9,DRUM_KICK,50);no(c,9,DRUM_HH,45);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,40);}
+        PAT_ONEDROP=>if on_beat{match b{
+            0=>{no(c,9,DRUM_HH,55);}1=>{no(c,9,DRUM_RIM,60);no(c,9,DRUM_HH,55);}
+            2=>{no(c,9,DRUM_HH,55);}3=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_RIM,65);no(c,9,DRUM_HH,60);}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,50);}
         _=>if on_beat{match b{
             0=>{no(c,9,DRUM_KICK,90);no(c,9,DRUM_HH,HH_BEAT);}1=>{no(c,9,DRUM_SNARE,75);no(c,9,DRUM_HH,HH_BEAT);}
             2=>{no(c,9,DRUM_KICK,80);no(c,9,DRUM_HH,HH_BEAT);}3=>{no(c,9,DRUM_SNARE,70);no(c,9,DRUM_HH,HH_BEAT);}_=>{}
@@ -126,8 +139,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
         if np{
             // Couper les notes nappes précédentes
             for n in &prev_nappe{no(c,3,*n,0)}
-            // Jouer les notes nappes sur canal 3 (strings, vel 55)
-            for n in &nappe_notes{no(c,3,*n,55)}
+            // Jouer les notes nappes sur canal 3 (strings, vel 30)
+            for n in &nappe_notes{no(c,3,*n,30)}
             prev_nappe=nappe_notes.clone();
         }
 
@@ -175,7 +188,9 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
         }
         if lc.stop.load(Ordering::Relaxed){break}
     }
-    // Couper les nappes résiduelles
+    // Petit gap pour eviter le phasing de fin de boucle
+    std::thread::sleep(Duration::from_millis(30));
+    // Couper les nappes residuelles
     for n in &prev_nappe{no(c,3,*n,0)}
     rch(c);
     println!("  done ({} evts)",ev.len());
