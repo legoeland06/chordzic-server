@@ -235,7 +235,6 @@ fn setup_tracks(c:&mut MidiOutputConnection,lc:&Live){
     for t in &lc.tracks {
         let ch=t.channel;
         if ch==9{pc(c,ch,1);continue}
-        cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2);
         pc(c,ch,t.program.load(Ordering::Relaxed)as u8);
     }
 }
@@ -268,7 +267,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             let start=std::time::Instant::now();
             let mut idx=0u64;
             let mut last_b_drums=u64::MAX;
-            let mut last_b_bass=u64::MAX;
+            let mut last_b_bass=0u64;  // 0 = deja joue manuellement
             let mut prev_bass_note:u8=0;
 
             // Generation du walking bass pour cet accord
@@ -294,6 +293,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 let bass_note = if walking { walking_notes[0] } else { root };
                 no(c,ch_bass,bass_note,bvol);
                 prev_bass_note=bass_note;
+                last_b_bass=0;
             }
 
             // Nappes (Strings)
@@ -335,7 +335,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
                 // Basse (Walking ou root)
                 if !t_bass.mute.load(Ordering::Relaxed){
-                    if last_b_bass==u64::MAX||beat>last_b_bass{
+                    if beat>last_b_bass{
                         let bvol=t_bass.volume.load(Ordering::Relaxed);
                         let bass_note = if walking {
                             let bi = (beat % 4) as usize;
@@ -343,7 +343,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                         } else {
                             root
                         };
-                        if last_b_bass!=u64::MAX{no(c,ch_bass,prev_bass_note,0)}
+                        no(c,ch_bass,prev_bass_note,0);
                         no(c,ch_bass,bass_note,bvol);
                         prev_bass_note=bass_note;
                         last_b_bass=beat;
