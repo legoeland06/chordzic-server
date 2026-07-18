@@ -33,6 +33,7 @@ struct Live {
     tempo: AtomicU16,
     stop: AtomicBool,
     sig: AtomicU16,
+    walking: AtomicBool,
 }
 
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
@@ -63,6 +64,7 @@ struct PlayReq{
     #[serde(default="s44")]sig:String,#[serde(default="rk")]pattern:String,#[serde(default="i51")]inst_val:u16,
     loop_enabled:Option<bool>,
     tracks:Option<Vec<TrackCfg>>,
+    walking:Option<bool>,
 }
 
 #[derive(Deserialize,Clone)] struct ChordEv{notes:Vec<String>,#[serde(default="b4")]beats:f64}
@@ -73,6 +75,7 @@ struct Cfg{
     drums:Option<bool>,bass:Option<bool>,arpeggios:Option<bool>,nappes:Option<bool>,
     pattern:Option<String>,tempo:Option<u16>,sig:Option<String>,instrument:Option<u16>,
     tracks:Option<Vec<TrackCfg>>,
+    walking:Option<bool>,
 }
 
 fn t120()->u32{120}fn y()->bool{true}fn n()->bool{false}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
@@ -84,6 +87,10 @@ fn note_midi(s:&str)->Result<u8,String>{
     let n=match u.as_str(){"DB"=>"C#","EB"=>"D#","GB"=>"F#","AB"=>"G#","BB"=>"A#",_=>&u};
     let i=["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"].iter().position(|x|x==&n).ok_or("?")?;
     let m=(o+1)*12+i as i32;if m<0||m>127{return Err("o".into())}Ok(m as u8)
+}
+
+fn notes_from_ev(e:&ChordEv)->Vec<u8>{
+    let mut v=vec![];for n in &e.notes{if let Ok(x)=note_midi(n){v.push(x)}}v
 }
 
 fn init_midi()->Option<MidiHandle>{
@@ -102,10 +109,84 @@ fn pc(c:&mut MidiOutputConnection,ch:u8,v:u8){snd(c,&[0xC0|ch,v])}
 fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v])}
 fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,9]{cc(c,ch,123,0)}}
 
+// ─── Walking Bass ────────────────────────────────────────────────────────
+/// Genere 4 notes de walking bass pour une mesure (4 temps)
+/// current_notes: [root, chord_tone1, chord_tone2, ...] en MIDI absolu
+/// next_root: fondamentale du prochain accord en MIDI absolu
+fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8; 4] {
+    let root = current_notes[0];
+    let chord_tones: Vec<u8> = if current_notes.len() > 1 {
+        // Ramener les chord tones dans l'octave basse (MIDI 28-48)
+        current_notes[1..].iter().map(|&n| {
+            let mut oct = n;
+            while oct > root + 12 && oct >= 12 { oct -= 12; }
+            while oct < root - 12 { oct += 12; }
+            oct
+        }).collect()
+    } else {
+        vec![root + 7] // quinte par defaut
+    };
+    // Enlever les doublons
+    let mut tones: Vec<u8> = chord_tones.clone();
+    tones.sort();
+    tones.dedup();
+    let tones = tones;
+
+    // Temps 1 : fondamentale (ancrage)
+    let b1 = root;
+
+    // Temps 2 : chord tone aleatoire
+    let idx2 = (seed as usize) % tones.len();
+    let b2 = tones[idx2];
+
+    // Temps 3 : chord tone different du temps 2
+    let filtered: Vec<u8> = tones.iter().filter(|&&n| n != b2).copied().collect();
+    let b3 = if filtered.is_empty() { b2 + 7 } else { filtered[(seed.wrapping_add(7) as usize) % filtered.len()] };
+
+    // Temps 4 : note d'approche vers next_root
+    let b4 = match (seed % 100) as u8 {
+        0..=49 => { // Approche chromatique (50%)
+            let dir = if seed % 2 == 0 { 1i8 } else { -1i8 };
+            let mut app = (next_root as i16 + dir as i16) as u8;
+            // Si l'approche est trop loin de la tessiture, essayer l'autre direction
+            if app < 28 || app > 48 {
+                app = (next_root as i16 - dir as i16) as u8;
+            }
+            // Dernier recours : next_root lui-meme
+            if app < 28 { app = next_root + 12; }
+            if app > 48 { app = next_root - 12; }
+            app
+        }
+        50..=84 => { // Approche dominante (35%)
+            let mut app = next_root + 7;
+            if app > 48 { app -= 12; }
+            app
+        }
+        _ => { // Approche diatonique (15%) : chord tone le plus proche de next_root
+            tones.iter()
+                .min_by_key(|&&t| {
+                    let diff = if t > next_root { t - next_root } else { next_root - t };
+                    diff
+                })
+                .copied()
+                .unwrap_or(next_root)
+        }
+    };
+
+    [b1, b2, b3, b4]
+}
+
+/// Maintient une note dans la tessiture basse (28-48)
+fn bass_clamp(n: u8) -> u8 {
+    if n < 28 { n + 12 }
+    else if n > 48 { n - 12 }
+    else { n }
+}
+
+// ─── MIDI helpers ───────────────────────────────────────────────────────
 const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
 const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
-const HH_BEAT:u8=80;
-const HH_8TH:u8=65;
+const HH_BEAT:u8=80; const HH_8TH:u8=65;
 
 fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64,vol:u8){
     if!on_beat&&!on_eighth{return}
@@ -139,7 +220,6 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
         }}else if on_eighth{no(c,9,DRUM_HH,h8);}
     }
 }
-
 fn vscale(vol:u8,base:u8)->u8{((vol as u16*base as u16)/127).min(127) as u8}
 
 fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
@@ -154,7 +234,7 @@ fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
 fn setup_tracks(c:&mut MidiOutputConnection,lc:&Live){
     for t in &lc.tracks {
         let ch=t.channel;
-        if ch==9{pc(c,ch,1);continue} // drums = kit standard
+        if ch==9{pc(c,ch,1);continue}
         cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2);
         pc(c,ch,t.program.load(Ordering::Relaxed)as u8);
     }
@@ -174,6 +254,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         let ch_lead=t_lead.channel;
         let ch_bass=t_bass.channel;
         let ch_str=t_str.channel;
+        let walking=lc.walking.load(Ordering::Relaxed);
+        let mut seed:u64 = 0;
 
         for(i,e)in ev.iter().enumerate(){
             let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
@@ -187,6 +269,24 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             let mut idx=0u64;
             let mut last_b_drums=u64::MAX;
             let mut last_b_bass=u64::MAX;
+            let mut prev_bass_note:u8=0;
+
+            // Generation du walking bass pour cet accord
+            let mut walking_notes:[u8;4]=[root,root,root,root];
+            if walking {
+                let next_root = if let Some(ne) = ev.get(i+1) {
+                    let nv = notes_from_ev(ne);
+                    if !nv.is_empty() { nv[0] } else { root }
+                } else {
+                    // Dernier accord : boucler sur le premier
+                    if let Some(ne) = ev.get(0) {
+                        let nv = notes_from_ev(ne);
+                        if !nv.is_empty() { nv[0] } else { root }
+                    } else { root }
+                };
+                walking_notes = generate_walking_bass(&m, next_root, seed);
+                seed = seed.wrapping_add(1);
+            }
 
             // Nappes (Strings)
             if !t_str.mute.load(Ordering::Relaxed) {
@@ -225,12 +325,19 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     }
                 }
 
-                // Basse (sur le beat)
+                // Basse (Walking ou root)
                 if !t_bass.mute.load(Ordering::Relaxed){
                     if last_b_bass==u64::MAX||beat>last_b_bass{
                         let bvol=t_bass.volume.load(Ordering::Relaxed);
-                        no(c,ch_bass,root,bvol);
-                        if last_b_bass!=u64::MAX{no(c,ch_bass,root,0)}
+                        let bass_note = if walking {
+                            let bi = (beat % 4) as usize;
+                            walking_notes[bi]
+                        } else {
+                            root
+                        };
+                        if last_b_bass!=u64::MAX{no(c,ch_bass,prev_bass_note,0)}
+                        no(c,ch_bass,bass_note,bvol);
+                        prev_bass_note=bass_note;
                         last_b_bass=beat;
                     }
                 }
@@ -248,7 +355,6 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             }
             if lc.stop.load(Ordering::Relaxed){break}
         }
-        // Couper les nappes residuelles
         for n in &prev_nappe{no(c,ch_str,*n,0)}
         if lc.stop.load(Ordering::Relaxed) || !do_loop {break}
     }
@@ -256,7 +362,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
     println!("  done ({} evts)", ev.len());
 }
 
-// ─── Application des tracks depuis une config ───────────────────────────
+// ─── Application des tracks ──────────────────────────────────────────────
 fn apply_tracks(lc:&Live,cfg:&[TrackCfg]){
     for tc in cfg{
         let idx:Option<usize>=lc.tracks.iter().position(|t|t.channel==tc.channel);
@@ -272,17 +378,13 @@ fn apply_tracks(lc:&Live,cfg:&[TrackCfg]){
 async fn idx()->impl IntoResponse{Html(include_str!("../static/index.html"))}
 
 async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse{
-    // Compat ascendante: les anciens flags mettent a jour les tracks correspondants
     let lv=&s.live;
     if b.tempo>0{lv.tempo.store(b.tempo as u16,Ordering::Relaxed)}
     lv.sig.store(sig_code(&b.sig),Ordering::Relaxed);
     lv.pattern.store(pat(&b.pattern),Ordering::Relaxed);
     lv.stop.store(false,Ordering::Relaxed);
-
-    // Tracks via le nouveau systeme
+    if let Some(w)=b.walking{lv.walking.store(w,Ordering::Relaxed)}
     if let Some(ref t)=b.tracks{apply_tracks(lv,t)}
-
-    // Compat anciens flags : n'applique que si le nouveau systeme tracks n'est PAS utilise
     if b.tracks.is_none() {
         lv.tracks[TRACK_LEAD].program.store(b.inst_val,Ordering::Relaxed);
         lv.tracks[TRACK_LEAD].mute.store(!b.arps,Ordering::Relaxed);
@@ -290,7 +392,6 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
         lv.tracks[TRACK_STR].mute.store(!b.nappes,Ordering::Relaxed);
         lv.tracks[TRACK_DRUMS].mute.store(!b.drums,Ordering::Relaxed);
     }
-
     let do_loop=b.loop_enabled.unwrap_or(false);
     let ev:&[ChordEv]=if!b.seq.is_empty(){b.seq.as_slice()}else if!b.sequence.is_empty(){b.sequence.as_slice()}else{&[]};
     if let Some(ref h)=s.midi{
@@ -307,7 +408,6 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
 async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     let lv=&s.live;
     if let Some(ref t)=b.tracks{apply_tracks(lv,t)}
-    // Compat anciens flags
     if let Some(v)=b.drums{lv.tracks[TRACK_DRUMS].mute.store(!v,Ordering::Relaxed)}
     if let Some(v)=b.bass{lv.tracks[TRACK_BASS].mute.store(!v,Ordering::Relaxed)}
     if let Some(v)=b.arpeggios{lv.tracks[TRACK_LEAD].mute.store(!v,Ordering::Relaxed)}
@@ -316,6 +416,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     if let Some(t)=b.tempo{lv.tempo.store(t,Ordering::Relaxed)}
     if let Some(ref sg)=b.sig{lv.sig.store(sig_code(sg),Ordering::Relaxed)}
     if let Some(iv)=b.instrument{lv.tracks[TRACK_LEAD].program.store(iv,Ordering::Relaxed)}
+    if let Some(w)=b.walking{lv.walking.store(w,Ordering::Relaxed)}
     Json(Rsp{status:"ok".into()})
 }
 
@@ -330,12 +431,13 @@ async fn main(){
     println!("csrs");let midi=init_midi();
     let state=AppState{midi,live:Arc::new(Live{
         tracks: [
-            LiveTrack::new(0,51,15),   // Lead (canal 0, program 51, vol 15)
-            LiveTrack::new(2,33,40),   // Bass (canal 2, program 33, vol 40)
-            LiveTrack::new(3,48,30),   // Strings (canal 3, program 48, vol 30)
-            LiveTrack::new(9,1,80),    // Drums (canal 9, kit std, vol 80)
+            LiveTrack::new(0,51,15),   // Lead (canal 0)
+            LiveTrack::new(2,33,40),   // Bass (canal 2)
+            LiveTrack::new(3,48,30),   // Strings (canal 3)
+            LiveTrack::new(9,1,80),    // Drums (canal 9)
         ],
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),
+        walking:AtomicBool::new(false),
     })};
     let app=Router::new().route("/",get(idx)).route("/play",post(play))
         .route("/config",post(conf)).route("/stop",post(stop))
