@@ -30,6 +30,7 @@ struct PlayReq{
     #[serde(default="t120")]tempo:u32,#[serde(default="y")]drums:bool,
     #[serde(default="y")]bass:bool,#[serde(default="y")]arps:bool,#[serde(default="n")]nappes:bool,
     #[serde(default="s44")]sig:String,#[serde(default="rk")]pattern:String,#[serde(default="i51")]inst_val:u16,
+    loop_enabled:Option<bool>,
 }
 #[derive(Deserialize,Clone)] struct ChordEv{notes:Vec<String>,#[serde(default="b4")]beats:f64}
 #[derive(Serialize)] struct Rsp{status:String}
@@ -87,7 +88,7 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             2=>{no(c,9,DRUM_KICK,75);no(c,9,DRUM_HH,50);}3=>{no(c,9,DRUM_SNARE,65);no(c,9,DRUM_HH,50);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,45);}
         PAT_BOSSA=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,55);no(c,9,DRUM_HH,45);}1=>{no(c,9,DRUM_SNARE,30);no(c,9,DRUM_HH,45);} // snare tres leger
+            0=>{no(c,9,DRUM_KICK,55);no(c,9,DRUM_HH,45);}1=>{no(c,9,DRUM_SNARE,30);no(c,9,DRUM_HH,45);}
             2=>{no(c,9,DRUM_KICK,60);no(c,9,DRUM_HH,45);}3=>{no(c,9,DRUM_KICK,50);no(c,9,DRUM_HH,45);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,40);}
         PAT_ONEDROP=>if on_beat{match b{
@@ -110,90 +111,86 @@ fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
     rch(c);println!("  notes: {v:?}");
 }
 
-fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live){
-    rch(c);
-    for&ch in&[0u8,1,2,3]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
-    let iv=lc.inst_val.load(Ordering::Relaxed)as u8;pc(c,0,iv);pc(c,1,iv);pc(c,2,33);
-    pc(c,3,48); // String Ensemble 1 pour les nappes
-    pc(c,9,1); // Standard Kit
-    std::thread::sleep(Duration::from_millis(2));
+fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
+    loop {
+        rch(c);
+        for&ch in&[0u8,1,2,3]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
+        let iv=lc.inst_val.load(Ordering::Relaxed)as u8;pc(c,0,iv);pc(c,1,iv);pc(c,2,33);
+        pc(c,3,48); // String Ensemble 1 pour les nappes
+        pc(c,9,1); // Standard Kit
+        std::thread::sleep(Duration::from_millis(2));
 
-    // Notes nappes précédentes (pour noteoff)
-    let mut prev_nappe:Vec<u8>=vec![];
+        let mut prev_nappe:Vec<u8>=vec![];
 
-    for(i,e)in ev.iter().enumerate(){
-        let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
-        if m.is_empty(){continue}
-        if i>0{rch(c);cc(c,9,120,0)}
+        for(i,e)in ev.iter().enumerate(){
+            let mut m:Vec<u8>=vec![];for n in&e.notes{if let Ok(x)=note_midi(n){m.push(x)}}
+            if m.is_empty(){continue}
+            if i>0{rch(c);cc(c,9,120,0)}
 
-        let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
-        // Les nappes tiennent toutes les notes (sauf la basse)
-        let nappe_notes:Vec<u8>=m[1..].to_vec();
-        let dur=(60_000.0/lc.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
-        let start=std::time::Instant::now();
-        let mut idx=0u64;
-        let mut last_b=u64::MAX;
+            let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
+            let nappe_notes:Vec<u8>=m[1..].to_vec();
+            let dur=(60_000.0/lc.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
+            let start=std::time::Instant::now();
+            let mut idx=0u64;
+            let mut last_b=u64::MAX;
 
-        // Nappes : début d'accord → NOTE_ON, fin → NOTE_OFF
-        let np=lc.nappes.load(Ordering::Relaxed);
-        if np{
-            // Couper les notes nappes précédentes
-            for n in &prev_nappe{no(c,3,*n,0)}
-            // Jouer les notes nappes sur canal 3 (strings, vel 30)
-            for n in &nappe_notes{no(c,3,*n,30)}
-            prev_nappe=nappe_notes.clone();
-        }
+            let np=lc.nappes.load(Ordering::Relaxed);
+            if np{
+                for n in &prev_nappe{no(c,3,*n,0)}
+                for n in &nappe_notes{no(c,3,*n,30)}
+                prev_nappe=nappe_notes.clone();
+            }
 
-        while(start.elapsed().as_millis()as u64)<dur&&!lc.stop.load(Ordering::Relaxed){
-            let tempo_f=lc.tempo.load(Ordering::Relaxed).max(20)as f64;
-            let bd_ms=60_000.0/tempo_f;
-            let delay_ms=(bd_ms/4.0).max(30.0);
+            while(start.elapsed().as_millis()as u64)<dur&&!lc.stop.load(Ordering::Relaxed){
+                let tempo_f=lc.tempo.load(Ordering::Relaxed).max(20)as f64;
+                let bd_ms=60_000.0/tempo_f;
+                let delay_ms=(bd_ms/4.0).max(30.0);
 
-            let target=start+Duration::from_secs_f64(idx as f64*delay_ms/1000.0);
-            let now=std::time::Instant::now();
-            if target>now{std::thread::sleep(target-now)}
+                let target=start+Duration::from_secs_f64(idx as f64*delay_ms/1000.0);
+                let now=std::time::Instant::now();
+                if target>now{std::thread::sleep(target-now)}
 
-            let elapsed_ms=start.elapsed().as_secs_f64()*1000.0;
-            let dr=lc.drums.load(Ordering::Relaxed);
-            let ba=lc.bass.load(Ordering::Relaxed);
-            let ar=lc.arpeggios.load(Ordering::Relaxed);
-            let pt=lc.pattern.load(Ordering::Relaxed);
-            let sig=lc.sig.load(Ordering::Relaxed);
-            let bars=(sig/10).max(1)as u64;
+                let elapsed_ms=start.elapsed().as_secs_f64()*1000.0;
+                let dr=lc.drums.load(Ordering::Relaxed);
+                let ba=lc.bass.load(Ordering::Relaxed);
+                let ar=lc.arpeggios.load(Ordering::Relaxed);
+                let pt=lc.pattern.load(Ordering::Relaxed);
+                let sig=lc.sig.load(Ordering::Relaxed);
+                let bars=(sig/10).max(1)as u64;
 
-            // Batterie + basse
-            let beat=(elapsed_ms/bd_ms)as u64;
-            if dr||ba{
-                if last_b==u64::MAX||beat>last_b{
-                    if dr{drum_hit(c,beat,pt,true,false,bars);}
-                    if ba{no(c,2,root,40);if last_b!=u64::MAX{no(c,2,root,0)}}
-                    last_b=beat;
-                }
-                if dr{
-                    let beat_pos=elapsed_ms%bd_ms;
-                    if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
-                        drum_hit(c,beat,pt,false,true,bars);
+                let beat=(elapsed_ms/bd_ms)as u64;
+                if dr||ba{
+                    if last_b==u64::MAX||beat>last_b{
+                        if dr{drum_hit(c,beat,pt,true,false,bars);}
+                        if ba{no(c,2,root,40);if last_b!=u64::MAX{no(c,2,root,0)}}
+                        last_b=beat;
+                    }
+                    if dr{
+                        let beat_pos=elapsed_ms%bd_ms;
+                        if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
+                            drum_hit(c,beat,pt,false,true,bars);
+                        }
                     }
                 }
-            }
 
-            // Arpège
-            let tick=idx%arp.len().max(1)as u64;
-            if ar&&!arp.is_empty(){
-                if idx>0{let p=arp[((idx-1)%arp.len()as u64)as usize];no(c,0,p,0);no(c,1,p,0)}
-                no(c,0,arp[tick as usize],15);no(c,1,arp[tick as usize],15);
-            }
+                let tick=idx%arp.len().max(1)as u64;
+                if ar&&!arp.is_empty(){
+                    if idx>0{let p=arp[((idx-1)%arp.len()as u64)as usize];no(c,0,p,0);no(c,1,p,0)}
+                    no(c,0,arp[tick as usize],15);no(c,1,arp[tick as usize],15);
+                }
 
-            idx+=1;
+                idx+=1;
+            }
+            if lc.stop.load(Ordering::Relaxed){break}
         }
-        if lc.stop.load(Ordering::Relaxed){break}
+        // Couper les nappes résiduelles
+        for n in &prev_nappe{no(c,3,*n,0)}
+
+        if lc.stop.load(Ordering::Relaxed) || !do_loop {break}
     }
-    // Petit gap pour eviter le phasing de fin de boucle
-    std::thread::sleep(Duration::from_millis(30));
-    // Couper les nappes residuelles
-    for n in &prev_nappe{no(c,3,*n,0)}
+    // Nettoyage final
     rch(c);
-    println!("  done ({} evts)",ev.len());
+    println!("  done ({} evts)", ev.len());
 }
 
 async fn idx()->impl IntoResponse{Html(include_str!("../static/index.html"))}
@@ -208,11 +205,12 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
     s.live.inst_val.store(b.inst_val,Ordering::Relaxed);
     s.live.tempo.store(b.tempo as u16,Ordering::Relaxed);
     s.live.stop.store(false,Ordering::Relaxed);
+    let do_loop=b.loop_enabled.unwrap_or(false);
     let ev:&[ChordEv]=if!b.seq.is_empty(){b.seq.as_slice()}else if!b.sequence.is_empty(){b.sequence.as_slice()}else{&[]};
     if let Some(ref h)=s.midi{
         let h2=Arc::clone(h);
         if!ev.is_empty(){let sq=ev.to_vec();let l=Arc::clone(&s.live);
-            std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_seq(&mut c,&sq,&l)}});
+            std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_seq(&mut c,&sq,&l,do_loop)}});
         }else if let Some(ref n)=b.notes{let v=n.clone();
             std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_notes(&mut c,&v)}});
         }
