@@ -198,12 +198,16 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             0=>{no(c,9,DRUM_HH,h60);}1=>{no(c,9,DRUM_RIM,vscale(vol,70));no(c,9,DRUM_HH,h60);}
             2=>{no(c,9,DRUM_KICK,vscale(vol,85));no(c,9,DRUM_HH,h65);}3=>{no(c,9,DRUM_RIM,vscale(vol,70));no(c,9,DRUM_HH,h60);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h55);}
-        PAT_JAZZ=>if on_beat{match b{
-            0=>{no(c,9,DRUM_RIDE,h60);}
-            1=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(vol,40));} // ride + pedal HH
-            2=>{no(c,9,DRUM_RIDE,h60);}
-            3=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(vol,40));no(c,9,DRUM_RIM,vscale(vol,50));}_=>{} // ride + pedal HH + rim
-        }}else if on_eighth{no(c,9,DRUM_HH,35);}
+        PAT_JAZZ=>{
+            let b=beat%8; // 2 mesures
+            if on_beat{match b{
+                0=>{no(c,9,DRUM_RIDE,h60);}
+                2=>{no(c,9,DRUM_RIDE,h60);}
+                4=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(vol,40));} // ride + pedal HH
+                6=>{no(c,9,DRUM_RIDE,h60);}
+                7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(vol,40));no(c,9,DRUM_RIM,vscale(vol,50));}_=>{}
+            }}else if on_eighth{no(c,9,DRUM_HH,35);}
+        }
         PAT_POP=>if on_beat{match b{
             0=>{no(c,9,DRUM_KICK,vscale(vol,85));no(c,9,DRUM_HH,vscale(vol,50));}1=>{no(c,9,DRUM_SNARE,vscale(vol,70));no(c,9,DRUM_HH,vscale(vol,50));}
             2=>{no(c,9,DRUM_KICK,vscale(vol,75));no(c,9,DRUM_HH,vscale(vol,50));}3=>{no(c,9,DRUM_SNARE,vscale(vol,65));no(c,9,DRUM_HH,vscale(vol,50));}_=>{}
