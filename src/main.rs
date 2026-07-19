@@ -34,6 +34,8 @@ struct Live {
     stop: AtomicBool,
     sig: AtomicU16,
     walking: AtomicBool,
+    master_vol: AtomicU8,
+    use432: AtomicBool,
 }
 
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
@@ -76,6 +78,8 @@ struct Cfg{
     pattern:Option<String>,tempo:Option<u16>,sig:Option<String>,instrument:Option<u16>,
     tracks:Option<Vec<TrackCfg>>,
     walking:Option<bool>,
+    master_vol:Option<u8>,
+    use432:Option<bool>,
 }
 
 fn t120()->u32{120}fn y()->bool{true}fn n()->bool{false}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
@@ -107,7 +111,10 @@ fn snd(c:&mut MidiOutputConnection,m:&[u8]){if let Err(e)=c.send(m){eprintln!("�
 fn cc(c:&mut MidiOutputConnection,ch:u8,ctl:u8,v:u8){snd(c,&[0xB0|ch,ctl,v])}
 fn pc(c:&mut MidiOutputConnection,ch:u8,v:u8){snd(c,&[0xC0|ch,v])}
 fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v])}
+fn no_mv(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8,mv:u8){
+    snd(c,&[0x90|ch,n,((v as u16*mv as u16)/127).min(127)as u8])}
 fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,9]{cc(c,ch,123,0)}}
+fn pb(c:&mut MidiOutputConnection,ch:u8,val:u16){let lsb=(val&127)as u8;let msb=((val>>7)&127)as u8;snd(c,&[0xE0|ch,lsb,msb])}
 
 // ─── Walking Bass ────────────────────────────────────────────────────────
 /// Genere 4 notes de walking bass pour une mesure (4 temps)
@@ -187,53 +194,55 @@ fn bass_clamp(n: u8) -> u8 {
 const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
 const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
 const HH_BEAT:u8=80; const HH_8TH:u8=65;
+fn scale_mv(v:u8,mv:u8)->u8{((v as u16*mv as u16)/127).min(127)as u8}
 
-fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64,vol:u8){
+fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64,vol:u8,mv:u8){
     if!on_beat&&!on_eighth{return}
     let b=beat%bars;
-    let hh=vscale(vol,HH_BEAT);let h8=vscale(vol,HH_8TH);let h55=vscale(vol,55);let h50=vscale(vol,50);let h45=vscale(vol,45);let h40=vscale(vol,40);
-    let h60=vscale(vol,60);let h65=vscale(vol,65);
+    let v=scale_mv(vol,mv);
+    let hh=vscale(v,HH_BEAT);let h8=vscale(v,HH_8TH);let h55=vscale(v,55);let h50=vscale(v,50);let h45=vscale(v,45);let h40=vscale(v,40);
+    let h60=vscale(v,60);let h65=vscale(v,65);
     match pat{
         PAT_REGGAE=>if on_beat{match b{
-            0=>{no(c,9,DRUM_HH,h60);}1=>{no(c,9,DRUM_RIM,vscale(vol,70));no(c,9,DRUM_HH,h60);}
-            2=>{no(c,9,DRUM_KICK,vscale(vol,85));no(c,9,DRUM_HH,h65);}3=>{no(c,9,DRUM_RIM,vscale(vol,70));no(c,9,DRUM_HH,h60);}_=>{}
+            0=>{no(c,9,DRUM_HH,h60);}1=>{no(c,9,DRUM_RIM,vscale(v,70));no(c,9,DRUM_HH,h60);}
+            2=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,h65);}3=>{no(c,9,DRUM_RIM,vscale(v,70));no(c,9,DRUM_HH,h60);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h55);}
         PAT_JAZZ=>{
             let b=beat%8; // 2 mesures
             if on_beat{match b{
                 0=>{no(c,9,DRUM_RIDE,h60);}
                 2=>{no(c,9,DRUM_RIDE,h60);}
-                4=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(vol,40));} // ride + pedal HH
+                4=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));} // ride + pedal HH
                 6=>{no(c,9,DRUM_RIDE,h60);}
-                7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(vol,40));no(c,9,DRUM_RIM,vscale(vol,50));}_=>{}
+                7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));no(c,9,DRUM_RIM,vscale(v,50));}_=>{}
             }}else if on_eighth{no(c,9,DRUM_HH,35);}
         }
         PAT_POP=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(vol,85));no(c,9,DRUM_HH,vscale(vol,50));}1=>{no(c,9,DRUM_SNARE,vscale(vol,70));no(c,9,DRUM_HH,vscale(vol,50));}
-            2=>{no(c,9,DRUM_KICK,vscale(vol,75));no(c,9,DRUM_HH,vscale(vol,50));}3=>{no(c,9,DRUM_SNARE,vscale(vol,65));no(c,9,DRUM_HH,vscale(vol,50));}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,vscale(vol,45));}
+            0=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,vscale(v,50));}1=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,vscale(v,50));}
+            2=>{no(c,9,DRUM_KICK,vscale(v,75));no(c,9,DRUM_HH,vscale(v,50));}3=>{no(c,9,DRUM_SNARE,vscale(v,65));no(c,9,DRUM_HH,vscale(v,50));}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,vscale(v,45));}
         PAT_BOSSA=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(vol,55));no(c,9,DRUM_HH,h45);}1=>{no(c,9,DRUM_SNARE,vscale(vol,30));no(c,9,DRUM_HH,h45);}
-            2=>{no(c,9,DRUM_KICK,vscale(vol,60));no(c,9,DRUM_HH,h45);}3=>{no(c,9,DRUM_KICK,vscale(vol,50));no(c,9,DRUM_HH,h45);}_=>{}
+            0=>{no(c,9,DRUM_KICK,vscale(v,55));no(c,9,DRUM_HH,h45);}1=>{no(c,9,DRUM_SNARE,vscale(v,30));no(c,9,DRUM_HH,h45);}
+            2=>{no(c,9,DRUM_KICK,vscale(v,60));no(c,9,DRUM_HH,h45);}3=>{no(c,9,DRUM_KICK,vscale(v,50));no(c,9,DRUM_HH,h45);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         PAT_ONEDROP=>if on_beat{match b{
             0=>{no(c,9,DRUM_HH,h55);}1=>{no(c,9,DRUM_HH,h55);}
-            2=>{no(c,9,DRUM_KICK,vscale(vol,90));no(c,9,DRUM_RIM,vscale(vol,65));no(c,9,DRUM_HH,h60);}3=>{no(c,9,DRUM_HH,h55);}_=>{}
+            2=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_RIM,vscale(v,65));no(c,9,DRUM_HH,h60);}3=>{no(c,9,DRUM_HH,h55);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h50);}
         _=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(vol,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,vscale(vol,75));no(c,9,DRUM_HH,hh);}
-            2=>{no(c,9,DRUM_KICK,vscale(vol,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,vscale(vol,70));no(c,9,DRUM_HH,hh);}_=>{}
+            0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,vscale(v,75));no(c,9,DRUM_HH,hh);}
+            2=>{no(c,9,DRUM_KICK,vscale(v,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,hh);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h8);}
     }
 }
 fn vscale(vol:u8,base:u8)->u8{((vol as u16*base as u16)/127).min(127) as u8}
 
-fn play_notes(c:&mut MidiOutputConnection,notes:&[String]){
+fn play_notes(c:&mut MidiOutputConnection,notes:&[String],mv:u8){
     let mut v:Vec<u8>=vec![];for n in notes{if let Ok(m)=note_midi(n){v.push(m)}}if v.is_empty(){return}
     rch(c);
     for&ch in&[0u8,2,3]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
     pc(c,0,51);pc(c,2,33);
-    for _ in 0..2{for&n in&v{std::thread::sleep(Duration::from_millis(240));if n<48{no(c,2,n,35)}else{no(c,0,n,15)}}}
+    for _ in 0..2{for&n in&v{std::thread::sleep(Duration::from_millis(240));if n<48{no_mv(c,2,n,35,mv)}else{no_mv(c,0,n,15,mv)}}}
     rch(c);println!("  notes: {v:?}");
 }
 
@@ -252,6 +261,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         std::thread::sleep(Duration::from_millis(2));
 
         let mut prev_nappe:Vec<u8>=vec![];
+        let mut prev_lead:Vec<u8>=vec![];
         let t_lead=&lc.tracks[TRACK_LEAD];
         let t_bass=&lc.tracks[TRACK_BASS];
         let t_str=&lc.tracks[TRACK_STR];
@@ -260,6 +270,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         let ch_bass=t_bass.channel;
         let ch_str=t_str.channel;
         let walking=lc.walking.load(Ordering::Relaxed);
+        let mv=lc.master_vol.load(Ordering::Relaxed);
         let mut seed:u64 = 0;
 
         for(i,e)in ev.iter().enumerate(){
@@ -286,14 +297,14 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     // Batterie seulement
                     if !t_drums.mute.load(Ordering::Relaxed){
                         if last_b_drums==u64::MAX||beat>last_b_drums{
-                            let dvol=t_drums.volume.load(Ordering::Relaxed);
-                            drum_hit(c,beat,pt,true,false,bars,dvol);
+                            let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                            drum_hit(c,beat,pt,true,false,bars,dvol,127);
                             last_b_drums=beat;
                         }
                         let beat_pos=elapsed_ms%bd_ms;
                         if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
-                            let dvol=t_drums.volume.load(Ordering::Relaxed);
-                            drum_hit(c,beat,pt,false,true,bars,dvol);
+                            let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                            drum_hit(c,beat,pt,false,true,bars,dvol,127);
                         }
                     }
                     idx+=1;
@@ -331,9 +342,9 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
             // Basse : jouer le premier temps IMMEDIATEMENT (pas via le tick)
             if !t_bass.mute.load(Ordering::Relaxed) {
-                let bvol=t_bass.volume.load(Ordering::Relaxed);
+                let bvol=scale_mv(t_bass.volume.load(Ordering::Relaxed),mv);
                 let bass_note = if walking { walking_notes[0] } else { root };
-                no(c,ch_bass,bass_note,bvol);
+                no_mv(c,ch_bass,bass_note,bvol,mv);
                 prev_bass_note=bass_note;
                 last_b_bass=0;
             }
@@ -341,8 +352,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             // Nappes (Strings)
             if !t_str.mute.load(Ordering::Relaxed) {
                 for n in &prev_nappe{no(c,ch_str,*n,0)}
-                let str_vol=t_str.volume.load(Ordering::Relaxed);
-                for n in &nappe_notes{no(c,ch_str,*n,str_vol)}
+                let str_vol=scale_mv(t_str.volume.load(Ordering::Relaxed),mv);
+                for n in &nappe_notes{no_mv(c,ch_str,*n,str_vol,mv)}
                 prev_nappe=nappe_notes.clone();
             }
 
@@ -364,21 +375,21 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 // Batterie
                 if !t_drums.mute.load(Ordering::Relaxed){
                     if last_b_drums==u64::MAX||beat>last_b_drums{
-                        let dvol=t_drums.volume.load(Ordering::Relaxed);
-                        drum_hit(c,beat,pt,true,false,bars,dvol);
+                        let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                        drum_hit(c,beat,pt,true,false,bars,dvol,127);
                         last_b_drums=beat;
                     }
                     let beat_pos=elapsed_ms%bd_ms;
                     if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
-                        let dvol=t_drums.volume.load(Ordering::Relaxed);
-                        drum_hit(c,beat,pt,false,true,bars,dvol);
+                        let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                        drum_hit(c,beat,pt,false,true,bars,dvol,127);
                     }
                 }
 
                 // Basse (Walking ou root)
                 if !t_bass.mute.load(Ordering::Relaxed){
                     if beat>last_b_bass{
-                        let bvol=t_bass.volume.load(Ordering::Relaxed);
+                        let bvol=scale_mv(t_bass.volume.load(Ordering::Relaxed),mv);
                         let bass_note = if walking {
                             let bi = (beat % 4) as usize;
                             walking_notes[bi]
@@ -386,7 +397,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                             root
                         };
                         no(c,ch_bass,prev_bass_note,0);
-                        no(c,ch_bass,bass_note,bvol);
+                        no_mv(c,ch_bass,bass_note,bvol,mv);
                         prev_bass_note=bass_note;
                         last_b_bass=beat;
                     }
@@ -397,8 +408,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 let lead_mute=t_lead.mute.load(Ordering::Relaxed);
                 if !lead_mute&&!arp.is_empty(){
                     if idx>0{let p=arp[((idx-1)%arp.len()as u64)as usize];no(c,ch_lead,p,0)}
-                    let lvol=t_lead.volume.load(Ordering::Relaxed);
-                    no(c,ch_lead,arp[tick as usize],lvol);
+                    let lvol=scale_mv(t_lead.volume.load(Ordering::Relaxed),mv);
+                    no_mv(c,ch_lead,arp[tick as usize],lvol,mv);
                 }
 
                 idx+=1;
@@ -406,6 +417,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             if lc.stop.load(Ordering::Relaxed){break}
         }
         for n in &prev_nappe{no(c,ch_str,*n,0)}
+        for n in &prev_lead{no(c,ch_lead,*n,0)}
         if lc.stop.load(Ordering::Relaxed) || !do_loop {break}
     }
     rch(c);
@@ -448,8 +460,8 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
         let h2=Arc::clone(h);
         if!ev.is_empty(){let sq=ev.to_vec();let l=Arc::clone(lv);
             std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_seq(&mut c,&sq,&l,do_loop)}});
-        }else if let Some(ref n)=b.notes{let v=n.clone();
-            std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_notes(&mut c,&v)}});
+        }else if let Some(ref n)=b.notes{let v=n.clone();let l2=Arc::clone(lv);
+            std::thread::spawn(move||{let mv=l2.master_vol.load(Ordering::Relaxed);if let Ok(mut c)=h2.lock(){play_notes(&mut c,&v,mv)}});
         }
     }
     Json(Rsp{status:"ok".into()})
@@ -467,6 +479,17 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     if let Some(ref sg)=b.sig{lv.sig.store(sig_code(sg),Ordering::Relaxed)}
     if let Some(iv)=b.instrument{lv.tracks[TRACK_LEAD].program.store(iv,Ordering::Relaxed)}
     if let Some(w)=b.walking{lv.walking.store(w,Ordering::Relaxed)}
+    if let Some(m)=b.master_vol{lv.master_vol.store(m,Ordering::Relaxed);}
+    if let Some(u)=b.use432{
+        let was=lv.use432.swap(u,Ordering::Relaxed);
+        if was!=u{
+            if let Some(ref h)=s.midi{
+                if let Ok(mut c)=h.lock(){
+                    for&ch in&[0u8,2,3,9]{pb(&mut c,ch,if u{6881}else{8192})}
+                }
+            }
+        }
+    }
     Json(Rsp{status:"ok".into()})
 }
 
@@ -487,7 +510,7 @@ async fn main(){
             LiveTrack::new(9,1,80),    // Drums (canal 9)
         ],
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),
-        walking:AtomicBool::new(false),
+        walking:AtomicBool::new(false),master_vol:AtomicU8::new(127),use432:AtomicBool::new(false),
     })};
     let app=Router::new().route("/",get(idx)).route("/play",post(play))
         .route("/config",post(conf)).route("/stop",post(stop))
