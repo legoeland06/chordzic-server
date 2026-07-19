@@ -314,7 +314,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             }
             if i>0{rch(c);cc(c,9,120,0)}
 
-            let root=m[0];let arp:Vec<u8>=m[1..].to_vec();
+            let root=m[0];
             let nappe_notes:Vec<u8>=m[1..].to_vec();
             let dur=(60_000.0/lc.tempo.load(Ordering::Relaxed).max(20)as f64*e.beats)as u64;
             let start=std::time::Instant::now();
@@ -403,13 +403,20 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     }
                 }
 
-                // Arpège (Lead)
-                let tick=idx%arp.len().max(1)as u64;
-                let lead_mute=t_lead.mute.load(Ordering::Relaxed);
-                if !lead_mute&&!arp.is_empty(){
-                    if idx>0{let p=arp[((idx-1)%arp.len()as u64)as usize];no(c,ch_lead,p,0)}
-                    let lvol=scale_mv(t_lead.volume.load(Ordering::Relaxed),mv);
-                    no_mv(c,ch_lead,arp[tick as usize],lvol,mv);
+                // Pompe skank (Lead) - staccato sur contretemps (8eme)
+                if !m.is_empty(){
+                    let lead_mute=t_lead.mute.load(Ordering::Relaxed);
+                    // Note Off au tick pair (fin du off-beat precedent)
+                    if idx%2==0&&!prev_lead.is_empty(){
+                        for &n in &prev_lead{no(c,ch_lead,n,0)}
+                        prev_lead.clear();
+                    }
+                    // Note On sur le contretemps (tick impair)
+                    if idx%2==1&&!lead_mute{
+                        let lvol=scale_mv(t_lead.volume.load(Ordering::Relaxed),mv);
+                        prev_lead=m.clone();
+                        for &note in &m{no_mv(c,ch_lead,note,lvol,mv)}
+                    }
                 }
 
                 idx+=1;
