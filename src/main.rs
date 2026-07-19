@@ -514,7 +514,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
         if was!=u{
             if let Some(ref h)=s.midi{
                 if let Ok(mut c)=h.lock(){
-                    for&ch in&[0u8,2,3,9]{pb(&mut c,ch,if u{6881}else{8192})}
+                    for&ch in&[0u8,2,3,4]{pb(&mut c,ch,if u{6881}else{8192})}
                 }
             }
         }
