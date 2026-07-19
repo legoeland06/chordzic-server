@@ -13,6 +13,7 @@ const TRACK_LEAD:usize=0;
 const TRACK_BASS:usize=1;
 const TRACK_STR:usize=2;
 const TRACK_DRUMS:usize=3;
+const TRACK_ACCENT:usize=4;
 
 struct LiveTrack {
     channel: u8,
@@ -28,7 +29,7 @@ impl LiveTrack {
 }
 
 struct Live {
-    tracks: [LiveTrack; 4],
+    tracks: [LiveTrack; 5],
     pattern: AtomicU8,
     tempo: AtomicU16,
     stop: AtomicBool,
@@ -113,8 +114,9 @@ fn pc(c:&mut MidiOutputConnection,ch:u8,v:u8){snd(c,&[0xC0|ch,v])}
 fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v])}
 fn no_mv(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8,mv:u8){
     snd(c,&[0x90|ch,n,((v as u16*mv as u16)/127).min(127)as u8])}
-fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,9]{cc(c,ch,123,0)}}
+fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,4,9]{cc(c,ch,123,0)}}
 fn pb(c:&mut MidiOutputConnection,ch:u8,val:u16){let lsb=(val&127)as u8;let msb=((val>>7)&127)as u8;snd(c,&[0xE0|ch,lsb,msb])}
+
 
 // ─── Walking Bass ────────────────────────────────────────────────────────
 /// Genere 4 notes de walking bass pour une mesure (4 temps)
@@ -262,6 +264,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
         let mut prev_nappe:Vec<u8>=vec![];
         let mut prev_lead:Vec<u8>=vec![];
+        let mut prev_accent:Vec<u8>=vec![];
         let t_lead=&lc.tracks[TRACK_LEAD];
         let t_bass=&lc.tracks[TRACK_BASS];
         let t_str=&lc.tracks[TRACK_STR];
@@ -269,6 +272,8 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         let ch_lead=t_lead.channel;
         let ch_bass=t_bass.channel;
         let ch_str=t_str.channel;
+        let t_accent=&lc.tracks[TRACK_ACCENT];
+        let ch_accent=t_accent.channel;
         let walking=lc.walking.load(Ordering::Relaxed);
         let mv=lc.master_vol.load(Ordering::Relaxed);
         let mut seed:u64 = 0;
@@ -406,16 +411,32 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 // Pompe skank (Lead) - staccato sur contretemps (8eme)
                 if !m.is_empty(){
                     let lead_mute=t_lead.mute.load(Ordering::Relaxed);
-                    // Note Off au tick pair (fin du off-beat precedent)
-                    if idx%2==0&&!prev_lead.is_empty(){
+                    // Note Off au tick suivant immediat (staccato)
+                    if idx%4==3&&!prev_lead.is_empty(){
                         for &n in &prev_lead{no(c,ch_lead,n,0)}
                         prev_lead.clear();
                     }
-                    // Note On sur le contretemps (tick impair)
-                    if idx%2==1&&!lead_mute{
+                    // Note On sur le contretemps 8eme (3e 16eme du temps)
+                    if idx%4==2&&!lead_mute{
                         let lvol=scale_mv(t_lead.volume.load(Ordering::Relaxed),mv);
                         prev_lead=m.clone();
                         for &note in &m{no_mv(c,ch_lead,note,lvol,mv)}
+                    }
+                }
+
+                // Pompe accent temps 2&4 (canal 4, piano sec)
+                if !m.is_empty(){
+                    let accent_mute=t_accent.mute.load(Ordering::Relaxed);
+                    // Note Off au tick apres le temps 2 ou 4
+                    if idx%8==5&&!prev_accent.is_empty(){
+                        for &n in &prev_accent{no(c,ch_accent,n,0)}
+                        prev_accent.clear();
+                    }
+                    // Note On sur temps 2 et 4 (tick 4 et 12 = idx%8==4)
+                    if idx%8==4&&!accent_mute{
+                        let avol=scale_mv(t_accent.volume.load(Ordering::Relaxed),mv);
+                        prev_accent=m.clone();
+                        for &note in &m{no_mv(c,ch_accent,note,avol,mv)}
                     }
                 }
 
@@ -425,6 +446,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         }
         for n in &prev_nappe{no(c,ch_str,*n,0)}
         for n in &prev_lead{no(c,ch_lead,*n,0)}
+        for n in &prev_accent{no(c,ch_accent,*n,0)}
         if lc.stop.load(Ordering::Relaxed) || !do_loop {break}
     }
     rch(c);
@@ -515,6 +537,7 @@ async fn main(){
             LiveTrack::new(2,33,40),   // Bass (canal 2)
             LiveTrack::new(3,48,30),   // Strings (canal 3)
             LiveTrack::new(9,1,80),    // Drums (canal 9)
+            LiveTrack::new(4,2,20),    // Accent (canal 4, Bright Acoustic Piano)
         ],
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),
         walking:AtomicBool::new(false),master_vol:AtomicU8::new(127),use432:AtomicBool::new(false),
