@@ -1,3 +1,4 @@
+mod samples;
 use axum::{extract::State, response::{Html, Json, IntoResponse}, routing::{get, post}, Router};
 use midir::{MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
@@ -111,7 +112,7 @@ fn init_midi()->Option<MidiHandle>{
 fn snd(c:&mut MidiOutputConnection,m:&[u8]){if let Err(e)=c.send(m){eprintln!("⚠️{e}")}}
 fn cc(c:&mut MidiOutputConnection,ch:u8,ctl:u8,v:u8){snd(c,&[0xB0|ch,ctl,v])}
 fn pc(c:&mut MidiOutputConnection,ch:u8,v:u8){snd(c,&[0xC0|ch,v])}
-fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v])}
+fn no(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8){snd(c,&[0x90|ch,n,v]);if ch==9&&v>0{samples::play(n,v)}}
 fn no_mv(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8,mv:u8){
     snd(c,&[0x90|ch,n,((v as u16*mv as u16)/127).min(127)as u8])}
 fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,4,9]{cc(c,ch,123,0)}}
@@ -531,6 +532,7 @@ async fn stop(State(s):State<AppState>)->impl IntoResponse{
 #[tokio::main]
 async fn main(){
     println!("csrs");let midi=init_midi();
+    samples::init();
     let state=AppState{midi,live:Arc::new(Live{
         tracks: [
             LiveTrack::new(0,51,15),   // Lead (canal 0)
