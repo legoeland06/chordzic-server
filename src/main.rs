@@ -130,11 +130,11 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8;
         current_notes[1..].iter().map(|&n| {
             let mut oct = n;
             while oct > root + 12 && oct >= 12 { oct -= 12; }
-            while oct < root - 12 { oct += 12; }
+            while oct < root - 17 { oct += 12; }
             oct
         }).collect()
     } else {
-        vec![root + 7] // quinte par defaut
+        vec![root - 5] // quinte par defaut
     };
     // Enlever les doublons
     let mut tones: Vec<u8> = chord_tones.clone();
@@ -188,8 +188,8 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8;
 
 /// Maintient une note dans la tessiture basse (28-48)
 fn bass_clamp(n: u8) -> u8 {
-    if n < 28 { n + 12 }
-    else if n > 48 { n - 12 }
+    if n < 22 { n + 12 }
+    else if n > 42 { n - 12 }
     else { n }
 }
 
@@ -203,13 +203,15 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
     if!on_beat&&!on_eighth{return}
     let b=beat%bars;
     let v=scale_mv(vol,mv);
-    let hh=vscale(v,HH_BEAT);let h8=vscale(v,HH_8TH);let h55=vscale(v,55);let h50=vscale(v,50);let h45=vscale(v,45);let h40=vscale(v,40);
+    let hh=vscale(v,HH_BEAT);let h8=vscale(v,HH_8TH);let h55=vscale(v,55);let h50=vscale(v,50);let h45=vscale(v,45);let h40=vscale(v,10);
     let h60=vscale(v,60);let h65=vscale(v,65);
     match pat{
         PAT_REGGAE=>if on_beat{match b{
-            0=>{no(c,9,DRUM_HH,h60);}1=>{no(c,9,DRUM_RIM,vscale(v,70));no(c,9,DRUM_HH,h60);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,h65);}3=>{no(c,9,DRUM_RIM,vscale(v,70));no(c,9,DRUM_HH,h60);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,h55);}
+            0=>{no(c,9,DRUM_HH,h60);}
+            1=>{no(c,9,DRUM_HH,h60);}
+            2=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,h65);no(c,9,DRUM_SNARE,vscale(v,70));}
+            3=>{no(c,9,DRUM_HH,h60);}_=>{}
+        }}else if on_eighth{}
         PAT_JAZZ=>{
             let b=beat%8; // 2 mesures
             if on_beat{match b{
@@ -220,18 +222,25 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
                 7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));no(c,9,DRUM_RIM,vscale(v,50));}_=>{}
             }}else if on_eighth{no(c,9,DRUM_HH,35);}
         }
-        PAT_POP=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,vscale(v,50));}1=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,vscale(v,50));}
-            2=>{no(c,9,DRUM_KICK,vscale(v,75));no(c,9,DRUM_HH,vscale(v,50));}3=>{no(c,9,DRUM_SNARE,vscale(v,65));no(c,9,DRUM_HH,vscale(v,50));}_=>{}
+        PAT_POP=>{
+            let b=beat%8; // 2 mesures
+            if on_beat{match b{
+            0=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,vscale(v,50));}
+            2=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,vscale(v,50));}
+            4=>{no(c,9,DRUM_KICK,vscale(v,75));no(c,9,DRUM_HH,vscale(v,50));}
+            6=>{no(c,9,DRUM_SNARE,vscale(v,65));no(c,9,DRUM_HH,vscale(v,50));}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,vscale(v,45));}
+    }
         PAT_BOSSA=>if on_beat{match b{
             0=>{no(c,9,DRUM_KICK,vscale(v,55));no(c,9,DRUM_HH,h45);}1=>{no(c,9,DRUM_SNARE,vscale(v,30));no(c,9,DRUM_HH,h45);}
             2=>{no(c,9,DRUM_KICK,vscale(v,60));no(c,9,DRUM_HH,h45);}3=>{no(c,9,DRUM_KICK,vscale(v,50));no(c,9,DRUM_HH,h45);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         PAT_ONEDROP=>if on_beat{match b{
-            0=>{no(c,9,DRUM_HH,h55);}1=>{no(c,9,DRUM_HH,h55);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_RIM,vscale(v,65));no(c,9,DRUM_HH,h60);}3=>{no(c,9,DRUM_HH,h55);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,h50);}
+            0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,h55);}
+            1=>{no(c,9,DRUM_HH,h40);}
+            2=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_RIM,vscale(v,65));no(c,9,DRUM_HH,h45);}
+            3=>{no(c,9,DRUM_HH,h55);}_=>{}
+        }}else if on_eighth{}
         _=>if on_beat{match b{
             0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,vscale(v,75));no(c,9,DRUM_HH,hh);}
             2=>{no(c,9,DRUM_KICK,vscale(v,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,hh);}_=>{}
