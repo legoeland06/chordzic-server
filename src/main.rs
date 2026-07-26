@@ -173,9 +173,15 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64, minor: 
     // Temps 1 : fondamentale (ancrage)
     let b1 = root;
 
-    // Temps 2 : chord tone aleatoire, sauf si mineur → ton au-dessus de la fondamentale
+    // Temps 2 : si mineur, 50% ton au-dessus de la fondamentale, 50% chord tone aleatoire
     let b2 = if minor {
-        bass_clamp(root + 2)
+        match seed % 100 {
+            0..=49 => bass_clamp(root + 2),
+            _ => {
+                let idx2 = (seed as usize) % tones.len();
+                tones[idx2]
+            }
+        }
     } else {
         let idx2 = (seed as usize) % tones.len();
         tones[idx2]
