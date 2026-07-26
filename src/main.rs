@@ -176,7 +176,8 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64, minor: 
     // Temps 2 : si mineur, 50% ton au-dessus de la fondamentale, 50% chord tone aleatoire
     let b2 = if minor {
         match seed % 100 {
-            0..=49 => bass_clamp(root + 2),
+            0..=24 => root + 2,
+            25..=49 => root - 10,
             _ => {
                 let idx2 = (seed as usize) % tones.len();
                 tones[idx2]
@@ -247,7 +248,7 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
         PAT_REGGAE=>if on_beat{match b{
             0=>{no(c,9,DRUM_HH,h60);}
             1=>{no(c,9,DRUM_HH,h60);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,h65);no(c,9,DRUM_SNARE,vscale(v,70));}
+            2=>{no(c,9,DRUM_KICK,vscale(v,120));no(c,9,DRUM_HH,h65);no(c,9,DRUM_RIM,vscale(v,90));}
             3=>{no(c,9,DRUM_HH,h60);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         PAT_JAZZ=>{
@@ -378,7 +379,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
             // Generation du walking bass pour cet accord
             let mut walking_notes:[u8;4]=[root,root,root,root];
-            if walking {
+            if walking && PAT_REGGAE != lc.pattern.load(Ordering::Relaxed) {
                 let next_root = if let Some(ne) = ev.get(i+1) {
                     let nv = notes_from_ev(ne);
                     if !nv.is_empty() { nv[0] } else { root }
