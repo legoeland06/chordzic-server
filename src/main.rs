@@ -9,6 +9,9 @@ use tower_http::cors::CorsLayer;
 
 type MidiHandle = Arc<Mutex<MidiOutputConnection>>;
 
+// ─── Tones ──────────────────────────────────────────────────────────────
+const MIN_NOTE:u8=22; const MAX_NOTE:u8=42;
+
 // ─── Tracks ──────────────────────────────────────────────────────────────
 const TRACK_LEAD:usize=0;
 const TRACK_BASS:usize=1;
@@ -99,6 +102,27 @@ fn notes_from_ev(e:&ChordEv)->Vec<u8>{
     let mut v=vec![];for n in &e.notes{if let Ok(x)=note_midi(n){v.push(x)}}v
 }
 
+/// Determine si un accord est mineur (tierce mineure entre fondamentale et 3eme note)
+fn is_minor(chord: &ChordEv) -> bool {
+    let midi = notes_from_ev(chord);
+    // midi[0] = basse, midi[1] = fondamentale, midi[2+] = notes de l'accord
+    if midi.len() < 3 { return false; }
+    let root = midi[1];
+    // Chercher une tierce (3 ou 4 demi-tons au-dessus de la fondamentale)
+    let mut has_minor = false;
+    let mut has_major = false;
+    for &n in &midi[1..] {
+        let interval = if n >= root { n - root } else { n + 12 - root };
+        match interval {
+            3 => has_minor = true,
+            4 => has_major = true,
+            _ => {}
+        }
+    }
+    // Mineur si on a une tierce mineure et pas de tierce majeure
+    has_minor && !has_major
+}
+
 fn init_midi()->Option<MidiHandle>{
     let mo=MidiOutput::new("cs").ok()?;let p=mo.ports();
     if p.is_empty(){eprintln!("no port");return None}
@@ -119,20 +143,24 @@ fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,4,9]{cc(c,ch,123,0)}}
 fn pb(c:&mut MidiOutputConnection,ch:u8,val:u16){let lsb=(val&127)as u8;let msb=((val>>7)&127)as u8;snd(c,&[0xE0|ch,lsb,msb])}
 
 
+
 // ─── Walking Bass ────────────────────────────────────────────────────────
+/// Maintient une note dans la tessiture basse (MIN_NOTE-MAX_NOTE)
+fn bass_clamp(n: u8) -> u8 {
+    if n < MIN_NOTE { n + 12 }
+    else if n > MAX_NOTE { n - 12 }
+    else { n }
+}
+
 /// Genere 4 notes de walking bass pour une mesure (4 temps)
 /// current_notes: [root, chord_tone1, chord_tone2, ...] en MIDI absolu
 /// next_root: fondamentale du prochain accord en MIDI absolu
-fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8; 4] {
+/// minor: si vrai, temps 2 = fondamentale + 2 demi-tons (ton au-dessus)
+fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64, minor: bool) -> [u8; 4] {
     let root = current_notes[0];
     let chord_tones: Vec<u8> = if current_notes.len() > 1 {
-        // Ramener les chord tones dans l'octave basse (MIDI 28-48)
-        current_notes[1..].iter().map(|&n| {
-            let mut oct = n;
-            while oct > root + 12 && oct >= 12 { oct -= 12; }
-            while oct < root - 17 { oct += 12; }
-            oct
-        }).collect()
+        // Ramener les chord tones dans l'octave basse (MIDI MIN_NOTE-MAX_NOTE)
+        current_notes[1..].iter().map(|&n| bass_clamp(n)).collect()
     } else {
         vec![root - 5] // quinte par defaut
     };
@@ -145,9 +173,13 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8;
     // Temps 1 : fondamentale (ancrage)
     let b1 = root;
 
-    // Temps 2 : chord tone aleatoire
-    let idx2 = (seed as usize) % tones.len();
-    let b2 = tones[idx2];
+    // Temps 2 : chord tone aleatoire, sauf si mineur → ton au-dessus de la fondamentale
+    let b2 = if minor {
+        bass_clamp(root + 2)
+    } else {
+        let idx2 = (seed as usize) % tones.len();
+        tones[idx2]
+    };
 
     // Temps 3 : chord tone different du temps 2
     let filtered: Vec<u8> = tones.iter().filter(|&&n| n != b2).copied().collect();
@@ -159,17 +191,22 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8;
             let dir = if seed % 2 == 0 { 1i8 } else { -1i8 };
             let mut app = (next_root as i16 + dir as i16) as u8;
             // Si l'approche est trop loin de la tessiture, essayer l'autre direction
-            if app < 28 || app > 48 {
+            if app < MIN_NOTE || app > MAX_NOTE {
                 app = (next_root as i16 - dir as i16) as u8;
             }
             // Dernier recours : next_root lui-meme
-            if app < 28 { app = next_root + 12; }
-            if app > 48 { app = next_root - 12; }
+            if app < MIN_NOTE { app = next_root + 12; }
+            if app > MAX_NOTE { app = next_root - 12; }
             app
         }
-        50..=84 => { // Approche dominante (35%)
+        50..=67 => { // Approche dominante (35%)
             let mut app = next_root + 7;
-            if app > 48 { app -= 12; }
+            if app > MAX_NOTE { app -= 12; }
+            app
+        }
+        68..=85 => { // Approche sous-dominante (15%)
+            let mut app = next_root - 5;
+            if app < MIN_NOTE { app += 12; }
             app
         }
         _ => { // Approche diatonique (15%) : chord tone le plus proche de next_root
@@ -186,12 +223,7 @@ fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64) -> [u8;
     [b1, b2, b3, b4]
 }
 
-/// Maintient une note dans la tessiture basse (28-48)
-fn bass_clamp(n: u8) -> u8 {
-    if n < 22 { n + 12 }
-    else if n > 42 { n - 12 }
-    else { n }
-}
+
 
 // ─── MIDI helpers ───────────────────────────────────────────────────────
 const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
@@ -203,7 +235,7 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
     if!on_beat&&!on_eighth{return}
     let b=beat%bars;
     let v=scale_mv(vol,mv);
-    let hh=vscale(v,HH_BEAT);let h8=vscale(v,HH_8TH);let h55=vscale(v,55);let h50=vscale(v,50);let h45=vscale(v,45);let h40=vscale(v,10);
+    let hh=vscale(v,HH_BEAT);let h8=vscale(v,HH_8TH);let h55=vscale(v,55);let h45=vscale(v,45);let h40=vscale(v,10);
     let h60=vscale(v,60);let h65=vscale(v,65);
     match pat{
         PAT_REGGAE=>if on_beat{match b{
@@ -211,7 +243,7 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             1=>{no(c,9,DRUM_HH,h60);}
             2=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,h65);no(c,9,DRUM_SNARE,vscale(v,70));}
             3=>{no(c,9,DRUM_HH,h60);}_=>{}
-        }}else if on_eighth{}
+        }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         PAT_JAZZ=>{
             let b=beat%8; // 2 mesures
             if on_beat{match b{
@@ -240,7 +272,7 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             1=>{no(c,9,DRUM_HH,h40);}
             2=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_RIM,vscale(v,65));no(c,9,DRUM_HH,h45);}
             3=>{no(c,9,DRUM_HH,h55);}_=>{}
-        }}else if on_eighth{}
+        }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         _=>if on_beat{match b{
             0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,vscale(v,75));no(c,9,DRUM_HH,hh);}
             2=>{no(c,9,DRUM_KICK,vscale(v,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,hh);}_=>{}
@@ -254,7 +286,7 @@ fn play_notes(c:&mut MidiOutputConnection,notes:&[String],mv:u8){
     rch(c);
     for&ch in&[0u8,2,3]{cc(c,ch,101,0);cc(c,ch,100,1);cc(c,ch,6,62);cc(c,ch,38,2)}
     pc(c,0,51);pc(c,2,33);
-    for _ in 0..2{for&n in&v{std::thread::sleep(Duration::from_millis(240));if n<48{no_mv(c,2,n,35,mv)}else{no_mv(c,0,n,15,mv)}}}
+    for _ in 0..2{for&n in&v{std::thread::sleep(Duration::from_millis(240));if n<MIN_NOTE{no_mv(c,2,n,35,mv)}else{no_mv(c,0,n,15,mv)}}}
     rch(c);println!("  notes: {v:?}");
 }
 
@@ -351,7 +383,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                         if !nv.is_empty() { nv[0] } else { root }
                     } else { root }
                 };
-                walking_notes = generate_walking_bass(&m, next_root, seed);
+                walking_notes = generate_walking_bass(&m, next_root, seed, is_minor(e));
                 seed = seed.wrapping_add(1);
             }
 
