@@ -1,1 +1,2 @@
-target/\n*.bak
+target/
+*.bak

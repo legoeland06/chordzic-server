@@ -1,3 +1,4 @@
+mod render;
 mod samples;
 use axum::{extract::State, response::{Html, Json, IntoResponse}, routing::{get, post}, Router};
 use midir::{MidiOutput, MidiOutputConnection};
@@ -577,6 +578,36 @@ async fn stop(State(s):State<AppState>)->impl IntoResponse{
     Json(serde_json::json!({"status":"stopped"}))
 }
 
+async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
+    use axum::http::{HeaderMap, StatusCode};
+
+    let ev: &[ChordEv] = if !b.seq.is_empty() { &b.seq } else if !b.sequence.is_empty() { &b.sequence } else { &[] };
+    if ev.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty sequence").into_response();
+    }
+
+    let mut notes_arrays: Vec<Vec<u8>> = Vec::new();
+    let mut beats: Vec<f64> = Vec::new();
+    for e in ev {
+        notes_arrays.push(notes_from_ev(e));
+        beats.push(e.beats);
+    }
+
+    let smf = render::generate_smf(&notes_arrays, &beats, b.tempo, 1);
+    let sf_path = "/usr/share/sounds/sf3/MuseScore_General_Full.sf3";
+
+    match render::render_wav(&smf, sf_path) {
+        Ok(wav) => {
+            let mut h = HeaderMap::new();
+            h.insert("Content-Type", "audio/wav".parse().unwrap());
+            (StatusCode::OK, h, wav).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main(){
     println!("csrs");let midi=init_midi();
@@ -594,6 +625,7 @@ async fn main(){
     })};
     let app=Router::new().route("/",get(idx)).route("/play",post(play))
         .route("/config",post(conf)).route("/stop",post(stop))
+        .route("/render-wav",post(render_wav))
         .layer(CorsLayer::permissive()).with_state(state);
     let p=std::env::var("PORT").unwrap_or_else(|_|"4000".to_string());
     println!("http://0.0.0.0:{p}");
