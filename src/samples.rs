@@ -1,80 +1,47 @@
-/// Sample Bank — charge des fichiers WAV nommés `snap_BPM.wav` depuis
-/// `~/samples/drums/` et les joue en temps réel via rodio.
+/// Loop Player — charge des fichiers WAV nommés `nom_BPM.wav` depuis
+/// `~/samples/drums/` et les joue en boucle via rodio, en simultané
+/// avec la séquence d'accords.
 ///
 /// Convention de nommage :
-///   kick_120.wav     → sample "kick" pour 120 BPM
-///   snare_120.wav    → sample "snare" pour 120 BPM
-///   hh_140.wav       → hi-hat sample pour 140 BPM
-///   rimshot_120.wav  → rimshot (mapping → MIDI 37)
+///   reggae_120.wav   → loop "reggae" pour 120 BPM
+///   rock_140.wav     → loop "rock" pour 140 BPM
 ///
-/// Mapping snap → MIDI note (pour chercher le bon sample depuis drum_hit).
-/// Si un sample existe pour (snap, tempo) on le joue, sinon on retourne
-/// false pour que l'appelant utilise le MIDI classique.
-use rodio::{OutputStream, Sink};
+/// Un spinner de décalage (offset_ms) permet d'ajuster le premier temps
+/// du WAV par rapport au début des accords.
+use rodio::{OutputStream, Sink, Source as RodioSource};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+
 const DRUM_DIR: &str = "/home/legoeland/samples/drums";
 
-static BANK: OnceLock<Mutex<SampleBank>> = OnceLock::new();
+static BANK: OnceLock<Mutex<LoopPlayer>> = OnceLock::new();
 
-// ─── État global (sans bloquer le mutex du bank pour les flags) ─────────
-static USE_SAMPLES: AtomicBool = AtomicBool::new(false);
+// ─── État global ────────────────────────────────────────────────────────
+static USE_LOOPS: AtomicBool = AtomicBool::new(false);
 static CUR_TEMPO: AtomicU16 = AtomicU16::new(120);
 
 // ─── Data ───────────────────────────────────────────────────────────────
-pub struct SampleBank {
+pub struct LoopPlayer {
     sink: Sink,
-    /// tempo → (snap_name → pcm mono f32)
-    samples: HashMap<u16, HashMap<String, Vec<f32>>>,
+    /// tempo → (nom → pcm mono f32)
+    loops: HashMap<u16, HashMap<String, Vec<f32>>>,
     sample_rate: u32,
+    /// tempo actuellement en lecture (0 = aucun)
+    playing_tempo: u16,
 }
 
-/// Mapping snap → MIDI note (minuscule sans extension)
-fn snap_to_note(snap: &str) -> Option<u8> {
-    match snap.to_lowercase().as_str() {
-        "kick" => Some(36),
-        "snare" => Some(38),
-        "rim" | "rimshot" => Some(37),
-        "hh" | "hihat" | "hi-hat" | "cc" => Some(42),
-        "hh_open" | "hhopen" | "oh" => Some(46),
-        "ride" => Some(51),
-        "crash" => Some(49),
-        "tom_hi" => Some(48),
-        "tom_mid" => Some(45),
-        "tom_lo" => Some(41),
-        "clap" => Some(39),
-        _ => None,
-    }
-}
-
-/// MIDI note → snap name préféré
-fn note_to_snap(note: u8) -> Option<&'static str> {
-    match note {
-        36 => Some("kick"),
-        38 => Some("snare"),
-        37 => Some("rim"),
-        42 => Some("hh"),
-        46 => Some("hh_open"),
-        51 => Some("ride"),
-        49 => Some("crash"),
-        48 => Some("tom_hi"),
-        45 => Some("tom_mid"),
-        41 => Some("tom_lo"),
-        39 => Some("clap"),
-        _ => None,
-    }
-}
-
-impl SampleBank {
+impl LoopPlayer {
     fn scan_dir() -> Self {
         let (_stream, handle) = OutputStream::try_default()
             .expect("rodio: impossible d'ouvrir la sortie audio");
+        std::mem::forget(_stream);
         let sink = Sink::try_new(&handle)
             .expect("rodio: impossible de créer le sink");
-        let mut samples: HashMap<u16, HashMap<String, Vec<f32>>> = HashMap::new();
+
+        let mut loops: HashMap<u16, HashMap<String, Vec<f32>>> = HashMap::new();
         let mut sample_rate = 44100u32;
 
         let dir = Path::new(DRUM_DIR);
@@ -95,7 +62,7 @@ impl SampleBank {
                     None => continue,
                 };
 
-                // Parse "snap_BPM" — dernier underscore sépare snap et bpm
+                // Parse "nom_BPM" — dernier underscore sépare nom et bpm
                 let us = match fname.rfind('_') {
                     Some(p) => p,
                     None => {
@@ -106,17 +73,12 @@ impl SampleBank {
                 let bpm: u16 = match fname[us + 1..].parse() {
                     Ok(b) => b,
                     Err(_) => {
-                        eprintln!(
-                            "  ⚠️  {}: '{:?}' n'est pas un BPM valide",
-                            fname,
-                            &fname[us + 1..]
-                        );
+                        eprintln!("  ⚠️  {}: BPM invalide", fname);
                         continue;
                     }
                 };
                 let snap = fname[..us].to_string();
 
-                // Charger le WAV
                 let reader = match hound::WavReader::open(&path) {
                     Ok(r) => r,
                     Err(e) => {
@@ -139,71 +101,98 @@ impl SampleBank {
                 };
 
                 let dur_s = pcm.len() as f32 / sample_rate as f32;
-                println!("   ✅ {} ({} bpm, snap='{}', {}s)", fname, bpm, snap, dur_s);
-                samples.entry(bpm).or_default().insert(snap, pcm);
+                println!("   ✅ {} ({} bpm, '{}', {:.1}s)", fname, bpm, snap, dur_s);
+                loops.entry(bpm).or_default().insert(snap, pcm);
                 count += 1;
             }
         }
 
         if count == 0 {
-            println!("   ℹ️  Aucun sample trouvé dans {}", DRUM_DIR);
-            println!("   └─ Nommez vos fichiers snap_BPM.wav (ex: kick_120.wav)");
+            println!("   ℹ️  Aucun loop trouvé dans {}", DRUM_DIR);
+            println!("   └─ Nommez vos fichiers nom_BPM.wav (ex: pattern_120.wav)");
         } else {
-            println!("   {} samples chargés", count);
+            println!("   {} loops chargés", count);
         }
 
-        SampleBank {
+        LoopPlayer {
             sink,
-            samples,
+            loops,
             sample_rate,
+            playing_tempo: 0,
         }
     }
 
-    /// Joue le sample correspondant à `note` au tempo `tempo`.
-    /// Retourne true si un sample a été trouvé et joué.
-    fn play_note(&self, note: u8, velocity: u8, tempo: u16) -> bool {
-        let snap = match note_to_snap(note) {
-            Some(s) => s,
-            None => return false,
+    /// Démarre la boucle pour `name` à `tempo` avec un décalage de `offset_ms`.
+    /// Si `name` est vide, prend le premier loop disponible pour ce tempo.
+    fn start(&mut self, tempo: u16, name: Option<&str>, offset_ms: i32) {
+        self.stop();
+
+        let bucket = match self.loops.get(&tempo) {
+            Some(b) => b,
+            None => return,
         };
 
-        // Essayer d'abord le tempo exact
-        if let Some(bucket) = self.samples.get(&tempo) {
-            if let Some(pcm) = bucket.get(snap) {
-                let vol = (velocity as f32 / 127.0).min(1.0);
-                let scaled: Vec<f32> = pcm.iter().map(|&s| s * vol).collect();
-                self.sink
-                    .append(rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled));
-                return true;
-            }
+        let pcm = match name {
+            Some(n) => bucket.get(n),
+            None => bucket.values().next(),
+        };
+
+        let pcm = match pcm {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Appliquer l'offset : ignorer les premières samples
+        let skip_samples = if offset_ms > 0 {
+            ((offset_ms as f64 / 1000.0) * self.sample_rate as f64) as usize
+        } else {
+            0
+        };
+
+        let data = if skip_samples > 0 && skip_samples < pcm.len() {
+            &pcm[skip_samples..]
+        } else {
+            pcm.as_slice()
+        };
+
+        if data.is_empty() {
+            return;
         }
 
-        // Fallback : chercher le même snap à n'importe quel tempo
-        for (_t, bucket) in &self.samples {
-            if let Some(pcm) = bucket.get(snap) {
-                let vol = (velocity as f32 / 127.0).min(1.0);
-                let scaled: Vec<f32> = pcm.iter().map(|&s| s * vol).collect();
-                self.sink
-                    .append(rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled));
-                return true;
-            }
-        }
-
-        false
+        let scaled: Vec<f32> = data.to_vec(); // copie pour le sink
+        let source =
+            rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled).repeat_infinite();
+        self.sink.append(source);
+        self.playing_tempo = tempo;
+        println!("  🔁 Loop '{}' à {} bpm (offset {}ms)", name.unwrap_or("?"), tempo, offset_ms);
     }
 
-    /// Retourne la liste des tempos disponibles et leurs snap names
+    fn stop(&mut self) {
+        if self.playing_tempo != 0 {
+            self.sink.stop();
+            self.sink.clear();
+            self.playing_tempo = 0;
+            println!("  ⏹ Loop arrêté");
+        }
+    }
+
+    fn has_loop(&self, tempo: u16) -> bool {
+        self.loops.contains_key(&tempo)
+    }
+
     fn list_available(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
-        let mut tempos: Vec<u16> = self.samples.keys().copied().collect();
+        let mut tempos: Vec<u16> = self.loops.keys().copied().collect();
         tempos.sort();
         for t in tempos {
-            let bucket = &self.samples[&t];
+            let bucket = &self.loops[&t];
             let mut snaps: Vec<String> = bucket.keys().cloned().collect();
             snaps.sort();
             map.insert(
                 t.to_string(),
-                serde_json::Value::Array(snaps.into_iter().map(serde_json::Value::String).collect()),
+                serde_json::Value::Array(
+                    snaps.into_iter().map(serde_json::Value::String).collect(),
+                ),
             );
         }
         serde_json::Value::Object(map)
@@ -213,69 +202,65 @@ impl SampleBank {
 // ─── API publique ───────────────────────────────────────────────────────
 
 pub fn init() {
-    let bank = SampleBank::scan_dir();
-    BANK.set(Mutex::new(bank)).unwrap_or_else(|_| {
-        eprintln!("⚠️  SampleBank déjà initialisée");
+    let player = LoopPlayer::scan_dir();
+    BANK.set(Mutex::new(player)).unwrap_or_else(|_| {
+        eprintln!("⚠️  LoopPlayer déjà initialisé");
     });
 }
 
-pub fn set_use_samples(enabled: bool) {
-    USE_SAMPLES.store(enabled, Ordering::Relaxed);
-    if enabled {
-        println!("  🎛️  Sample drums activé");
-    } else {
-        println!("  🎛️  Sample drums désactivé (MIDI)");
+pub fn set_use_loops(enabled: bool) {
+    USE_LOOPS.store(enabled, Ordering::Relaxed);
+    if !enabled {
+        if let Some(mtx) = BANK.get() {
+            if let Ok(mut p) = mtx.lock() {
+                p.stop();
+            }
+        }
     }
+    println!("  🎛️  Loop drums {}", if enabled { "activé" } else { "désactivé" });
 }
 
 pub fn set_current_tempo(tempo: u16) {
     CUR_TEMPO.store(tempo, Ordering::Relaxed);
 }
 
-pub fn is_active() -> bool {
-    USE_SAMPLES.load(Ordering::Relaxed) && BANK.get().is_some()
+/// Démarre la boucle. Appelé par play_seq quand use_loops est true.
+pub fn play_loop(tempo: u16, offset_ms: i32) {
+    if !USE_LOOPS.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(mtx) = BANK.get() {
+        if let Ok(mut p) = mtx.lock() {
+            if p.has_loop(tempo) {
+                p.start(tempo, None, offset_ms);
+            }
+        }
+    }
 }
 
-/// Joue le sample pour `note` à la vélocité `velocity`.
-/// Retourne true si un sample a été trouvé et joué, false pour fallback MIDI.
-pub fn play_drum(note: u8, velocity: u8) -> bool {
-    if !USE_SAMPLES.load(Ordering::Relaxed) {
-        return false;
-    }
-    let tempo = CUR_TEMPO.load(Ordering::Relaxed);
+/// Arrête la boucle. Appelé par stop et à la fin de play_seq.
+pub fn stop_loop() {
     if let Some(mtx) = BANK.get() {
-        if let Ok(bank) = mtx.lock() {
-            return bank.play_note(note, velocity, tempo);
+        if let Ok(mut p) = mtx.lock() {
+            p.stop();
+        }
+    }
+}
+
+pub fn has_loop_for(tempo: u16) -> bool {
+    if let Some(mtx) = BANK.get() {
+        if let Ok(p) = mtx.lock() {
+            return p.has_loop(tempo);
         }
     }
     false
 }
 
-/// Stop tous les sons en cours
-pub fn stop_all() {
-    if let Some(mtx) = BANK.get() {
-        if let Ok(bank) = mtx.lock() {
-            bank.sink.stop();
-        }
-    }
-}
-
-/// Retourne la liste des échantillons disponibles (pour l'API)
 pub fn get_available() -> serde_json::Value {
     if let Some(mtx) = BANK.get() {
-        if let Ok(bank) = mtx.lock() {
-            return bank.list_available();
+        if let Ok(p) = mtx.lock() {
+            return p.list_available();
         }
     }
     serde_json::Value::Null
-}
-
-/// Retourne true si des samples existent pour `tempo`
-pub fn has_for_tempo(tempo: u16) -> bool {
-    if let Some(mtx) = BANK.get() {
-        if let Ok(bank) = mtx.lock() {
-            return bank.samples.contains_key(&tempo);
-        }
-    }
-    false
 }
