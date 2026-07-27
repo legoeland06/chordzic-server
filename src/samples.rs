@@ -225,14 +225,14 @@ pub fn set_current_tempo(tempo: u16) {
 }
 
 /// Démarre la boucle. Appelé par play_seq quand use_loops est true.
-pub fn play_loop(tempo: u16, offset_ms: i32) {
+pub fn play_loop(tempo: u16, name: Option<&str>, offset_ms: i32) {
     if !USE_LOOPS.load(Ordering::Relaxed) {
         return;
     }
     if let Some(mtx) = BANK.get() {
         if let Ok(mut p) = mtx.lock() {
             if p.has_loop(tempo) {
-                p.start(tempo, None, offset_ms);
+                p.start(tempo, name, offset_ms);
             }
         }
     }

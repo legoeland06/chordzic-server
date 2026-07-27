@@ -44,6 +44,7 @@ struct Live {
     use432: AtomicBool,
     loop_offset: AtomicI32,
     use_loops: AtomicBool,
+    loop_name: Mutex<String>,
 }
 
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
@@ -90,6 +91,7 @@ struct Cfg{
     use432:Option<bool>,
     loop_offset:Option<i32>,
     use_loops:Option<bool>,
+    loop_name:Option<String>,
 }
 
 fn t120()->u32{120}fn y()->bool{true}fn n()->bool{false}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
@@ -507,7 +509,6 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
     }
     rch(c);
     println!("  done ({} evts)", ev.len());
-    samples::stop_loop();
 }
 
 // ─── Application des tracks ──────────────────────────────────────────────
@@ -548,7 +549,9 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
         let tempo_now=lv.tempo.load(Ordering::Relaxed);
         let loop_active=lv.use_loops.load(Ordering::Relaxed);
         if loop_active {
-            samples::play_loop(tempo_now, lv.loop_offset.load(Ordering::Relaxed));
+            let lname=lv.loop_name.lock().unwrap().clone();
+            let name_opt=if lname.is_empty(){None}else{Some(lname.as_str())};
+        samples::play_loop(tempo_now, name_opt, lv.loop_offset.load(Ordering::Relaxed));
         }
         if!ev.is_empty(){let sq=ev.to_vec();let l=Arc::clone(lv);
             std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_seq(&mut c,&sq,&l,do_loop)}});
@@ -584,6 +587,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     }
     if let Some(off)=b.loop_offset{lv.loop_offset.store(off,Ordering::Relaxed);}
     if let Some(lo)=b.use_loops{lv.use_loops.store(lo,Ordering::Relaxed);samples::set_use_loops(lo);}
+    if let Some(ref n)=b.loop_name{*lv.loop_name.lock().unwrap()=n.clone();}
     Json(Rsp{status:"ok".into()})
 }
 
@@ -638,6 +642,7 @@ async fn main(){
         ],
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),
         walking:AtomicBool::new(false),master_vol:AtomicU8::new(127),use432:AtomicBool::new(false),loop_offset:AtomicI32::new(0),use_loops:AtomicBool::new(false),
+        loop_name:Mutex::new(String::new()),
     })};
     async fn samples_list()->impl IntoResponse{
     use axum::http::StatusCode;
