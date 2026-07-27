@@ -126,22 +126,30 @@ pub fn render_wav(smf: &[u8], soundfont: &str) -> Result<Vec<u8>, String> {
 
     std::fs::write(&mid_path, smf).map_err(|e| format!("write mid: {e}"))?;
 
-    // Run fluidsynth
-    let status = Command::new("fluidsynth")
+    // Run fluidsynth (batch render: -n pas d'audio, -i pas d'interactif)
+    let output = Command::new("fluidsynth")
         .arg("-F")
         .arg(&wav_path)
         .arg("-T")
         .arg("wav")
         .arg("-g")
         .arg("1.0")
+        .arg("-n")
+        .arg("-i")
         .arg(soundfont)
         .arg(&mid_path)
-        .status()
+        .output()
         .map_err(|e| format!("fluidsynth exec: {e}"))?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         let _ = std::fs::remove_file(&mid_path);
-        return Err("fluidsynth failed".into());
+        return Err(format!("fluidsynth failed: {stderr}"));
+    }
+
+    // Log fluent pour debug
+    if let Ok(s) = String::from_utf8(output.stderr) {
+        let _ = std::fs::write(std::env::temp_dir().join("chordj_render.log"), &s);
     }
 
     // Read WAV
