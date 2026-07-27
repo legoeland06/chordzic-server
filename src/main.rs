@@ -337,7 +337,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 let start=std::time::Instant::now();
                 let mut idx=0u64;
                 let mut last_b_drums=u64::MAX;
-                while(start.elapsed().as_millis()as u64)<dur&&!lc.stop.load(Ordering::Relaxed){
+                let dur_f = dur as f64; while start.elapsed().as_secs_f64() * 1000.0 < dur_f&&!lc.stop.load(Ordering::Relaxed){
                     let tempo_f=lc.tempo.load(Ordering::Relaxed).max(20)as f64;
                     let bd_ms=60_000.0/tempo_f;
                     let delay_ms=(bd_ms/4.0).max(30.0);
@@ -412,7 +412,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 prev_nappe=nappe_notes.clone();
             }
 
-            while(start.elapsed().as_millis()as u64)<dur&&!lc.stop.load(Ordering::Relaxed){
+            let dur_f = dur as f64; while start.elapsed().as_secs_f64() * 1000.0 < dur_f&&!lc.stop.load(Ordering::Relaxed){
                 let tempo_f=lc.tempo.load(Ordering::Relaxed).max(20)as f64;
                 let bd_ms=60_000.0/tempo_f;
                 let delay_ms=(bd_ms/4.0).max(30.0);
