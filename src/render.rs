@@ -1,6 +1,7 @@
 /// Render chord progression to WAV via MIDI file + fluidsynth batch.
-/// REGLE D'OR: apres un VLQ, \x00 n'est jamais un VLQ mais une data byte.
-/// TOUS les VLQs doivent etre immediatement suivis par un status byte (MSB=1).
+/// FLUIDSYNTH 2.3.4 BUG: \x00 apres un VLQ n'est jamais un nouveau VLQ,
+/// meme si suivi d'un status byte MSB=1. Solution: inserer \xC0\x00
+/// (Program Change) entre le VLQ et \x00\x80 pour briser le running status.
 use std::process::Command;
 
 const TICKS_PER_BEAT: u32 = 480;
@@ -21,10 +22,6 @@ fn write_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_be_bytes()
 
 const KICK: u8 = 36; const SNARE: u8 = 38; const HH: u8 = 42; const RIM: u8 = 37;
 
-/// CLES: 
-/// - Apres un VLQ, le prochain byte est: status (MSB=1) ou data (MSB=0)
-/// - \x00 apres VLQ = data byte pour le running status, PAS un VLQ
-/// - Donc: JAMAIS de \x00 entre un VLQ et l'evenement suivant
 pub fn generate_smf(
     notes_arrays: &[Vec<u8>],
     beats: &[f64],
@@ -34,7 +31,7 @@ pub fn generate_smf(
     let tempo_us = (60_000_000u64 / tempo_bpm.max(1) as u64) as u32;
     let mut t = Vec::new();
 
-    // Tempo + Program Changes (tous delta 0)
+    // Setup
     t.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03]);
     t.extend_from_slice(&tempo_us.to_be_bytes()[1..]);
     for &(ch, prog) in &[(0u8, 51u8), (1, 33), (2, 48), (4, 2), (9, 1)] {
@@ -50,19 +47,16 @@ pub fn generate_smf(
         let bass = notes[0];
         let chord: Vec<u8> = if notes.len() > 1 { notes[1..].to_vec() } else { vec![] };
 
-        // ── Note Ons (status byte directement apres le VLQ/delta, pas de \x00 intermediaire)
-        // Premier Note On: delta inclus dans le VLQ
+        // Note Ons
         for &n in &chord { t.extend_from_slice(&[0x00, 0x90, n, 80]); }
         t.extend_from_slice(&[0x01, 0x91, bass, 90]);
         for &n in &chord { t.extend_from_slice(&[0x01, 0x92, n, 60]); }
 
-        // ── Drums + Accent par battement
+        // Drums + Accent
         let mut pos = 0u32;
         for b in 0..nq {
             let target = b * 480;
             if target > pos { write_vlq(&mut t, target - pos); pos = target; }
-
-            // Drums: status 0x99 directement apres le VLQ
             t.push(0x99);
             match b % 4 {
                 0 => { t.extend_from_slice(&[KICK, 100, 0x00, HH, 70]); }
@@ -71,24 +65,25 @@ pub fn generate_smf(
                 3 => { t.extend_from_slice(&[SNARE, 90, 0x00, HH, 70, 0x00, RIM, 60]); }
                 _ => {}
             }
-            // Accent sur 2&4: nouveau status byte
             if b == 1 || b == 3 {
                 for &n in &chord { t.extend_from_slice(&[0x01, 0x94, n, 70]); }
             }
-            // Hi-hat off-beat: VLQ puis status directement
             write_vlq(&mut t, 240);
             t.push(0x99); t.extend_from_slice(&[HH, 60]);
             pos = target + 240;
         }
 
-        // Advance to chord end + Note Offs
+        // PC pour briser le running status avant les Note Offs
+        t.extend_from_slice(&[0x00, 0xC0, 0x00]);
         if total_ticks > pos { write_vlq(&mut t, total_ticks - pos); }
+
+        // Note Offs
         for &n in &chord { t.extend_from_slice(&[0x00, 0x80, n, 64]); }
         t.extend_from_slice(&[0x01, 0x81, bass, 64]);
         for &n in &chord { t.extend_from_slice(&[0x01, 0x82, n, 64]); }
     }
 
-    // PC ch0 prog 0 brise le running status, puis EOT
+    // Final EOT
     t.extend_from_slice(&[0x00, 0xC0, 0x00, 0x00, 0xFF, 0x2F, 0x00]);
 
     let mut smf = Vec::new();
