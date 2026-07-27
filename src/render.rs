@@ -127,30 +127,31 @@ fn make_note_track(
     t
 }
 
-/// Drums track (channel 9)
+/// Drums track (channel 9) - UN seul VLQ entre chaque evenement
 fn make_drum_track(
     notes_arrays: &[Vec<u8>],
     beats: &[f64],
     qtr_tick: u32, half_tick: u32,
 ) -> Vec<u8> {
     let mut t = Vec::new();
-    // Program change (optional for drums, but set anyway)
-    t.push(0x00);
-    t.push(0xC9);
-    t.push(1);
+    t.push(0x00); t.push(0xC9); t.push(1);
 
     for (ci, _notes) in notes_arrays.iter().enumerate() {
         let beat_count = if ci < beats.len() { beats[ci] } else { 4.0 };
         let total_ticks = (beat_count * TICKS_PER_BEAT as f64) as u32;
         let num_q = beat_count as u32;
 
-        let mut last_pos = 0u32;
+        let mut pos = 0u32;
         for b in 0..num_q {
-            let tick_pos = b * qtr_tick;
-            let delta = if b == 0 { 0 } else { tick_pos - last_pos };
-            if delta > 0 { write_vlq(&mut t, delta); }
+            let target_beat = b * qtr_tick;
 
-            // Drums on the beat (running status on ch9)
+            // VLQ unique de la position courante a la battement
+            if target_beat > pos {
+                write_vlq(&mut t, target_beat - pos);
+                pos = target_beat;
+            }
+
+            // Drums + HH sur le temps (running status sur ch9)
             match b % 4 {
                 0 => { t.extend_from_slice(&[0x99, KICK, 100]); t.push(0x00); t.extend_from_slice(&[HH, 70]); }
                 1 => { t.extend_from_slice(&[0x99, SNARE, 90]); t.push(0x00); t.extend_from_slice(&[HH, 70]); }
@@ -159,20 +160,21 @@ fn make_drum_track(
                 _ => {}
             }
 
-            // Hi-hat on 8th note (off-beat)
+            // VLQ unique pour le hi-hat off-beat
+            let hh_pos = target_beat + half_tick;
             write_vlq(&mut t, half_tick);
-            t.extend_from_slice(&[0x99, HH, 60]);  // Note On with running status
-
-            last_pos = tick_pos + half_tick;
+            t.extend_from_slice(&[0x99, HH, 60]);
+            pos = hh_pos;
         }
 
-        // Advance to end of chord
-        if total_ticks > last_pos {
-            write_vlq(&mut t, total_ticks - last_pos);
+        // VLQ final pour atteindre la fin de l'accord
+        if total_ticks > pos {
+            write_vlq(&mut t, total_ticks - pos);
         }
     }
 
-    t.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+    // PC ch0 prog 0 brise le running status, puis EOT normal
+    t.extend_from_slice(&[0xC0, 0x00, 0x00, 0xFF, 0x2F, 0x00]);
     t
 }
 
@@ -194,36 +196,42 @@ fn make_accent_track(
         let chord_notes: Vec<u8> = if notes.len() > 1 { notes[1..].to_vec() } else { vec![] };
         let num_q = beat_count as u32;
 
-        // Accent on beats 2 and 4 (index 1, 3)
+        let mut pos = 0u32;
         for b in 0..num_q {
-            let tick_pos = b * qtr_tick;
-            if tick_pos > 0 { write_vlq(&mut t, tick_pos); }
+            let target = b * qtr_tick;
 
             if b == 1 || b == 3 {
-                // Accent notes (staccato: short note-off after)
+                // Accent sur temps 2&4
+                if target > pos {
+                    write_vlq(&mut t, target - pos);
+                }
+                // Note On SANS delta-0 avant le status byte (evite deux VLQs consecutifs)
                 for (i, &n) in chord_notes.iter().enumerate() {
                     if i > 0 { t.push(0x00); }
                     t.extend_from_slice(&[0x90 | channel, n, 70]);
                 }
-                // Very short duration (1 tick)
                 write_vlq(&mut t, 1);
                 for (i, &n) in chord_notes.iter().enumerate() {
                     if i == 0 { t.extend_from_slice(&[0x80 | channel, n, 64]); }
                     else { t.extend_from_slice(&[0x00, n, 64]); }
                 }
+                pos = target + 1;
             } else {
-                write_vlq(&mut t, qtr_tick);
+                // Pas d'accent : avancer
+                let next_target = target + qtr_tick;
+                if next_target > pos {
+                    write_vlq(&mut t, next_target - pos);
+                    pos = next_target;
+                }
             }
         }
 
-        // Fill remaining time to chord boundary
-        let covered = num_q * qtr_tick;
-        if covered < total_ticks {
-            write_vlq(&mut t, total_ticks - covered);
+        if total_ticks > pos {
+            write_vlq(&mut t, total_ticks - pos);
         }
     }
 
-    t.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+    t.extend_from_slice(&[0xC0, 0x00, 0x00, 0xFF, 0x2F, 0x00]);
     t
 }
 
