@@ -66,15 +66,15 @@ pub fn generate_smf(
 
             if notes.is_empty() {
                 // Silence: just drums
+                let mut last_pos = 0u32;
                 for b in 0..num_quarters {
                     let tick_pos = b * qtr_tick;
-                    if tick_pos > 0 { write_vlq(&mut track, tick_pos); }
+                    let delta = if b == 0 { 0 } else { tick_pos - last_pos };
+                    if delta > 0 { write_vlq(&mut track, delta); }
                     drum_hit(&mut track, b, num_quarters);
-                }
-                // Wait remaining
-                let played = num_quarters * qtr_tick;
-                if played < total_ticks {
-                    write_vlq(&mut track, total_ticks - played);
+                    write_vlq(&mut track, half_tick);
+                    track.extend_from_slice(&[0x99, HH_CLOSED, 60]);
+                    last_pos = tick_pos + half_tick;
                 }
                 continue;
             }
@@ -100,9 +100,13 @@ pub fn generate_smf(
             }
 
             // ── Sub-beat events: drums + accent ──
+            // Chaque beat b avance de qtr_tick, puis le hi-hat de half_tick.
+            // Position cumulative apres le dernier evenement = (num_quarters-1)*qtr + half
+            let mut last_ev_pos = 0u32;
             for b in 0..num_quarters {
                 let tick_pos = b * qtr_tick;
-                if tick_pos > 0 { write_vlq(&mut track, tick_pos); }
+                let delta = if b == 0 { 0 } else { tick_pos - last_ev_pos };
+                if delta > 0 { write_vlq(&mut track, delta); }
 
                 // Drums
                 drum_hit(&mut track, b, num_quarters);
@@ -115,21 +119,15 @@ pub fn generate_smf(
                     }
                 }
 
-                // Hi-hat on 8th notes (half-beat subdivisions)
-                if half_tick > 0 {
-                    write_vlq(&mut track, half_tick);
-                    track.extend_from_slice(&[0x99, HH_CLOSED, 60]);
-                }
+                // Hi-hat on 8th notes
+                write_vlq(&mut track, half_tick);
+                track.extend_from_slice(&[0x99, HH_CLOSED, 60]);
+                last_ev_pos = tick_pos + half_tick;
             }
 
-            // ── Wait remaining ticks after last drum hit ──
-            // Drums + hi-hat already cover `num_quarters * qtr_tick + half_tick`
-            let covered = num_quarters * qtr_tick + half_tick;
-            if covered < total_ticks {
-                write_vlq(&mut track, total_ticks - covered);
-            } else if covered > total_ticks {
-                // This shouldn't happen; clamp
-                write_vlq(&mut track, total_ticks);
+            // ── Avancer jusqu'a la fin de l'accord pour les Note Off ──
+            if total_ticks > last_ev_pos {
+                write_vlq(&mut track, total_ticks - last_ev_pos);
             }
 
             // ── Note Off: Lead, Bass, Nappes, Accent ──
