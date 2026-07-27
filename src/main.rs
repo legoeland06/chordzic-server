@@ -42,6 +42,7 @@ struct Live {
     walking: AtomicBool,
     master_vol: AtomicU8,
     use432: AtomicBool,
+    use_samples: AtomicBool,
 }
 
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
@@ -86,6 +87,7 @@ struct Cfg{
     walking:Option<bool>,
     master_vol:Option<u8>,
     use432:Option<bool>,
+    use_samples:Option<bool>,
 }
 
 fn t120()->u32{120}fn y()->bool{true}fn n()->bool{false}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
@@ -239,7 +241,8 @@ const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
 const HH_BEAT:u8=80; const HH_8TH:u8=65;
 fn scale_mv(v:u8,mv:u8)->u8{((v as u16*mv as u16)/127).min(127)as u8}
 
-fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64,vol:u8,mv:u8){
+fn drum_out(c:&mut MidiOutputConnection,note:u8,vel:u8,smp:bool){if smp{samples::play_drum(note,vel);}else{no(c,9,note,vel);}}
+fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64,vol:u8,mv:u8,smp:bool){
     if!on_beat&&!on_eighth{return}
     let b=beat%bars;
     let v=scale_mv(vol,mv);
@@ -247,44 +250,44 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
     let h60=vscale(v,60);let h65=vscale(v,65);
     match pat{
         PAT_REGGAE=>if on_beat{match b{
-            0=>{no(c,9,DRUM_HH,h60);}
-            1=>{no(c,9,DRUM_HH,h60);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,120));no(c,9,DRUM_HH,h65);no(c,9,DRUM_RIM,vscale(v,90));}
-            3=>{no(c,9,DRUM_HH,h60);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,h40);}
+            0=>{drum_out(c,DRUM_HH,h60,smp);}
+            1=>{drum_out(c,DRUM_HH,h60,smp);}
+            2=>{drum_out(c,DRUM_KICK,vscale(v,120),smp);drum_out(c,DRUM_HH,h65,smp);drum_out(c,DRUM_RIM,vscale(v,90),smp);}
+            3=>{drum_out(c,DRUM_HH,h60,smp);}_=>{}
+        }}else if on_eighth{drum_out(c,DRUM_HH,h40,smp);}
         PAT_JAZZ=>{
             let b=beat%8; // 2 mesures
             if on_beat{match b{
-                0=>{no(c,9,DRUM_RIDE,h60);}
-                2=>{no(c,9,DRUM_RIDE,h60);}
-                4=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));} // ride + pedal HH
-                6=>{no(c,9,DRUM_RIDE,h60);}
-                7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));no(c,9,DRUM_RIM,vscale(v,50));}_=>{}
-            }}else if on_eighth{no(c,9,DRUM_HH,35);}
+                0=>{drum_out(c,DRUM_RIDE,h60,smp);}
+                2=>{drum_out(c,DRUM_RIDE,h60,smp);}
+                4=>{drum_out(c,DRUM_RIDE,h60,smp);drum_out(c,44,vscale(v,40),smp);} // ride + pedal HH
+                6=>{drum_out(c,DRUM_RIDE,h60,smp);}
+                7=>{drum_out(c,DRUM_RIDE,h60,smp);drum_out(c,44,vscale(v,40),smp);drum_out(c,DRUM_RIM,vscale(v,50),smp);}_=>{}
+            }}else if on_eighth{drum_out(c,DRUM_HH,35,smp);}
         }
         PAT_POP=>{
             let b=beat%8; // 2 mesures
             if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,vscale(v,50));}
-            2=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,vscale(v,50));}
-            4=>{no(c,9,DRUM_KICK,vscale(v,75));no(c,9,DRUM_HH,vscale(v,50));}
-            6=>{no(c,9,DRUM_SNARE,vscale(v,65));no(c,9,DRUM_HH,vscale(v,50));}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,vscale(v,45));}
+            0=>{drum_out(c,DRUM_KICK,vscale(v,85),smp);drum_out(c,DRUM_HH,vscale(v,50),smp);}
+            2=>{drum_out(c,DRUM_SNARE,vscale(v,70),smp);drum_out(c,DRUM_HH,vscale(v,50),smp);}
+            4=>{drum_out(c,DRUM_KICK,vscale(v,75),smp);drum_out(c,DRUM_HH,vscale(v,50),smp);}
+            6=>{drum_out(c,DRUM_SNARE,vscale(v,65),smp);drum_out(c,DRUM_HH,vscale(v,50),smp);}_=>{}
+        }}else if on_eighth{drum_out(c,DRUM_HH,vscale(v,45),smp);}
     }
         PAT_BOSSA=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,55));no(c,9,DRUM_HH,h45);}1=>{no(c,9,DRUM_SNARE,vscale(v,30));no(c,9,DRUM_HH,h45);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,60));no(c,9,DRUM_HH,h45);}3=>{no(c,9,DRUM_KICK,vscale(v,50));no(c,9,DRUM_HH,h45);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,h40);}
+            0=>{drum_out(c,DRUM_KICK,vscale(v,55),smp);drum_out(c,DRUM_HH,h45,smp);}1=>{drum_out(c,DRUM_SNARE,vscale(v,30),smp);drum_out(c,DRUM_HH,h45,smp);}
+            2=>{drum_out(c,DRUM_KICK,vscale(v,60),smp);drum_out(c,DRUM_HH,h45,smp);}3=>{drum_out(c,DRUM_KICK,vscale(v,50),smp);drum_out(c,DRUM_HH,h45,smp);}_=>{}
+        }}else if on_eighth{drum_out(c,DRUM_HH,h40,smp);}
         PAT_ONEDROP=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,h55);}
-            1=>{no(c,9,DRUM_HH,h40);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_RIM,vscale(v,65));no(c,9,DRUM_HH,h45);}
-            3=>{no(c,9,DRUM_HH,h55);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,h40);}
+            0=>{drum_out(c,DRUM_KICK,vscale(v,90),smp);drum_out(c,DRUM_HH,h55,smp);}
+            1=>{drum_out(c,DRUM_HH,h40,smp);}
+            2=>{drum_out(c,DRUM_KICK,vscale(v,90),smp);drum_out(c,DRUM_RIM,vscale(v,65),smp);drum_out(c,DRUM_HH,h45,smp);}
+            3=>{drum_out(c,DRUM_HH,h55,smp);}_=>{}
+        }}else if on_eighth{drum_out(c,DRUM_HH,h40,smp);}
         _=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,vscale(v,75));no(c,9,DRUM_HH,hh);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,hh);}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,h8);}
+            0=>{drum_out(c,DRUM_KICK,vscale(v,90),smp);drum_out(c,DRUM_HH,hh,smp);}1=>{drum_out(c,DRUM_SNARE,vscale(v,75),smp);drum_out(c,DRUM_HH,hh,smp);}
+            2=>{drum_out(c,DRUM_KICK,vscale(v,80),smp);drum_out(c,DRUM_HH,hh,smp);}3=>{drum_out(c,DRUM_SNARE,vscale(v,70),smp);drum_out(c,DRUM_HH,hh,smp);}_=>{}
+        }}else if on_eighth{drum_out(c,DRUM_HH,h8,smp);}
     }
 }
 fn vscale(vol:u8,base:u8)->u8{((vol as u16*base as u16)/127).min(127) as u8}
@@ -326,6 +329,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
         let ch_accent=t_accent.channel;
         let walking=lc.walking.load(Ordering::Relaxed);
         let mv=lc.master_vol.load(Ordering::Relaxed);
+        let smp=lc.use_samples.load(Ordering::Relaxed);
         let mut seed:u64 = 0;
 
         for(i,e)in ev.iter().enumerate(){
@@ -353,13 +357,13 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     if !t_drums.mute.load(Ordering::Relaxed){
                         if last_b_drums==u64::MAX||beat>last_b_drums{
                             let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
-                            drum_hit(c,beat,pt,true,false,bars,dvol,127);
+                            drum_hit(c,beat,pt,true,false,bars,dvol,127,smp);
                             last_b_drums=beat;
                         }
                         let beat_pos=elapsed_ms%bd_ms;
                         if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
                             let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
-                            drum_hit(c,beat,pt,false,true,bars,dvol,127);
+                            drum_hit(c,beat,pt,false,true,bars,dvol,127,smp);
                         }
                     }
                     idx+=1;
@@ -431,13 +435,13 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 if !t_drums.mute.load(Ordering::Relaxed){
                     if last_b_drums==u64::MAX||beat>last_b_drums{
                         let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
-                        drum_hit(c,beat,pt,true,false,bars,dvol,127);
+                        drum_hit(c,beat,pt,true,false,bars,dvol,127,smp);
                         last_b_drums=beat;
                     }
                     let beat_pos=elapsed_ms%bd_ms;
                     if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
                         let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
-                        drum_hit(c,beat,pt,false,true,bars,dvol,127);
+                        drum_hit(c,beat,pt,false,true,bars,dvol,127,smp);
                     }
                 }
 
@@ -554,7 +558,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     if let Some(v)=b.arpeggios{lv.tracks[TRACK_LEAD].mute.store(!v,Ordering::Relaxed)}
     if let Some(v)=b.nappes{lv.tracks[TRACK_STR].mute.store(!v,Ordering::Relaxed)}
     if let Some(ref p)=b.pattern{lv.pattern.store(pat(p),Ordering::Relaxed)}
-    if let Some(t)=b.tempo{lv.tempo.store(t,Ordering::Relaxed)}
+    if let Some(t)=b.tempo{lv.tempo.store(t,Ordering::Relaxed);samples::set_current_tempo(t);}
     if let Some(ref sg)=b.sig{lv.sig.store(sig_code(sg),Ordering::Relaxed)}
     if let Some(iv)=b.instrument{lv.tracks[TRACK_LEAD].program.store(iv,Ordering::Relaxed)}
     if let Some(w)=b.walking{lv.walking.store(w,Ordering::Relaxed)}
@@ -569,6 +573,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
             }
         }
     }
+    if let Some(smp)=b.use_samples{lv.use_samples.store(smp,Ordering::Relaxed);samples::set_use_samples(smp);}
     Json(Rsp{status:"ok".into()})
 }
 
@@ -621,11 +626,18 @@ async fn main(){
             LiveTrack::new(4,2,20),    // Accent (canal 4, Bright Acoustic Piano)
         ],
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),
-        walking:AtomicBool::new(false),master_vol:AtomicU8::new(127),use432:AtomicBool::new(false),
+        walking:AtomicBool::new(false),master_vol:AtomicU8::new(127),use432:AtomicBool::new(false),use_samples:AtomicBool::new(false),
     })};
-    let app=Router::new().route("/",get(idx)).route("/play",post(play))
+    async fn samples_list()->impl IntoResponse{
+    use axum::http::StatusCode;
+    let data=samples::get_available();
+    (StatusCode::OK,axum::Json(data))
+}
+
+let app=Router::new().route("/",get(idx)).route("/play",post(play))
         .route("/config",post(conf)).route("/stop",post(stop))
         .route("/render-wav",post(render_wav))
+        .route("/samples-list",get(samples_list))
         .layer(CorsLayer::permissive()).with_state(state);
     let p=std::env::var("PORT").unwrap_or_else(|_|"4000".to_string());
     println!("http://0.0.0.0:{p}");
