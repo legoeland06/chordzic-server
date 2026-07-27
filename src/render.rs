@@ -3,9 +3,7 @@ use std::process::Command;
 
 const TICKS_PER_BEAT: u32 = 480;
 
-/// VLQ encode a value into the buffer (variable-length quantity for delta times).
 fn write_vlq(buf: &mut Vec<u8>, mut v: u32) {
-    // Build bytes in reverse
     let mut bytes = Vec::new();
     bytes.push((v & 0x7F) as u8);
     v >>= 7;
@@ -16,84 +14,139 @@ fn write_vlq(buf: &mut Vec<u8>, mut v: u32) {
     buf.extend(bytes.into_iter().rev());
 }
 
-/// Write a 16-bit big-endian value.
 fn write_u16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
-/// Write a 32-bit big-endian value.
 fn write_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
-/// Generate a Standard MIDI File from chord events.
-/// Returns raw SMF bytes.
-pub fn generate_smf(
-    notes_arrays: &[Vec<u8>],  // per-chord MIDI note numbers
-    beats: &[f64],              // per-chord duration in beats
-    tempo_bpm: u32,             // BPM
-    num_bars: usize,            // how many bars/loops
-) -> Vec<u8> {
-    let tempo_us = (60_000_000u64 / tempo_bpm.max(1) as u64) as u32; // µs/qn
-    let ticks_per_qn = TICKS_PER_BEAT as u16;
+/// MIDI drum note numbers
+const KICK: u8 = 36;
+const SNARE: u8 = 38;
+const HH_CLOSED: u8 = 42;
+const RIMSHOT: u8 = 37;
 
-    // ── Build track events ──
+/// Generate a Standard MIDI File with multi-track arrangement.
+/// Lead (ch0), Bass (ch1), Nappes (ch2), Accent (ch4), Drums (ch9).
+pub fn generate_smf(
+    notes_arrays: &[Vec<u8>],
+    beats: &[f64],
+    tempo_bpm: u32,
+    num_bars: usize,
+) -> Vec<u8> {
+    let tempo_us = (60_000_000u64 / tempo_bpm.max(1) as u64) as u32;
+    let ppq = TICKS_PER_BEAT as u16;       // pulses per quarter note
+    let _tpq = TICKS_PER_BEAT;               // ticks per quarter
+    let half_tick = TICKS_PER_BEAT / 2;     // eighth note
+    let qtr_tick = TICKS_PER_BEAT;
+
     let mut track = Vec::new();
 
-    // Tempo meta event (delta=0)
+    // ── Setup events (delta=0) ──
+    // Tempo
     track.push(0x00);
     track.extend_from_slice(&[0xFF, 0x51, 0x03]);
-    track.extend_from_slice(&tempo_us.to_be_bytes()[1..]); // 3 bytes
+    track.extend_from_slice(&tempo_us.to_be_bytes()[1..]);
 
-    // Program Change: channel 0 (Lead) -> program 51 (Synth Strings 1)
-    track.push(0x00);
-    track.push(0xC0);
-    track.push(51);
+    // Program changes: Lead, Bass, Nappes, Accent, Drums channel
+    for &(ch, prog) in &[(0u8, 51u8), (1, 33), (2, 48), (4, 2), (9, 1)] {
+        track.push(0x00);
+        track.push(0xC0 | ch);
+        track.push(prog);
+    }
 
-    // Program Change: channel 1 (Bass) -> program 33 (Electric Bass)
-    track.push(0x00);
-    track.push(0xC1);
-    track.push(33);
-
-    // Program Change: channel 2 (Nappes) -> program 48 (String Ensemble)
-    track.push(0x00);
-    track.push(0xC2);
-    track.push(48);
-
-    // Program Change: channel 9 (Drums) -> no program (drums are on ch10)
-    track.push(0x00);
-    track.push(0xC9);
-    track.push(1);
-
-    // Loop through chords for the specified number of bars
+    // ── Chord loop ──
     for _bar in 0..num_bars {
         for (ci, notes) in notes_arrays.iter().enumerate() {
             let beat_count = if ci < beats.len() { beats[ci] } else { 4.0 };
-            let duration_ticks = (beat_count * TICKS_PER_BEAT as f64) as u32;
+            let total_ticks = (beat_count * TICKS_PER_BEAT as f64) as u32;
+            let num_quarters = beat_count as u32;
 
             if notes.is_empty() {
-                // Silence: skip (drums could be added here)
+                // Silence: just drums
+                for b in 0..num_quarters {
+                    let tick_pos = b * qtr_tick;
+                    if tick_pos > 0 { write_vlq(&mut track, tick_pos); }
+                    drum_hit(&mut track, b, num_quarters);
+                }
+                // Wait remaining
+                let played = num_quarters * qtr_tick;
+                if played < total_ticks {
+                    write_vlq(&mut track, total_ticks - played);
+                }
                 continue;
             }
 
-            // Note On for all notes (premier delta=0, suivants running status)
-            for (i, &note) in notes.iter().enumerate() {
-                if i > 0 {
-                    track.push(0x00);
-                }
-                track.extend_from_slice(&[0x90, note, 80]);
+            // Separate bass note (first) from chord notes
+            let bass_note = notes[0];
+            let chord_notes: Vec<u8> = if notes.len() > 1 { notes[1..].to_vec() } else { vec![] };
+
+            // ── Note On: Lead, Bass, Nappes, Accent ──
+            // Lead (channel 0): chord notes
+            for (i, &n) in chord_notes.iter().enumerate() {
+                if i > 0 { track.push(0x00); }
+                track.extend_from_slice(&[0x90, n, 80]);
+            }
+            // Bass (channel 1): root note
+            track.push(0x00);
+            track.extend_from_slice(&[0x91, bass_note, 90]);
+
+            // Nappes (channel 2): chord notes, sustained
+            for (i, &n) in chord_notes.iter().enumerate() {
+                if i > 0 { track.push(0x00); }
+                track.extend_from_slice(&[0x92, n, 60]);
             }
 
-            // Wait for chord duration
-            write_vlq(&mut track, duration_ticks);
+            // ── Sub-beat events: drums + accent ──
+            for b in 0..num_quarters {
+                let tick_pos = b * qtr_tick;
+                if tick_pos > 0 { write_vlq(&mut track, tick_pos); }
 
-            // Note Off for all notes (first use le delta du VLQ, les suivants delta=0)
-            for (i, &note) in notes.iter().enumerate() {
-                if i > 0 {
-                    track.push(0x00); // delta 0 pour les notes suivantes
+                // Drums
+                drum_hit(&mut track, b, num_quarters);
+
+                // Accent (Bright Acoustic Piano, channel 4) on beats 2&4 (b=1,3)
+                if b == 1 || b == 3 {
+                    for (i, &n) in chord_notes.iter().enumerate() {
+                        if i > 0 { track.push(0x00); }
+                        track.extend_from_slice(&[0x94, n, 70]);
+                    }
                 }
-                track.extend_from_slice(&[0x80, note, 64]);
+
+                // Hi-hat on 8th notes (half-beat subdivisions)
+                if half_tick > 0 {
+                    write_vlq(&mut track, half_tick);
+                    track.extend_from_slice(&[0x99, HH_CLOSED, 60]);
+                }
             }
+
+            // ── Wait remaining ticks after last drum hit ──
+            // Drums + hi-hat already cover `num_quarters * qtr_tick + half_tick`
+            let covered = num_quarters * qtr_tick + half_tick;
+            if covered < total_ticks {
+                write_vlq(&mut track, total_ticks - covered);
+            } else if covered > total_ticks {
+                // This shouldn't happen; clamp
+                write_vlq(&mut track, total_ticks);
+            }
+
+            // ── Note Off: Lead, Bass, Nappes, Accent ──
+            // Lead (channel 0)
+            for (i, &n) in chord_notes.iter().enumerate() {
+                if i > 0 { track.push(0x00); }
+                track.extend_from_slice(&[0x80, n, 64]);
+            }
+            // Bass (channel 1)
+            track.push(0x00);
+            track.extend_from_slice(&[0x81, bass_note, 64]);
+            // Nappes (channel 2)
+            for (i, &n) in chord_notes.iter().enumerate() {
+                if i > 0 { track.push(0x00); }
+                track.extend_from_slice(&[0x82, n, 64]);
+            }
+            // Accent notes already ended naturally (short staccato)
         }
     }
 
@@ -103,43 +156,67 @@ pub fn generate_smf(
 
     // ── Assemble SMF ──
     let mut smf = Vec::new();
-
-    // Header chunk
     smf.extend_from_slice(b"MThd");
-    write_u32(&mut smf, 6);           // header length
-    write_u16(&mut smf, 0);           // format 0 (1 seul track)
+    write_u32(&mut smf, 6);
+    write_u16(&mut smf, 0);           // format 0
     write_u16(&mut smf, 1);           // 1 track
-    write_u16(&mut smf, ticks_per_qn); // ticks/quarter
-
-    // Track chunk
+    write_u16(&mut smf, ppq);
     smf.extend_from_slice(b"MTrk");
-    write_u32(&mut smf, track.len() as u32); // track length
+    write_u32(&mut smf, track.len() as u32);
     smf.extend_from_slice(&track);
 
     smf
 }
 
-/// Render an SMF to WAV using fluidsynth CLI.
-/// Returns the WAV bytes.
+/// Hit drums at a given beat position.
+/// b: beat index (0-based), num_quarters: beats per chord
+fn drum_hit(track: &mut Vec<u8>, b: u32, _num_quarters: u32) {
+    match b % 4 {
+        0 => {
+            // Beat 1: Kick + Closed Hi-hat
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, KICK, 100]);
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, HH_CLOSED, 70]);
+        }
+        1 => {
+            // Beat 2: Snare + Hi-hat
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, SNARE, 90]);
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, HH_CLOSED, 70]);
+        }
+        2 => {
+            // Beat 3: Kick
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, KICK, 80]);
+        }
+        3 => {
+            // Beat 4: Snare + Hi-hat + Rimshot
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, SNARE, 90]);
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, HH_CLOSED, 70]);
+            track.push(0x00);
+            track.extend_from_slice(&[0x99, RIMSHOT, 60]);
+        }
+        _ => {}
+    }
+}
+
+/// Render SMF to WAV using fluidsynth CLI.
 pub fn render_wav(smf: &[u8], soundfont: &str) -> Result<Vec<u8>, String> {
-    // Write SMF to temp file
     let mid_path = std::env::temp_dir().join("chordj_render.mid");
     let wav_path = std::env::temp_dir().join("chordj_render.wav");
 
     std::fs::write(&mid_path, smf).map_err(|e| format!("write mid: {e}"))?;
 
-    // Run fluidsynth (batch render: -n pas d'audio, -i pas d'interactif)
     let output = Command::new("fluidsynth")
-        .arg("-F")
-        .arg(&wav_path)
-        .arg("-T")
-        .arg("wav")
-        .arg("-g")
-        .arg("1.0")
-        .arg("-n")
-        .arg("-i")
-        .arg(soundfont)
-        .arg(&mid_path)
+        .arg("-F").arg(&wav_path)
+        .arg("-T").arg("wav")
+        .arg("-g").arg("1.0")
+        .arg("-n").arg("-i")
+        .arg(soundfont).arg(&mid_path)
         .output()
         .map_err(|e| format!("fluidsynth exec: {e}"))?;
 
@@ -148,18 +225,12 @@ pub fn render_wav(smf: &[u8], soundfont: &str) -> Result<Vec<u8>, String> {
         let _ = std::fs::remove_file(&mid_path);
         return Err(format!("fluidsynth failed: {stderr}"));
     }
-
-    // Log fluent pour debug
     if let Ok(s) = String::from_utf8(output.stderr) {
         let _ = std::fs::write(std::env::temp_dir().join("chordj_render.log"), &s);
     }
 
-    // Read WAV
     let wav = std::fs::read(&wav_path).map_err(|e| format!("read wav: {e}"))?;
-
-    // Cleanup
     let _ = std::fs::remove_file(&mid_path);
     let _ = std::fs::remove_file(&wav_path);
-
     Ok(wav)
 }
