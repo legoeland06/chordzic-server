@@ -76,21 +76,23 @@ pub fn generate_smf(
                 continue;
             }
 
-            // Note On for all notes in this chord
-            for &note in notes {
-                // Lead (channel 0)
-                track.push(0x00);
+            // Note On for all notes (premier delta=0, suivants running status)
+            for (i, &note) in notes.iter().enumerate() {
+                if i > 0 {
+                    track.push(0x00);
+                }
                 track.extend_from_slice(&[0x90, note, 80]);
             }
 
             // Wait for chord duration
             write_vlq(&mut track, duration_ticks);
 
-            // Note Off for all notes
-            for &note in notes {
+            // Note Off for all notes (first use le delta du VLQ, les suivants delta=0)
+            for (i, &note) in notes.iter().enumerate() {
+                if i > 0 {
+                    track.push(0x00); // delta 0 pour les notes suivantes
+                }
                 track.extend_from_slice(&[0x80, note, 64]);
-                // Delta time 0 for subsequent offs
-                track.push(0x00);
             }
         }
     }
