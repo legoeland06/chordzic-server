@@ -105,7 +105,7 @@ pub fn generate_smf(
     // Header chunk
     smf.extend_from_slice(b"MThd");
     write_u32(&mut smf, 6);           // header length
-    write_u16(&mut smf, 1);           // format 1
+    write_u16(&mut smf, 0);           // format 0 (1 seul track)
     write_u16(&mut smf, 1);           // 1 track
     write_u16(&mut smf, ticks_per_qn); // ticks/quarter
 
