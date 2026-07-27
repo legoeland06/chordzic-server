@@ -169,7 +169,6 @@ impl LoopPlayer {
 
     fn stop(&mut self) {
         if self.playing_tempo != 0 {
-            self.sink.stop();
             self.sink.clear();
             self.playing_tempo = 0;
             println!("  ⏹ Loop arrêté");
