@@ -618,10 +618,37 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
         beats.push(e.beats);
     }
 
-    let smf = render::generate_smf_fmt0(&notes_arrays, &beats, b.tempo, 1);
+    // Construire la config de rendu
+    let mut tracks_cfg: [render::TrackCfg; 5] = [
+        render::TrackCfg { channel: 0, program: b.inst_val, volume: 15, mute: !b.arps },
+        render::TrackCfg { channel: 2, program: 33, volume: 40, mute: !b.bass },
+        render::TrackCfg { channel: 3, program: 48, volume: 30, mute: !b.nappes },
+        render::TrackCfg { channel: 9, program: 1, volume: 80, mute: !b.drums },
+        render::TrackCfg { channel: 4, program: 2, volume: 20, mute: false },
+    ];
+    // Appliquer tracks override si présent
+    if let Some(ref tcfg) = b.tracks {
+        for tc in tcfg {
+            if let Some(t) = tracks_cfg.iter_mut().find(|t| t.channel == tc.channel) {
+                t.program = tc.program.unwrap_or(t.program);
+                t.volume = tc.volume.unwrap_or(t.volume);
+                t.mute = tc.mute.unwrap_or(t.mute);
+            }
+        }
+    }
+
+    let rcfg = render::RenderCfg {
+        tempo: b.tempo,
+        pattern: b.pattern.clone(),
+        walking: b.walking.unwrap_or(false),
+        sig: b.sig.clone(),
+        lead_inst: b.inst_val,
+        tracks: tracks_cfg,
+    };
+
+    let smf = render::generate_smf_fmt0(&notes_arrays, &beats, &rcfg);
     let sf_path = "/usr/share/sounds/sf3/MuseScore_General_Full.sf3";
 
-    // Durée exacte en secondes pour un loop parfait
     let total_beats: f64 = beats.iter().sum();
     let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
 
