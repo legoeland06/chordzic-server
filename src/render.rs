@@ -1,5 +1,6 @@
 /// Render chord progression — génération SMF Format 0 + render WAV.
 use std::process::Command;
+use crate::walking::{is_minor as is_minor_chord, generate_walking_bass as walking_bass_notes};
 
 const TICKS_PER_BEAT: u32 = 480;
 
@@ -52,54 +53,6 @@ impl Default for RenderCfg {
             ],
         }
     }
-}
-
-// ─── Walking Bass ─────────────────────────────────────────────────────
-const MIN_NOTE:u8=22; const MAX_NOTE:u8=42;
-
-fn bass_clamp(n: u8) -> u8 {
-    if n < MIN_NOTE { n + 12 } else if n > MAX_NOTE { n - 12 } else { n }
-}
-
-fn is_minor_chord(chord: &[u8]) -> bool {
-    if chord.len() < 2 { return false; }
-    let root = chord[0];
-    let mut has_minor = false;
-    let mut has_major = false;
-    for &n in chord {
-        let interval = if n >= root { n - root } else { n + 12 - root };
-        match interval { 3 => has_minor = true, 4 => has_major = true, _ => {} }
-    }
-    has_minor && !has_major
-}
-
-fn walking_bass_notes(current: &[u8], next_root: u8, seed: u64, minor: bool) -> [u8; 4] {
-    let root = current[0];
-    let tones: Vec<u8> = if current.len() > 1 {
-        let mut v: Vec<u8> = current[1..].iter().map(|&n| bass_clamp(n)).collect();
-        v.sort(); v.dedup(); v
-    } else { vec![root.saturating_sub(5)] };
-
-    let b1 = root;
-    let b2 = if minor {
-        match seed % 100 {
-            0..=24 => root + 2, 25..=49 => root.wrapping_sub(10),
-            _ => tones[seed as usize % tones.len()],
-        }
-    } else { tones[seed as usize % tones.len()] };
-
-    let filtered: Vec<u8> = tones.iter().filter(|&&n| n != b2).copied().collect();
-    let b3 = if filtered.is_empty() { b2 + 7 } else { filtered[(seed.wrapping_add(7) as usize) % filtered.len()] };
-
-    let b4 = match (seed % 100) as u8 {
-        0..=49 => { let dir = if seed % 2 == 0 { 1i8 } else { -1i8 };
-            let mut app = (next_root as i16 + dir as i16) as u8;
-            if app < MIN_NOTE { app = next_root + 12; } if app > MAX_NOTE { app = next_root - 12; } app }
-        50..=67 => { let mut app = next_root + 7; if app > MAX_NOTE { app -= 12; } app }
-        68..=85 => { let mut app = next_root.wrapping_sub(5); if app < MIN_NOTE { app += 12; } app }
-        _ => tones.iter().min_by_key(|&&t| { let d = if t > next_root { t-next_root } else { next_root-t }; d }).copied().unwrap_or(next_root),
-    };
-    [b1, b2, b3, b4]
 }
 
 // ─── SMF Format 0 ─────────────────────────────────────────────────────

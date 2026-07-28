@@ -1,5 +1,6 @@
 mod render;
 mod samples;
+mod walking;
 use axum::{extract::State, response::{Html, Json, IntoResponse}, routing::{get, post}, Router};
 use midir::{MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
@@ -7,11 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
+use walking::{generate_walking_bass, is_minor, MIN_NOTE};
 
 type MidiHandle = Arc<Mutex<MidiOutputConnection>>;
 
 // ─── Tones ──────────────────────────────────────────────────────────────
-const MIN_NOTE:u8=22; const MAX_NOTE:u8=42;
 
 // ─── Tracks ──────────────────────────────────────────────────────────────
 const TRACK_LEAD:usize=0;
@@ -111,27 +112,6 @@ fn notes_from_ev(e:&ChordEv)->Vec<u8>{
     let mut v=vec![];for n in &e.notes{if let Ok(x)=note_midi(n){v.push(x)}}v
 }
 
-/// Determine si un accord est mineur (tierce mineure entre fondamentale et 3eme note)
-fn is_minor(chord: &ChordEv) -> bool {
-    let midi = notes_from_ev(chord);
-    // midi[0] = basse, midi[1] = fondamentale, midi[2+] = notes de l'accord
-    if midi.len() < 3 { return false; }
-    let root = midi[1];
-    // Chercher une tierce (3 ou 4 demi-tons au-dessus de la fondamentale)
-    let mut has_minor = false;
-    let mut has_major = false;
-    for &n in &midi[1..] {
-        let interval = if n >= root { n - root } else { n + 12 - root };
-        match interval {
-            3 => has_minor = true,
-            4 => has_major = true,
-            _ => {}
-        }
-    }
-    // Mineur si on a une tierce mineure et pas de tierce majeure
-    has_minor && !has_major
-}
-
 fn init_midi()->Option<MidiHandle>{
     let mo=MidiOutput::new("cs").ok()?;let p=mo.ports();
     if p.is_empty(){eprintln!("no port");return None}
@@ -150,94 +130,6 @@ fn no_mv(c:&mut MidiOutputConnection,ch:u8,n:u8,v:u8,mv:u8){
     snd(c,&[0x90|ch,n,((v as u16*mv as u16)/127).min(127)as u8])}
 fn rch(c:&mut MidiOutputConnection){for&ch in&[0u8,2,3,4,9]{cc(c,ch,123,0)}}
 fn pb(c:&mut MidiOutputConnection,ch:u8,val:u16){let lsb=(val&127)as u8;let msb=((val>>7)&127)as u8;snd(c,&[0xE0|ch,lsb,msb])}
-
-
-
-// ─── Walking Bass ────────────────────────────────────────────────────────
-/// Maintient une note dans la tessiture basse (MIN_NOTE-MAX_NOTE)
-fn bass_clamp(n: u8) -> u8 {
-    if n < MIN_NOTE { n + 12 }
-    else if n > MAX_NOTE { n - 12 }
-    else { n }
-}
-
-/// Genere 4 notes de walking bass pour une mesure (4 temps)
-/// current_notes: [root, chord_tone1, chord_tone2, ...] en MIDI absolu
-/// next_root: fondamentale du prochain accord en MIDI absolu
-/// minor: si vrai, temps 2 = fondamentale + 2 demi-tons (ton au-dessus)
-fn generate_walking_bass(current_notes: &[u8], next_root: u8, seed: u64, minor: bool) -> [u8; 4] {
-    let root = current_notes[0];
-    let chord_tones: Vec<u8> = if current_notes.len() > 1 {
-        // Ramener les chord tones dans l'octave basse (MIDI MIN_NOTE-MAX_NOTE)
-        current_notes[1..].iter().map(|&n| bass_clamp(n)).collect()
-    } else {
-        vec![root - 5] // quinte par defaut
-    };
-    // Enlever les doublons
-    let mut tones: Vec<u8> = chord_tones.clone();
-    tones.sort();
-    tones.dedup();
-    let tones = tones;
-
-    // Temps 1 : fondamentale (ancrage)
-    let b1 = root;
-
-    // Temps 2 : si mineur, 50% ton au-dessus de la fondamentale, 50% chord tone aleatoire
-    let b2 = if minor {
-        match seed % 100 {
-            0..=24 => root + 2,
-            25..=49 => root - 10,
-            _ => {
-                let idx2 = (seed as usize) % tones.len();
-                tones[idx2]
-            }
-        }
-    } else {
-        let idx2 = (seed as usize) % tones.len();
-        tones[idx2]
-    };
-
-    // Temps 3 : chord tone different du temps 2
-    let filtered: Vec<u8> = tones.iter().filter(|&&n| n != b2).copied().collect();
-    let b3 = if filtered.is_empty() { b2 + 7 } else { filtered[(seed.wrapping_add(7) as usize) % filtered.len()] };
-
-    // Temps 4 : note d'approche vers next_root
-    let b4 = match (seed % 100) as u8 {
-        0..=49 => { // Approche chromatique (50%)
-            let dir = if seed % 2 == 0 { 1i8 } else { -1i8 };
-            let mut app = (next_root as i16 + dir as i16) as u8;
-            // Si l'approche est trop loin de la tessiture, essayer l'autre direction
-            if app < MIN_NOTE || app > MAX_NOTE {
-                app = (next_root as i16 - dir as i16) as u8;
-            }
-            // Dernier recours : next_root lui-meme
-            if app < MIN_NOTE { app = next_root + 12; }
-            if app > MAX_NOTE { app = next_root - 12; }
-            app
-        }
-        50..=67 => { // Approche dominante (35%)
-            let mut app = next_root + 7;
-            if app > MAX_NOTE { app -= 12; }
-            app
-        }
-        68..=85 => { // Approche sous-dominante (15%)
-            let mut app = next_root - 5;
-            if app < MIN_NOTE { app += 12; }
-            app
-        }
-        _ => { // Approche diatonique (15%) : chord tone le plus proche de next_root
-            tones.iter()
-                .min_by_key(|&&t| {
-                    let diff = if t > next_root { t - next_root } else { next_root - t };
-                    diff
-                })
-                .copied()
-                .unwrap_or(next_root)
-        }
-    };
-
-    [b1, b2, b3, b4]
-}
 
 
 
@@ -401,7 +293,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                         if !nv.is_empty() { nv[0] } else { root }
                     } else { root }
                 };
-                walking_notes = generate_walking_bass(&m, next_root, seed, is_minor(e));
+                walking_notes = generate_walking_bass(&m, next_root, seed, m.len() >= 2 && is_minor(&m[1..]));
                 seed = seed.wrapping_add(1);
             }
 
