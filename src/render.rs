@@ -145,6 +145,35 @@ pub fn generate_smf_fmt0(
 }
 
 // ─── Render WAV via fluidsynth CLI ──────────────────────────────────────
+/// Coupe la fin du WAV au dernier échantillon non-silencieux.
+fn trim_wav_tail(wav: &[u8]) -> Vec<u8> {
+    use hound::WavReader;
+    let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
+        return wav.to_vec(); // fallback: retourner tel quel
+    };
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
+    if samples.is_empty() { return wav.to_vec(); }
+
+    // Dernier échantillon dont l'amplitude dépasse le seuil
+    let threshold: i16 = 300;
+    let last = samples.iter().rposition(|&s| s.abs() > threshold)
+        .unwrap_or(samples.len().saturating_sub(1));
+
+    // 50ms de queue naturelle après la dernière attaque
+    let extra = (spec.sample_rate as usize * 50 / 1000) * spec.channels as usize;
+    let end = (last + extra).min(samples.len());
+
+    let mut out = Vec::new();
+    if let Ok(mut w) = hound::WavWriter::new(std::io::Cursor::new(&mut out), spec) {
+        for &s in &samples[..end] {
+            let _ = w.write_sample(s);
+        }
+        let _ = w.finalize();
+    }
+    if out.is_empty() { wav.to_vec() } else { out }
+}
+
 pub fn render_wav(smf: &[u8], soundfont: &str) -> Result<Vec<u8>, String> {
     let mid_path = std::env::temp_dir().join("chordj_render.mid");
     let wav_path = std::env::temp_dir().join("chordj_render.wav");
@@ -165,5 +194,7 @@ pub fn render_wav(smf: &[u8], soundfont: &str) -> Result<Vec<u8>, String> {
     let wav = std::fs::read(&wav_path).map_err(|e| format!("read wav: {e}"))?;
     let _ = std::fs::remove_file(&mid_path);
     let _ = std::fs::remove_file(&wav_path);
-    Ok(wav)
+
+    // Couper la queue silencieuse (réverb naturelle de la SoundFont)
+    Ok(trim_wav_tail(&wav))
 }
