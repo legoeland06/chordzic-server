@@ -131,18 +131,26 @@ impl LoopPlayer {
             None => return,
         };
 
-        let skip_samples = offset_ms.max(0) as usize * self.sample_rate as usize / 1000;
-        let data = if skip_samples > 0 && skip_samples < pcm.len() {
-            &pcm[skip_samples..]
+        // Décalage cyclique : on ne coupe PAS la durée, on déplace le point
+        // de départ pour que le loop reste synchronisé sur la grille.
+        let len = pcm.len();
+        let offset = if len > 0 && offset_ms != 0 {
+            let samp = (offset_ms.abs() as usize * self.sample_rate as usize / 1000) % len;
+            if offset_ms > 0 { samp } else { len - samp }
         } else {
-            pcm.as_slice()
+            0
         };
 
-        if data.is_empty() {
+        let scaled: Vec<f32> = if offset > 0 && offset < len {
+            let (tail, head) = pcm.split_at(offset);
+            [head, tail].concat()
+        } else {
+            pcm.to_vec()
+        };
+
+        if scaled.is_empty() {
             return;
         }
-
-        let scaled: Vec<f32> = data.to_vec();
         let source = rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled)
             .repeat_infinite();
 
