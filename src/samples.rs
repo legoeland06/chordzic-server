@@ -10,7 +10,7 @@
 use rodio::{OutputStream, OutputStreamHandle, Sink, Source as RodioSource};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const DRUM_DIR: &str = "/home/legoeland/samples/drums";
@@ -116,9 +116,32 @@ impl LoopPlayer {
         }
     }
 
+    /// Ré-échantillonne linéairement `data` vers `target_len` samples.
+    fn resample(data: &[f32], target_len: usize) -> Vec<f32> {
+        let len = data.len();
+        if len == 0 || target_len == 0 || len == target_len {
+            return data.to_vec();
+        }
+        let ratio = len as f64 / target_len as f64;
+        let mut out = Vec::with_capacity(target_len);
+        for i in 0..target_len {
+            let pos = i as f64 * ratio;
+            let idx = pos as usize;
+            let frac = pos - idx as f64;
+            let val = if idx + 1 < len {
+                data[idx] as f64 * (1.0 - frac) + data[idx + 1] as f64 * frac
+            } else {
+                data[idx] as f64
+            };
+            out.push(val as f32);
+        }
+        out
+    }
+
     /// Démarre la boucle — crée un NOUVEAU sink
+    /// Le WAV est resamplé pour que sa durée corresponde exactement à 4, 8, 12…
+    /// temps au BPM donné, évitant toute dérive entre répétitions.
     fn start(&mut self, tempo: u16, name: Option<&str>, offset_ms: i32) {
-        // Jeter l'ancien sink s'il existe
         self.sink = None;
 
         let bucket = match self.loops.get(&tempo) {
@@ -131,9 +154,16 @@ impl LoopPlayer {
             None => return,
         };
 
-        // Décalage cyclique : on ne coupe PAS la durée, on déplace le point
-        // de départ pour que le loop reste synchronisé sur la grille.
-        let len = pcm.len();
+        // 1. Resampler pour que la durée corresponde pile au BPM
+        let wav_seconds = pcm.len() as f64 / self.sample_rate as f64;
+        let wav_beats = wav_seconds * (tempo as f64 / 60.0);
+        let target_beats = (wav_beats / 4.0).round().max(1.0) * 4.0;
+        let target_samples =
+            (target_beats * 60.0 / tempo as f64 * self.sample_rate as f64) as usize;
+        let resampled = Self::resample(pcm, target_samples.max(1));
+
+        // 2. Décalage cyclique (préserve la durée exacte)
+        let len = resampled.len();
         let offset = if len > 0 && offset_ms != 0 {
             let samp = (offset_ms.abs() as usize * self.sample_rate as usize / 1000) % len;
             if offset_ms > 0 { samp } else { len - samp }
@@ -141,17 +171,19 @@ impl LoopPlayer {
             0
         };
 
-        let scaled: Vec<f32> = if offset > 0 && offset < len {
-            let (tail, head) = pcm.split_at(offset);
-            [head, tail].concat()
+        let vol = LOOP_VOLUME.load(Ordering::Relaxed) as f32 / 127.0;
+        let final_pcm: Vec<f32> = if offset > 0 && offset < len {
+            let (tail, head) = resampled.split_at(offset);
+            [head, tail].concat().into_iter().map(|s| s * vol).collect()
         } else {
-            pcm.to_vec()
+            resampled.into_iter().map(|s| s * vol).collect()
         };
 
-        if scaled.is_empty() {
+        if final_pcm.is_empty() {
             return;
         }
-        let source = rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled)
+
+        let source = rodio::buffer::SamplesBuffer::new(1, self.sample_rate, final_pcm)
             .repeat_infinite();
 
         self.last_tempo = tempo;
@@ -162,9 +194,12 @@ impl LoopPlayer {
                 s.append(source);
                 self.sink = Some(s);
                 println!(
-                    "  🔁 Loop '{}' à {} bpm (offset {}ms)",
+                    "  🔁 Loop '{}' à {} bpm ({} éch → {} éch, {}m battements, offset {}ms)",
                     self.last_name,
                     tempo,
+                    pcm.len(),
+                    len,
+                    target_beats,
                     offset_ms
                 );
             }
@@ -224,6 +259,12 @@ pub fn init() {
 }
 
 pub fn set_current_tempo(_tempo: u16) { /* le bank n'a pas besoin de savoir, le lookup se fait par tempo */ }
+
+static LOOP_VOLUME: AtomicU8 = AtomicU8::new(80);
+
+pub fn set_volume(vol: u8) {
+    LOOP_VOLUME.store(vol, Ordering::Relaxed);
+}
 
 pub fn set_use_loops(enabled: bool) {
     USE_LOOPS.store(enabled, Ordering::Relaxed);

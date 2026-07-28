@@ -45,6 +45,7 @@ struct Live {
     loop_offset: AtomicI32,
     use_loops: AtomicBool,
     loop_name: Mutex<String>,
+    loop_volume: AtomicU8,
 }
 
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
@@ -92,6 +93,7 @@ struct Cfg{
     loop_offset:Option<i32>,
     use_loops:Option<bool>,
     loop_name:Option<String>,
+    loop_volume:Option<u8>,
 }
 
 fn t120()->u32{120}fn y()->bool{true}fn n()->bool{false}fn rk()->String{"rock".to_string()}fn s44()->String{"4/4".to_string()}fn i51()->u16{51}fn b4()->f64{4.0}
@@ -551,6 +553,8 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
         if loop_active {
             let lname=lv.loop_name.lock().unwrap().clone();
             let name_opt=if lname.is_empty(){None}else{Some(lname.as_str())};
+        let lvol=lv.loop_volume.load(Ordering::Relaxed);
+        samples::set_volume(lvol);
         samples::play_loop(tempo_now, name_opt, lv.loop_offset.load(Ordering::Relaxed));
         }
         if!ev.is_empty(){let sq=ev.to_vec();let l=Arc::clone(lv);
@@ -588,6 +592,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
     if let Some(off)=b.loop_offset{lv.loop_offset.store(off,Ordering::Relaxed);samples::update_offset(off);}
     if let Some(lo)=b.use_loops{lv.use_loops.store(lo,Ordering::Relaxed);samples::set_use_loops(lo);}
     if let Some(ref n)=b.loop_name{*lv.loop_name.lock().unwrap()=n.clone();}
+    if let Some(lv2)=b.loop_volume{lv.loop_volume.store(lv2,Ordering::Relaxed);samples::set_volume(lv2);}
     Json(Rsp{status:"ok".into()})
 }
 
@@ -642,7 +647,7 @@ async fn main(){
         ],
         pattern:AtomicU8::new(PAT_ROCK),tempo:AtomicU16::new(120),stop:AtomicBool::new(false),sig:AtomicU16::new(44),
         walking:AtomicBool::new(false),master_vol:AtomicU8::new(127),use432:AtomicBool::new(false),loop_offset:AtomicI32::new(0),use_loops:AtomicBool::new(false),
-        loop_name:Mutex::new(String::new()),
+        loop_name:Mutex::new(String::new()),loop_volume:AtomicU8::new(80),
     })};
     async fn samples_list()->impl IntoResponse{
     use axum::http::StatusCode;
