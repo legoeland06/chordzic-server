@@ -555,7 +555,8 @@ async fn play(State(s):State<AppState>,Json(b):Json<PlayReq>)->impl IntoResponse
             let name_opt=if lname.is_empty(){None}else{Some(lname.as_str())};
         let lvol=lv.loop_volume.load(Ordering::Relaxed);
         samples::set_volume(lvol);
-        samples::play_loop(tempo_now, name_opt, lv.loop_offset.load(Ordering::Relaxed));
+        let total_beats: f64 = if !ev.is_empty() { ev.iter().map(|e| e.beats).sum() } else { 4.0 };
+        samples::play_loop(tempo_now, name_opt, lv.loop_offset.load(Ordering::Relaxed), total_beats);
         }
         if!ev.is_empty(){let sq=ev.to_vec();let l=Arc::clone(lv);
             std::thread::spawn(move||{if let Ok(mut c)=h2.lock(){play_seq(&mut c,&sq,&l,do_loop)}});

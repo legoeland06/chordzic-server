@@ -141,7 +141,7 @@ impl LoopPlayer {
     /// Démarre la boucle — crée un NOUVEAU sink
     /// Le WAV est resamplé pour que sa durée corresponde exactement à 4, 8, 12…
     /// temps au BPM donné, évitant toute dérive entre répétitions.
-    fn start(&mut self, tempo: u16, name: Option<&str>, offset_ms: i32) {
+    fn start(&mut self, tempo: u16, name: Option<&str>, offset_ms: i32, total_beats: f64) {
         self.sink = None;
 
         let bucket = match self.loops.get(&tempo) {
@@ -154,12 +154,9 @@ impl LoopPlayer {
             None => return,
         };
 
-        // 1. Resampler pour que la durée corresponde pile au BPM
-        let wav_seconds = pcm.len() as f64 / self.sample_rate as f64;
-        let wav_beats = wav_seconds * (tempo as f64 / 60.0);
-        let target_beats = (wav_beats / 4.0).round().max(1.0) * 4.0;
+        // 1. Resampler le WAV pour qu'il fasse exactement `total_beats` temps
         let target_samples =
-            (target_beats * 60.0 / tempo as f64 * self.sample_rate as f64) as usize;
+            (total_beats * 60.0 / tempo as f64 * self.sample_rate as f64) as usize;
         let resampled = Self::resample(pcm, target_samples.max(1));
 
         // 2. Décalage cyclique (préserve la durée exacte)
@@ -199,7 +196,7 @@ impl LoopPlayer {
                     tempo,
                     pcm.len(),
                     len,
-                    target_beats,
+                    total_beats,
                     offset_ms
                 );
             }
@@ -215,7 +212,7 @@ impl LoopPlayer {
         let tempo = self.last_tempo;
         let name = self.last_name.clone();
         let name_opt = if name.is_empty() { None } else { Some(name.as_str()) };
-        self.start(tempo, name_opt, offset_ms);
+        self.start(tempo, name_opt, offset_ms, 4.0);
     }
 
     /// Arrête la boucle — détruit le sink (le drop stoppe le son)
@@ -274,14 +271,14 @@ pub fn set_use_loops(enabled: bool) {
     println!("  🎛️  Loop {}", if enabled { "activé" } else { "désactivé" });
 }
 
-pub fn play_loop(tempo: u16, name: Option<&str>, offset_ms: i32) {
+pub fn play_loop(tempo: u16, name: Option<&str>, offset_ms: i32, total_beats: f64) {
     if !USE_LOOPS.load(Ordering::Relaxed) {
         return;
     }
     if let Some(mtx) = BANK.get() {
         if let Ok(mut p) = mtx.lock() {
             if p.has_loop(tempo) {
-                p.start(tempo, name, offset_ms);
+                p.start(tempo, name, offset_ms, total_beats);
             }
         }
     }
