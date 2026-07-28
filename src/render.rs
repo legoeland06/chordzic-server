@@ -1,5 +1,6 @@
 /// Render chord progression — génération SMF Format 0 + render WAV.
 use std::process::Command;
+use crate::patterns::sc;
 use crate::walking::{is_minor as is_minor_chord, generate_walking_bass as walking_bass_notes};
 
 const TICKS_PER_BEAT: u32 = 480;
@@ -61,9 +62,6 @@ struct Ev { tick: u32, bytes: Vec<u8> }
 fn e(evs: &mut Vec<Ev>, tick: u32, bytes: &[u8]) {
     evs.push(Ev { tick, bytes: bytes.to_vec() });
 }
-
-// volume scaling helper
-fn sc(vol: u8, base: u8) -> u8 { ((vol as u16 * base as u16) / 127).min(127) as u8 }
 
 pub fn generate_smf_fmt0(
     notes_arrays: &[Vec<u8>],

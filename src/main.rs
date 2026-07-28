@@ -1,3 +1,4 @@
+mod patterns;
 mod render;
 mod samples;
 mod walking;
@@ -8,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
+use patterns::{pat, sc, DRUM_HH, DRUM_KICK, DRUM_RIDE, DRUM_RIM, DRUM_SNARE, HH_8TH, HH_BEAT, PAT_BOSSA, PAT_JAZZ, PAT_ONEDROP, PAT_POP, PAT_REGGAE, PAT_ROCK};
 use walking::{generate_walking_bass, is_minor, MIN_NOTE};
 
 type MidiHandle = Arc<Mutex<MidiOutputConnection>>;
@@ -52,9 +54,6 @@ struct Live {
 #[derive(Clone)] struct AppState{midi:Option<MidiHandle>,live:Arc<Live>}
 
 // ─── Patterns ────────────────────────────────────────────────────────────
-const PAT_ROCK:u8=0; const PAT_REGGAE:u8=1; const PAT_JAZZ:u8=2;
-const PAT_POP:u8=3; const PAT_BOSSA:u8=4; const PAT_ONEDROP:u8=5;
-fn pat(s:&str)->u8{match s{"reggae"=>PAT_REGGAE,"jazz"=>PAT_JAZZ,"pop"=>PAT_POP,"bossa"=>PAT_BOSSA,"onedrop"=>PAT_ONEDROP,_=>PAT_ROCK}}
 fn sig_code(s:&str)->u16{
     let parts:Vec<&str>=s.split('/').collect();
     if parts.len()!=2{return 44}let top:u16=parts[0].parse().unwrap_or(4);let bot:u16=parts[1].parse().unwrap_or(4);top*10+bot
@@ -134,22 +133,17 @@ fn pb(c:&mut MidiOutputConnection,ch:u8,val:u16){let lsb=(val&127)as u8;let msb=
 
 
 // ─── MIDI helpers ───────────────────────────────────────────────────────
-const DRUM_KICK:u8=36; const DRUM_SNARE:u8=38; const DRUM_RIM:u8=37;
-const DRUM_HH:u8=42; const DRUM_RIDE:u8=51;
-const HH_BEAT:u8=80; const HH_8TH:u8=65;
-fn scale_mv(v:u8,mv:u8)->u8{((v as u16*mv as u16)/127).min(127)as u8}
-
 fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:bool,bars:u64,vol:u8,mv:u8){
     if!on_beat&&!on_eighth{return}
     let b=beat%bars;
-    let v=scale_mv(vol,mv);
-    let hh=vscale(v,HH_BEAT);let h8=vscale(v,HH_8TH);let h55=vscale(v,55);let h45=vscale(v,45);let h40=vscale(v,10);
-    let h60=vscale(v,60);let h65=vscale(v,65);
+    let v=sc(vol,mv);
+    let hh=sc(v,HH_BEAT);let h8=sc(v,HH_8TH);let h55=sc(v,55);let h45=sc(v,45);let h40=sc(v,10);
+    let h60=sc(v,60);let h65=sc(v,65);
     match pat{
         PAT_REGGAE=>if on_beat{match b{
             0=>{no(c,9,DRUM_HH,h60);}
             1=>{no(c,9,DRUM_HH,h60);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,120));no(c,9,DRUM_HH,h65);no(c,9,DRUM_RIM,vscale(v,90));}
+            2=>{no(c,9,DRUM_KICK,sc(v,120));no(c,9,DRUM_HH,h65);no(c,9,DRUM_RIM,sc(v,90));}
             3=>{no(c,9,DRUM_HH,h60);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         PAT_JAZZ=>{
@@ -157,37 +151,36 @@ fn drum_hit(c:&mut MidiOutputConnection,beat:u64,pat:u8,on_beat:bool,on_eighth:b
             if on_beat{match b{
                 0=>{no(c,9,DRUM_RIDE,h60);}
                 2=>{no(c,9,DRUM_RIDE,h60);}
-                4=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));} // ride + pedal HH
+                4=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,sc(v,40));} // ride + pedal HH
                 6=>{no(c,9,DRUM_RIDE,h60);}
-                7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,vscale(v,40));no(c,9,DRUM_RIM,vscale(v,50));}_=>{}
+                7=>{no(c,9,DRUM_RIDE,h60);no(c,9,44,sc(v,40));no(c,9,DRUM_RIM,sc(v,50));}_=>{}
             }}else if on_eighth{no(c,9,DRUM_HH,35);}
         }
         PAT_POP=>{
             let b=beat%8; // 2 mesures
             if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,85));no(c,9,DRUM_HH,vscale(v,50));}
-            2=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,vscale(v,50));}
-            4=>{no(c,9,DRUM_KICK,vscale(v,75));no(c,9,DRUM_HH,vscale(v,50));}
-            6=>{no(c,9,DRUM_SNARE,vscale(v,65));no(c,9,DRUM_HH,vscale(v,50));}_=>{}
-        }}else if on_eighth{no(c,9,DRUM_HH,vscale(v,45));}
+            0=>{no(c,9,DRUM_KICK,sc(v,85));no(c,9,DRUM_HH,sc(v,50));}
+            2=>{no(c,9,DRUM_SNARE,sc(v,70));no(c,9,DRUM_HH,sc(v,50));}
+            4=>{no(c,9,DRUM_KICK,sc(v,75));no(c,9,DRUM_HH,sc(v,50));}
+            6=>{no(c,9,DRUM_SNARE,sc(v,65));no(c,9,DRUM_HH,sc(v,50));}_=>{}
+        }}else if on_eighth{no(c,9,DRUM_HH,sc(v,45));}
     }
         PAT_BOSSA=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,55));no(c,9,DRUM_HH,h45);}1=>{no(c,9,DRUM_SNARE,vscale(v,30));no(c,9,DRUM_HH,h45);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,60));no(c,9,DRUM_HH,h45);}3=>{no(c,9,DRUM_KICK,vscale(v,50));no(c,9,DRUM_HH,h45);}_=>{}
+            0=>{no(c,9,DRUM_KICK,sc(v,55));no(c,9,DRUM_HH,h45);}1=>{no(c,9,DRUM_SNARE,sc(v,30));no(c,9,DRUM_HH,h45);}
+            2=>{no(c,9,DRUM_KICK,sc(v,60));no(c,9,DRUM_HH,h45);}3=>{no(c,9,DRUM_KICK,sc(v,50));no(c,9,DRUM_HH,h45);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         PAT_ONEDROP=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,h55);}
+            0=>{no(c,9,DRUM_KICK,sc(v,90));no(c,9,DRUM_HH,h55);}
             1=>{no(c,9,DRUM_HH,h40);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_RIM,vscale(v,65));no(c,9,DRUM_HH,h45);}
+            2=>{no(c,9,DRUM_KICK,sc(v,90));no(c,9,DRUM_RIM,sc(v,65));no(c,9,DRUM_HH,h45);}
             3=>{no(c,9,DRUM_HH,h55);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h40);}
         _=>if on_beat{match b{
-            0=>{no(c,9,DRUM_KICK,vscale(v,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,vscale(v,75));no(c,9,DRUM_HH,hh);}
-            2=>{no(c,9,DRUM_KICK,vscale(v,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,vscale(v,70));no(c,9,DRUM_HH,hh);}_=>{}
+            0=>{no(c,9,DRUM_KICK,sc(v,90));no(c,9,DRUM_HH,hh);}1=>{no(c,9,DRUM_SNARE,sc(v,75));no(c,9,DRUM_HH,hh);}
+            2=>{no(c,9,DRUM_KICK,sc(v,80));no(c,9,DRUM_HH,hh);}3=>{no(c,9,DRUM_SNARE,sc(v,70));no(c,9,DRUM_HH,hh);}_=>{}
         }}else if on_eighth{no(c,9,DRUM_HH,h8);}
     }
 }
-fn vscale(vol:u8,base:u8)->u8{((vol as u16*base as u16)/127).min(127) as u8}
 
 fn play_notes(c:&mut MidiOutputConnection,notes:&[String],mv:u8){
     let mut v:Vec<u8>=vec![];for n in notes{if let Ok(m)=note_midi(n){v.push(m)}}if v.is_empty(){return}
@@ -254,13 +247,13 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     // Batterie seulement
                     if !t_drums.mute.load(Ordering::Relaxed){
                         if last_b_drums==u64::MAX||beat>last_b_drums{
-                            let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                            let dvol=sc(t_drums.volume.load(Ordering::Relaxed),mv);
                             drum_hit(c,beat,pt,true,false,bars,dvol,127);
                             last_b_drums=beat;
                         }
                         let beat_pos=elapsed_ms%bd_ms;
                         if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
-                            let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                            let dvol=sc(t_drums.volume.load(Ordering::Relaxed),mv);
                             drum_hit(c,beat,pt,false,true,bars,dvol,127);
                         }
                     }
@@ -299,7 +292,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
 
             // Basse : jouer le premier temps IMMEDIATEMENT (pas via le tick)
             if !t_bass.mute.load(Ordering::Relaxed) {
-                let bvol=scale_mv(t_bass.volume.load(Ordering::Relaxed),mv);
+                let bvol=sc(t_bass.volume.load(Ordering::Relaxed),mv);
                 let bass_note = if walking { walking_notes[0] } else { root };
                 no_mv(c,ch_bass,bass_note,bvol,mv);
                 prev_bass_note=bass_note;
@@ -309,7 +302,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
             // Nappes (Strings)
             if !t_str.mute.load(Ordering::Relaxed) {
                 for n in &prev_nappe{no(c,ch_str,*n,0)}
-                let str_vol=scale_mv(t_str.volume.load(Ordering::Relaxed),mv);
+                let str_vol=sc(t_str.volume.load(Ordering::Relaxed),mv);
                 for n in &nappe_notes{no_mv(c,ch_str,*n,str_vol,mv)}
                 prev_nappe=nappe_notes.clone();
             }
@@ -332,13 +325,13 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 // Batterie
                 if !t_drums.mute.load(Ordering::Relaxed){
                     if last_b_drums==u64::MAX||beat>last_b_drums{
-                        let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                        let dvol=sc(t_drums.volume.load(Ordering::Relaxed),mv);
                         drum_hit(c,beat,pt,true,false,bars,dvol,127);
                         last_b_drums=beat;
                     }
                     let beat_pos=elapsed_ms%bd_ms;
                     if beat_pos>bd_ms/2.0-10.0&&beat_pos<bd_ms/2.0+10.0{
-                        let dvol=scale_mv(t_drums.volume.load(Ordering::Relaxed),mv);
+                        let dvol=sc(t_drums.volume.load(Ordering::Relaxed),mv);
                         drum_hit(c,beat,pt,false,true,bars,dvol,127);
                     }
                 }
@@ -346,7 +339,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                 // Basse (Walking ou root)
                 if !t_bass.mute.load(Ordering::Relaxed){
                     if beat>last_b_bass{
-                        let bvol=scale_mv(t_bass.volume.load(Ordering::Relaxed),mv);
+                        let bvol=sc(t_bass.volume.load(Ordering::Relaxed),mv);
                         let bass_note = if walking {
                             let bi = (beat % 4) as usize;
                             walking_notes[bi]
@@ -370,7 +363,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     }
                     // Note On sur le contretemps 8eme (3e 16eme du temps)
                     if idx%4==2&&!lead_mute{
-                        let lvol=scale_mv(t_lead.volume.load(Ordering::Relaxed),mv);
+                        let lvol=sc(t_lead.volume.load(Ordering::Relaxed),mv);
                         prev_lead=m.clone();
                         for &note in &m{no_mv(c,ch_lead,note,lvol,mv)}
                     }
@@ -386,7 +379,7 @@ fn play_seq(c:&mut MidiOutputConnection,ev:&[ChordEv],lc:&Live,do_loop:bool){
                     }
                     // Note On sur temps 2 et 4 (tick 4 et 12 = idx%8==4)
                     if idx%8==4&&!accent_mute{
-                        let avol=scale_mv(t_accent.volume.load(Ordering::Relaxed),mv);
+                        let avol=sc(t_accent.volume.load(Ordering::Relaxed),mv);
                         prev_accent=m.clone();
                         for &note in &m{no_mv(c,ch_accent,note,avol,mv)}
                     }
