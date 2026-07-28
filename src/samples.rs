@@ -3,34 +3,28 @@
 /// avec la séquence d'accords.
 ///
 /// Convention de nommage :
-///   reggae_120.wav   → loop "reggae" pour 120 BPM
-///   rock_140.wav     → loop "rock" pour 140 BPM
+///   pattern_120.wav   → loop "pattern" pour 120 BPM
 ///
-/// Un spinner de décalage (offset_ms) permet d'ajuster le premier temps
-/// du WAV par rapport au début des accords.
-use rodio::{OutputStream, Sink, Source as RodioSource};
+/// Le sink rodio est recréé à chaque play/stop pour éviter tout état
+/// résiduel (sink.stop() le détache définitivement du mixeur).
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source as RodioSource};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-
 const DRUM_DIR: &str = "/home/legoeland/samples/drums";
 
 static BANK: OnceLock<Mutex<LoopPlayer>> = OnceLock::new();
 
-// ─── État global ────────────────────────────────────────────────────────
 static USE_LOOPS: AtomicBool = AtomicBool::new(false);
-static CUR_TEMPO: AtomicU16 = AtomicU16::new(120);
 
 // ─── Data ───────────────────────────────────────────────────────────────
 pub struct LoopPlayer {
-    sink: Sink,
-    /// tempo → (nom → pcm mono f32)
+    handle: OutputStreamHandle,
+    sink: Option<Sink>,
     loops: HashMap<u16, HashMap<String, Vec<f32>>>,
     sample_rate: u32,
-    /// tempo actuellement en lecture (0 = aucun)
-    playing_tempo: u16,
 }
 
 impl LoopPlayer {
@@ -38,8 +32,6 @@ impl LoopPlayer {
         let (_stream, handle) = OutputStream::try_default()
             .expect("rodio: impossible d'ouvrir la sortie audio");
         std::mem::forget(_stream);
-        let sink = Sink::try_new(&handle)
-            .expect("rodio: impossible de créer le sink");
 
         let mut loops: HashMap<u16, HashMap<String, Vec<f32>>> = HashMap::new();
         let mut sample_rate = 44100u32;
@@ -62,7 +54,6 @@ impl LoopPlayer {
                     None => continue,
                 };
 
-                // Parse "nom_BPM" — dernier underscore sépare nom et bpm
                 let us = match fname.rfind('_') {
                     Some(p) => p,
                     None => {
@@ -109,46 +100,34 @@ impl LoopPlayer {
 
         if count == 0 {
             println!("   ℹ️  Aucun loop trouvé dans {}", DRUM_DIR);
-            println!("   └─ Nommez vos fichiers nom_BPM.wav (ex: pattern_120.wav)");
         } else {
             println!("   {} loops chargés", count);
         }
 
         LoopPlayer {
-            sink,
+            handle,
+            sink: None,
             loops,
             sample_rate,
-            playing_tempo: 0,
         }
     }
 
-    /// Démarre la boucle pour `name` à `tempo` avec un décalage de `offset_ms`.
-    /// Si `name` est vide, prend le premier loop disponible pour ce tempo.
+    /// Démarre la boucle — crée un NOUVEAU sink
     fn start(&mut self, tempo: u16, name: Option<&str>, offset_ms: i32) {
-        self.stop();
+        // Jeter l'ancien sink s'il existe
+        self.sink = None;
 
         let bucket = match self.loops.get(&tempo) {
             Some(b) => b,
             None => return,
         };
 
-        let pcm = match name {
-            Some(n) => bucket.get(n),
-            None => bucket.values().next(),
-        };
-
-        let pcm = match pcm {
+        let pcm = match name.and_then(|n| bucket.get(n)).or_else(|| bucket.values().next()) {
             Some(p) => p,
             None => return,
         };
 
-        // Appliquer l'offset : ignorer les premières samples
-        let skip_samples = if offset_ms > 0 {
-            ((offset_ms as f64 / 1000.0) * self.sample_rate as f64) as usize
-        } else {
-            0
-        };
-
+        let skip_samples = offset_ms.max(0) as usize * self.sample_rate as usize / 1000;
         let data = if skip_samples > 0 && skip_samples < pcm.len() {
             &pcm[skip_samples..]
         } else {
@@ -159,18 +138,29 @@ impl LoopPlayer {
             return;
         }
 
-        let scaled: Vec<f32> = data.to_vec(); // copie pour le sink
-        let source =
-            rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled).repeat_infinite();
-        self.sink.append(source);
-        self.playing_tempo = tempo;
-        println!("  🔁 Loop '{}' à {} bpm (offset {}ms)", name.unwrap_or("?"), tempo, offset_ms);
+        let scaled: Vec<f32> = data.to_vec();
+        let source = rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled)
+            .repeat_infinite();
+
+        match Sink::try_new(&self.handle) {
+            Ok(s) => {
+                s.append(source);
+                self.sink = Some(s);
+                println!(
+                    "  🔁 Loop '{}' à {} bpm (offset {}ms)",
+                    name.unwrap_or("?"),
+                    tempo,
+                    offset_ms
+                );
+            }
+            Err(e) => eprintln!("  ⚠️ Erreur création sink: {}", e),
+        }
     }
 
+    /// Arrête la boucle — détruit le sink (le drop stoppe le son)
     fn stop(&mut self) {
-        if self.playing_tempo != 0 {
-            self.sink.clear();
-            self.playing_tempo = 0;
+        if self.sink.is_some() {
+            self.sink = None;
             println!("  ⏹ Loop arrêté");
         }
     }
@@ -207,23 +197,16 @@ pub fn init() {
     });
 }
 
+pub fn set_current_tempo(_tempo: u16) { /* le bank n'a pas besoin de savoir, le lookup se fait par tempo */ }
+
 pub fn set_use_loops(enabled: bool) {
     USE_LOOPS.store(enabled, Ordering::Relaxed);
     if !enabled {
-        if let Some(mtx) = BANK.get() {
-            if let Ok(mut p) = mtx.lock() {
-                p.stop();
-            }
-        }
+        stop_loop();
     }
-    println!("  🎛️  Loop drums {}", if enabled { "activé" } else { "désactivé" });
+    println!("  🎛️  Loop {}", if enabled { "activé" } else { "désactivé" });
 }
 
-pub fn set_current_tempo(tempo: u16) {
-    CUR_TEMPO.store(tempo, Ordering::Relaxed);
-}
-
-/// Démarre la boucle. Appelé par play_seq quand use_loops est true.
 pub fn play_loop(tempo: u16, name: Option<&str>, offset_ms: i32) {
     if !USE_LOOPS.load(Ordering::Relaxed) {
         return;
@@ -237,22 +220,12 @@ pub fn play_loop(tempo: u16, name: Option<&str>, offset_ms: i32) {
     }
 }
 
-/// Arrête la boucle. Appelé par stop et à la fin de play_seq.
 pub fn stop_loop() {
     if let Some(mtx) = BANK.get() {
         if let Ok(mut p) = mtx.lock() {
             p.stop();
         }
     }
-}
-
-pub fn has_loop_for(tempo: u16) -> bool {
-    if let Some(mtx) = BANK.get() {
-        if let Ok(p) = mtx.lock() {
-            return p.has_loop(tempo);
-        }
-    }
-    false
 }
 
 pub fn get_available() -> serde_json::Value {
