@@ -585,7 +585,7 @@ async fn conf(State(s):State<AppState>,Json(b):Json<Cfg>)->impl IntoResponse{
             }
         }
     }
-    if let Some(off)=b.loop_offset{lv.loop_offset.store(off,Ordering::Relaxed);}
+    if let Some(off)=b.loop_offset{lv.loop_offset.store(off,Ordering::Relaxed);samples::update_offset(off);}
     if let Some(lo)=b.use_loops{lv.use_loops.store(lo,Ordering::Relaxed);samples::set_use_loops(lo);}
     if let Some(ref n)=b.loop_name{*lv.loop_name.lock().unwrap()=n.clone();}
     Json(Rsp{status:"ok".into()})

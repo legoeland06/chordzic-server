@@ -25,6 +25,8 @@ pub struct LoopPlayer {
     sink: Option<Sink>,
     loops: HashMap<u16, HashMap<String, Vec<f32>>>,
     sample_rate: u32,
+    last_tempo: u16,
+    last_name: String,
 }
 
 impl LoopPlayer {
@@ -109,6 +111,8 @@ impl LoopPlayer {
             sink: None,
             loops,
             sample_rate,
+            last_tempo: 0,
+            last_name: String::new(),
         }
     }
 
@@ -142,19 +146,33 @@ impl LoopPlayer {
         let source = rodio::buffer::SamplesBuffer::new(1, self.sample_rate, scaled)
             .repeat_infinite();
 
+        self.last_tempo = tempo;
+        self.last_name = name.unwrap_or("").to_string();
+
         match Sink::try_new(&self.handle) {
             Ok(s) => {
                 s.append(source);
                 self.sink = Some(s);
                 println!(
                     "  🔁 Loop '{}' à {} bpm (offset {}ms)",
-                    name.unwrap_or("?"),
+                    self.last_name,
                     tempo,
                     offset_ms
                 );
             }
             Err(e) => eprintln!("  ⚠️ Erreur création sink: {}", e),
         }
+    }
+
+    /// Relance la boucle avec un nouvel offset (appelé quand l'utilisateur tourne le spinner)
+    fn restart_offset(&mut self, offset_ms: i32) {
+        if self.sink.is_none() || self.last_tempo == 0 {
+            return;
+        }
+        let tempo = self.last_tempo;
+        let name = self.last_name.clone();
+        let name_opt = if name.is_empty() { None } else { Some(name.as_str()) };
+        self.start(tempo, name_opt, offset_ms);
     }
 
     /// Arrête la boucle — détruit le sink (le drop stoppe le son)
@@ -224,6 +242,18 @@ pub fn stop_loop() {
     if let Some(mtx) = BANK.get() {
         if let Ok(mut p) = mtx.lock() {
             p.stop();
+        }
+    }
+}
+
+/// Met à jour l'offset en temps réel (relance la boucle si elle tourne)
+pub fn update_offset(offset_ms: i32) {
+    if !USE_LOOPS.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(mtx) = BANK.get() {
+        if let Ok(mut p) = mtx.lock() {
+            p.restart_offset(offset_ms);
         }
     }
 }
