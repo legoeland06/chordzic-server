@@ -10,7 +10,7 @@
 use rodio::{OutputStream, OutputStreamHandle, Sink, Source as RodioSource};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const DRUM_DIR: &str = "/home/legoeland/samples/drums";
