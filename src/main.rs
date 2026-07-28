@@ -621,7 +621,11 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
     let smf = render::generate_smf_fmt0(&notes_arrays, &beats, b.tempo, 1);
     let sf_path = "/usr/share/sounds/sf3/MuseScore_General_Full.sf3";
 
-    match render::render_wav(&smf, sf_path) {
+    // Durée exacte en secondes pour un loop parfait
+    let total_beats: f64 = beats.iter().sum();
+    let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
+
+    match render::render_wav(&smf, sf_path, duration_sec) {
         Ok(wav) => {
             let mut h = HeaderMap::new();
             h.insert("Content-Type", "audio/wav".parse().unwrap());
