@@ -133,11 +133,9 @@ pub fn generate_smf_fmt0(
         ((tempo_us >> 8)  & 0xFF) as u8,
         (tempo_us & 0xFF) as u8]);
 
-    // Init PCs depuis la config tracks
+    // Init PCs depuis la config tracks (drums: le program selectionne le kit)
     for tc in &cfg.tracks {
-        let ch = tc.channel;
-        if ch == CH_DRUMS { e(&mut evs, 0, &[0xC0 | ch, 0]); } // GM drum bank = prog 0
-        else { e(&mut evs, 0, &[0xC0 | ch, tc.program as u8]); }
+        e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
     }
     // Si lead channel n'est pas dans tracks, utiliser cfg.lead_inst
     let has_lead = cfg.tracks.iter().any(|t| t.channel == CH_LEAD);
