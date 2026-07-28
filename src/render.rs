@@ -180,25 +180,32 @@ pub fn generate_smf_fmt0(
         let bass_note = notes[0];
         let chord: &[u8] = if notes.len() > 1 { &notes[1..] } else { &[] };
 
+        // Lead — pompe skank : staccato sur contretemps 8eme
+        // Note On au tick = beat * tpb + 240, Off 120 ticks plus tard (staccato 16eme)
         if !lead_mute {
             let lv = sc(lead_vol, 127);
-            for &n in chord { e(&mut evs, chord_start, &[0x90, n, lv]); }
+            for b in 0..nq {
+                let skank_on = chord_start + b * tpb + eighth; // 8eme offbeat = tick 240
+                for &n in chord { e(&mut evs, skank_on, &[0x90, n, lv]); }
+                let skank_off = skank_on + 120; // staccato 1/16eme
+                for &n in chord { e(&mut evs, skank_off, &[0x80, n, 64]); }
+            }
         }
 
         // Walking bass ou note tenue
         if !bass_mute {
             let bv = sc(bass_vol, 127);
-            if cfg.walking && chord.len() >= 2 {
+            if cfg.walking && notes.len() >= 2 {
                 let next_root = notes_arrays.get(ci + 1).and_then(|n| n.first()).copied()
                     .or_else(|| notes_arrays.first().and_then(|n| n.first()).copied())
                     .unwrap_or(bass_note);
                 let wb_notes = walking_bass_notes(&[bass_note, chord[0], chord.get(1).copied().unwrap_or(bass_note)], next_root, seed, is_minor_chord(&[bass_note, chord[0]]));
                 seed = seed.wrapping_add(1);
                 for (bi, &bn) in wb_notes.iter().enumerate() {
-                    let bt = chord_start + (bi as u32) * tpb / 4;
+                    let bt = chord_start + (bi as u32) * tpb; // toutes les noires
                     e(&mut evs, bt, &[0x92, bn, bv]);
-                    // Note Off juste avant la prochaine note (ticks avant)
-                    let off_tick = if bi < 3 { chord_start + ((bi + 1) as u32) * tpb / 4 - 1 } else { chord_end };
+                    // Note Off 1 tick avant la note suivante (staccato)
+                    let off_tick = if bi < 3 { chord_start + ((bi + 1) as u32) * tpb - 1 } else { chord_end };
                     e(&mut evs, off_tick, &[0x82, bn, 64]);
                 }
             } else {
@@ -219,61 +226,73 @@ pub fn generate_smf_fmt0(
             let up_tick = on_tick + eighth;
             let bar_beat = (abs_tick / tpb + b) % beats_per_bar;
 
-            // Drums
+            // Druns — pattern exactement comme drum_hit() dans main.rs
             if !drums_mute {
                 let dv = sc(drums_vol, 127);
-                let (kk, sn, hh, rm) = (sc(dv, 100), sc(dv, 90), sc(dv, 70), sc(dv, 60));
-                let hh_up = sc(dv, 55);
+                let hh = |b:u8| sc(dv, b); let hh_beat = hh(80); let hh_eighth = hh(65);
+                let hh55 = hh(55); let hh45 = hh(45); let hh40 = hh(10);
+                let hh60 = hh(60); let hh65 = hh(65);
+                let kk = |b:u8| sc(dv, b); let sn = |b:u8| sc(dv, b);
+                
                 match cfg.pattern.as_str() {
                     "reggae" => {
-                        if bar_beat == 2 { e(&mut evs, on_tick, &[0x99, KICK, kk]); e(&mut evs, on_tick, &[0x99, RIM, sc(dv, 90)]); }
-                        e(&mut evs, on_tick, &[0x99, HH, hh]);
+                        match bar_beat { // on-beat only
+                            0|1|3 => { e(&mut evs, on_tick, &[0x99, HH, hh60]); }
+                            2 => { e(&mut evs, on_tick, &[0x99, KICK, kk(120)]); e(&mut evs, on_tick, &[0x99, HH, hh65]); e(&mut evs, on_tick, &[0x99, RIM, kk(90)]); }
+                            _ => {}
+                        }
+                        e(&mut evs, up_tick, &[0x99, HH, hh40]);
                     }
                     "jazz" => {
-                        e(&mut evs, on_tick, &[0x99, 51, hh]); // ride
-                        if bar_beat == 4 { e(&mut evs, on_tick, &[0x99, 44, sc(dv, 40)]); } // pedal HH
-                        if bar_beat == 7 { e(&mut evs, on_tick, &[0x99, RIM, sc(dv, 50)]); }
+                        let bb2 = bar_beat % 8; // 2 mesures
+                        match bb2 {
+                            0|2|6 => { e(&mut evs, on_tick, &[0x99, 51, hh60]); }
+                            4 => { e(&mut evs, on_tick, &[0x99, 51, hh60]); e(&mut evs, on_tick, &[0x99, 44, hh(40)]); }
+                            7 => { e(&mut evs, on_tick, &[0x99, 51, hh60]); e(&mut evs, on_tick, &[0x99, 44, hh(40)]); e(&mut evs, on_tick, &[0x99, RIM, hh(50)]); }
+                            _ => {}
+                        }
+                        e(&mut evs, up_tick, &[0x99, HH, 35]);
                     }
                     "pop" => {
                         match bar_beat % 4 {
-                            0 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 85)]); e(&mut evs, on_tick, &[0x99, HH, sc(dv, 50)]); }
-                            1 => { e(&mut evs, on_tick, &[0x99, SNARE, sc(dv, 70)]); e(&mut evs, on_tick, &[0x99, HH, sc(dv, 50)]); }
-                            2 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 75)]); }
-                            3 => { e(&mut evs, on_tick, &[0x99, SNARE, sc(dv, 65)]); e(&mut evs, on_tick, &[0x99, HH, sc(dv, 50)]); }
+                            0 => { e(&mut evs, on_tick, &[0x99, KICK, kk(85)]); e(&mut evs, on_tick, &[0x99, HH, hh(50)]); }
+                            1 => { e(&mut evs, on_tick, &[0x99, SNARE, sn(70)]); e(&mut evs, on_tick, &[0x99, HH, hh(50)]); }
+                            2 => { e(&mut evs, on_tick, &[0x99, KICK, kk(75)]); }
+                            3 => { e(&mut evs, on_tick, &[0x99, SNARE, sn(65)]); e(&mut evs, on_tick, &[0x99, HH, hh(50)]); }
                             _ => {}
                         }
+                        e(&mut evs, up_tick, &[0x99, HH, hh(45)]);
                     }
                     "bossa" => {
                         match bar_beat % 4 {
-                            0 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 55)]); }
-                            1 => { e(&mut evs, on_tick, &[0x99, SNARE, sc(dv, 30)]); }
-                            2 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 60)]); }
-                            3 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 50)]); }
+                            0 => { e(&mut evs, on_tick, &[0x99, KICK, kk(55)]); e(&mut evs, on_tick, &[0x99, HH, hh45]); }
+                            1 => { e(&mut evs, on_tick, &[0x99, SNARE, sn(30)]); e(&mut evs, on_tick, &[0x99, HH, hh45]); }
+                            2 => { e(&mut evs, on_tick, &[0x99, KICK, kk(60)]); e(&mut evs, on_tick, &[0x99, HH, hh45]); }
+                            3 => { e(&mut evs, on_tick, &[0x99, KICK, kk(50)]); e(&mut evs, on_tick, &[0x99, HH, hh45]); }
                             _ => {}
                         }
-                        e(&mut evs, on_tick, &[0x99, HH, sc(dv, 45)]);
+                        e(&mut evs, up_tick, &[0x99, HH, hh40]);
                     }
                     "onedrop" => {
                         match bar_beat % 4 {
-                            0 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 90)]); }
-                            2 => { e(&mut evs, on_tick, &[0x99, KICK, sc(dv, 90)]); e(&mut evs, on_tick, &[0x99, RIM, sc(dv, 65)]); }
+                            0 => { e(&mut evs, on_tick, &[0x99, KICK, kk(90)]); e(&mut evs, on_tick, &[0x99, HH, hh55]); }
+                            1 => { e(&mut evs, on_tick, &[0x99, HH, hh40]); }
+                            2 => { e(&mut evs, on_tick, &[0x99, KICK, kk(90)]); e(&mut evs, on_tick, &[0x99, RIM, sn(65)]); e(&mut evs, on_tick, &[0x99, HH, hh45]); }
+                            3 => { e(&mut evs, on_tick, &[0x99, HH, hh55]); }
                             _ => {}
                         }
-                        e(&mut evs, on_tick, &[0x99, HH, sc(dv, 55)]);
+                        e(&mut evs, up_tick, &[0x99, HH, hh40]);
                     }
-                    _ => { // rock par défaut
+                    _ => { // rock (default) — HH sur chaque temps, rimshot seulement si specifique
                         match bar_beat % 4 {
-                            0 => { e(&mut evs, on_tick, &[0x99, KICK, kk]); e(&mut evs, on_tick, &[0x99, HH, hh]); }
-                            1 => { e(&mut evs, on_tick, &[0x99, SNARE, sn]); e(&mut evs, on_tick, &[0x99, HH, hh]); }
-                            2 => { e(&mut evs, on_tick, &[0x99, KICK, kk]); }
-                            3 => { e(&mut evs, on_tick, &[0x99, SNARE, sn]); e(&mut evs, on_tick, &[0x99, HH, hh]); e(&mut evs, on_tick, &[0x99, RIM, rm]); }
+                            0 => { e(&mut evs, on_tick, &[0x99, KICK, kk(90)]); e(&mut evs, on_tick, &[0x99, HH, hh_beat]); }
+                            1 => { e(&mut evs, on_tick, &[0x99, SNARE, sn(75)]); e(&mut evs, on_tick, &[0x99, HH, hh_beat]); }
+                            2 => { e(&mut evs, on_tick, &[0x99, KICK, kk(80)]); e(&mut evs, on_tick, &[0x99, HH, hh_beat]); }
+                            3 => { e(&mut evs, on_tick, &[0x99, SNARE, sn(70)]); e(&mut evs, on_tick, &[0x99, HH, hh_beat]); }
                             _ => {}
                         }
+                        e(&mut evs, up_tick, &[0x99, HH, hh_eighth]);
                     }
-                }
-                // Upbeat HH (pas pour bossa et jazz qui ont leur propre hi-hat)
-                if !matches!(cfg.pattern.as_str(), "bossa" | "jazz") {
-                    e(&mut evs, up_tick, &[0x99, HH, hh_up]);
                 }
             }
 
