@@ -268,7 +268,9 @@ pub fn generate_smf_fmt0(
         }
 
         // Nappes (strings) — notes tenues sur toute la durée de l'accord
-        if !str_mute {
+        // En reggae, les nappes ne jouent que sur les accords courts.
+        let reggae_skip_nappe = cfg.pattern == "reggae" && bc > 1.0;
+        if !str_mute && !reggae_skip_nappe {
             let sv = sc(str_vol, 127);
             for &n in chord {
                 e(&mut evs, chord_start, &[0x90 | CH_STR, n, sv]);

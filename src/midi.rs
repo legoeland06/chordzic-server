@@ -591,7 +591,12 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
             }
 
             // ── Jouer les nappes ──────────────────────────────
-            if !t_str.mute.load(Ordering::Relaxed) {
+            // En reggae, les nappes ne jouent que sur les accords
+            // courts (4:, 8:, 16:) — pas de tenue sur les longs.
+            let pat = lc.pattern.load(Ordering::Relaxed);
+            let short_chord = e.beats <= 1.0;
+            let skip_nappe = pat == PAT_REGGAE && !short_chord;
+            if !t_str.mute.load(Ordering::Relaxed) && !skip_nappe {
                 // Couper les nappes précédentes (Note Off = vélocité 0)
                 for n in &prev_nappe { no(c, ch_str, *n, 0); }
                 let str_vol = sc(t_str.volume.load(Ordering::Relaxed), mv);
