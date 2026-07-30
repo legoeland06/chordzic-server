@@ -434,7 +434,7 @@ pub fn generate_smf_fmt0(
                     e(&mut evs, on_tick, &[0x90 | CH_ACC, n, av]);
                     // Note Off quasi immédiat (1 tick plus tard) pour un effet
                     // percussif, pas de note tenue
-                    e(&mut evs, on_tick + 1, &[0x80 | CH_ACC, n, 64]);
+                    e(&mut evs, on_tick + 30, &[0x80 | CH_ACC, n, 64]); // Off 1/16ème plus tard
                 }
             }
         }
