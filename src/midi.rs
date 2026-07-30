@@ -667,7 +667,9 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 }
 
                 // ── Accent (temps 2&4) ─────────────────
-                if !m.is_empty() {
+                // Seulement pour les accords de plus d'1 temps (pas sur
+                // les 4:, 8:, 16: qui sont trop courts pour un backbeat).
+                if !m.is_empty() && e.beats > 1.0 {
                     let accent_mute = t_accent.mute.load(Ordering::Relaxed);
                     // Note Off (à idx=5)
                     if idx % 8 == 5 && !prev_accent.is_empty() {
