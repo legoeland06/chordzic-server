@@ -131,7 +131,8 @@ pub fn notes_from_vec(notes: &[String]) -> Vec<u8> {
 /// Initialise la connexion MIDI de sortie.
 ///
 /// Lis la variable d'environnement `MIDI_PORT` pour choisir le port.
-/// Par défaut : port 2 (FluidSynth via ALSA).
+/// Sur Linux : défaut port 2 (FluidSynth via ALSA).
+/// Sur macOS  : auto-détection de FluidSynth dans CoreMIDI.
 /// Affiche la liste des ports disponibles au démarrage.
 ///
 /// Retourne `None` si aucun port n'est disponible.
@@ -146,17 +147,48 @@ pub fn init_midi() -> Option<MidiHandle> {
     for (i, x) in p.iter().enumerate() {
         if let Ok(n) = mo.port_name(x) { println!("  [{}] {}", i, n) }
     }
-    // Sélection du port : variable d'env MIDI_PORT, défaut 2
+
+    // Sélection du port
     let i: usize = if let Ok(e) = std::env::var("MIDI_PORT") {
+        // MIDI_PORT défini explicitement → utiliser cet index
         e.parse().unwrap_or(2)
     } else {
-        2
+        // Pas de MIDI_PORT → auto-détection intelligente
+        // Chercher un port FluidSynth ou Roland par nom
+        let names: Vec<String> = p.iter().filter_map(|x| mo.port_name(x).ok()).collect();
+
+        // Priorité : FluidSynth (nommé "FLUID" ou "FluidSynth" ou "fluid")
+        if let Some((idx, _)) = names.iter().enumerate().find(|(_, n)| {
+            n.to_lowercase().contains("fluid")
+        }) {
+            println!("   → Auto-détection : port FluidSynth [{}] {}", idx, names[idx]);
+            idx
+        }
+        // Priorité 2 : Roland Digital Piano
+        else if let Some((idx, _)) = names.iter().enumerate().find(|(_, n)| {
+            n.to_lowercase().contains("roland")
+        }) {
+            println!("   → Auto-détection : port Roland [{}] {}", idx, names[idx]);
+            idx
+        }
+        // Priorité 3 : premier port qui n'est pas "Midi Through" ou "System"
+        else if let Some((idx, _)) = names.iter().enumerate().find(|(_, n)| {
+            !n.contains("Midi Through") && !n.contains("System")
+        }) {
+            println!("   → Auto-sélection : [{}] {}", idx, names[idx]);
+            idx
+        }
+        // Fallback : port 2 (comportement Linux historique)
+        else {
+            2
+        }
     };
+
     if i >= p.len() {
-        eprintln!("Port MIDI {} invalide", i);
+        eprintln!("Port MIDI {} invalide ({} ports disponibles)", i, p.len());
         return None;
     }
-    println!("Connecté à {}", mo.port_name(&p[i]).unwrap_or_default());
+    println!("✅ Connecté à MIDI : {}", mo.port_name(&p[i]).unwrap_or_default());
     mo.connect(&p[i], "chords-server-rs").ok().map(|c| Arc::new(Mutex::new(c)))
 }
 
@@ -481,8 +513,9 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
             for n in &e.notes { if let Ok(x) = note_midi(n) { m.push(x) } }
 
             // ── Cas vide : accord de silence ──────────────────
-            // Pas de notes (ex: accord "4:_") → seulement les drums
-            // continuent pendant la durée de cet emplacement.
+            // Pas de notes (ex: "4:_") → vrai silence : RIEN ne joue
+            // (ni accords, ni nappes, ni drums), mais le timing avance
+            // correctement pour que la musique ne soit pas saccadée.
             if m.is_empty() {
                 if i > 0 {
                     rch(c);           // Couper les notes qui trainent
@@ -490,40 +523,17 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 }
                 let dur = (60_000.0 / lc.tempo.load(Ordering::Relaxed).max(20) as f64 * e.beats) as u64;
                 let start = std::time::Instant::now();
-                let mut idx = 0u64;
-                let mut last_b_drums = u64::MAX;
                 let dur_f = dur as f64;
 
-                // Boucle de silence : seulement les drums jouent
+                // Boucle de silence : attendre sans rien jouer
                 while start.elapsed().as_secs_f64() * 1000.0 < dur_f && !lc.stop.load(Ordering::Relaxed) {
-                    let tempo_f = lc.tempo.load(Ordering::Relaxed).max(20) as f64;
-                    let bd_ms = 60_000.0 / tempo_f;            // Durée d'un temps en ms
-                    let delay_ms = (bd_ms / 4.0).max(30.0);     // Pas = 1/4 de temps (min 30ms)
-                    let target = start + Duration::from_secs_f64(idx as f64 * delay_ms / 1000.0);
-                    let now = std::time::Instant::now();
-                    if target > now { std::thread::sleep(target - now); }
-
-                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let pt = lc.pattern.load(Ordering::Relaxed);
-                    let sig = lc.sig.load(Ordering::Relaxed);
-                    let bars = (sig / 10).max(1) as u64;         // Temps par mesure
-                    let beat = (elapsed_ms / bd_ms) as u64;
-
-                    // Drums — on_beat (changement de temps)
-                    if !t_drums.mute.load(Ordering::Relaxed) {
-                        if last_b_drums == u64::MAX || beat > last_b_drums {
-                            let dvol = sc(t_drums.volume.load(Ordering::Relaxed), mv);
-                            drum_hit(c, beat, pt, true, false, bars, dvol, 127);
-                            last_b_drums = beat;
-                        }
-                        // Drums — on_eighth (contretemps, milieu du temps)
-                        let beat_pos = elapsed_ms % bd_ms;
-                        if beat_pos > bd_ms / 2.0 - 10.0 && beat_pos < bd_ms / 2.0 + 10.0 {
-                            let dvol = sc(t_drums.volume.load(Ordering::Relaxed), mv);
-                            drum_hit(c, beat, pt, false, true, bars, dvol, 127);
-                        }
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    let remaining = dur_f - elapsed;
+                    if remaining > 10.0 {
+                        std::thread::sleep(Duration::from_millis(
+                            (remaining.min(50.0).max(5.0)) as u64
+                        ));
                     }
-                    idx += 1;
                 }
                 if lc.stop.load(Ordering::Relaxed) { break 'outer; }
                 continue;

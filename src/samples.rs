@@ -13,7 +13,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-const DRUM_DIR: &str = "/home/legoeland/samples/drums";
+/// Répertoire des boucles WAV drums.
+/// Utilise `SAMPLES_DIR` (variable d'env) ou `~/samples/drums/`.
+pub fn drum_dir() -> String {
+    if let Ok(dir) = std::env::var("SAMPLES_DIR") {
+        if !dir.is_empty() {
+            return dir;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/samples/drums", home)
+}
 
 static BANK: OnceLock<Mutex<LoopPlayer>> = OnceLock::new();
 
@@ -38,9 +48,10 @@ impl LoopPlayer {
         let mut loops: HashMap<u16, HashMap<String, Vec<f32>>> = HashMap::new();
         let mut sample_rate = 44100u32;
 
-        let dir = Path::new(DRUM_DIR);
+        let d = drum_dir();
+        let dir = Path::new(&d);
         if !dir.exists() {
-            println!("   📁 {} n'existe pas, création", DRUM_DIR);
+            println!("   📁 {} n'existe pas, création", d);
             let _ = std::fs::create_dir_all(dir);
         }
 
@@ -101,7 +112,7 @@ impl LoopPlayer {
         }
 
         if count == 0 {
-            println!("   ℹ️  Aucun loop trouvé dans {}", DRUM_DIR);
+            println!("   ℹ️  Aucun loop trouvé dans {}", drum_dir());
         } else {
             println!("   {} loops chargés", count);
         }

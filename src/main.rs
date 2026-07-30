@@ -44,6 +44,152 @@ use midi::{
     MidiHandle, TrackCfg as MidiTrackCfg, TRACK_BASS, TRACK_DRUMS, TRACK_LEAD, TRACK_STR,
 };
 
+// ─── Frontend embarqué (mode standalone) ────────────────────────────────
+// Quand on compile avec --features standalone, le frontend React/Vite est
+// compilé et embarqué directement dans le binaire Rust via rust-embed.
+// Ainsi, un seul fichier exécutable suffit : pas de serveur Vite séparé.
+#[cfg(feature = "standalone")]
+mod frontend_embed {
+    use axum::{
+        body::Body,
+        extract::Request,
+        http::{header, StatusCode},
+        response::Response,
+    };
+    use rust_embed::RustEmbed;
+
+    #[derive(RustEmbed)]
+    #[folder = "frontend_dist/"]
+    struct FrontendAssets;
+
+    /// Sert les fichiers du frontend embarqué.
+    ///
+    /// Gère :
+    /// - Fichiers statiques (JS, CSS, images) → servis avec leur vrai Content-Type
+    /// - SPA fallback : toute route inconnue → index.html (pour le routing React)
+    pub async fn serve(req: Request<Body>) -> Response<Body> {
+        let path = req.uri().path().trim_start_matches('/');
+
+        // Si le fichier existe dans l'embed, le servir directement
+        if let Some(content) = FrontendAssets::get(path) {
+            return serve_embedded(path, content);
+        }
+
+        // SPA fallback : servir index.html pour les routes React
+        // (ne pas capturer les routes API)
+        if !path.starts_with("api/") {
+            if let Some(content) = FrontendAssets::get("index.html") {
+                return serve_embedded("index.html", content);
+            }
+        }
+
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn serve_embedded(path: &str, file: rust_embed::EmbeddedFile) -> Response<Body> {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        Response::builder()
+            .header(header::CONTENT_TYPE, mime.as_ref())
+            .body(Body::from(file.data))
+            .unwrap()
+    }
+}
+
+// ─── SoundFont auto-détection ──────────────────────────────────────────
+
+/// Chemins possibles pour la SoundFont MuseScore General Full.
+/// Cherche d'abord sur Linux (chemin Debian/Ubuntu), puis macOS (Homebrew
+/// Intel et Apple Silicon), puis Homebrew standard, puis les alternatives.
+static SF_CANDIDATES: &[&str] = &[
+    // Linux (Debian/Ubuntu)
+    "/usr/share/sounds/sf3/MuseScore_General_Full.sf3",
+    "/usr/share/sounds/sf2/MuseScore_General_Full.sf2",
+    // macOS Intel Homebrew
+    "/usr/local/share/sounds/sf3/MuseScore_General_Full.sf3",
+    "/usr/local/share/sounds/sf2/MuseScore_General_Full.sf2",
+    // macOS Apple Silicon Homebrew
+    "/opt/homebrew/share/sounds/sf3/MuseScore_General_Full.sf3",
+    "/opt/homebrew/share/sounds/sf2/MuseScore_General_Full.sf2",
+    // macOS Homebrew (nouveau prefix)
+    "/opt/homebrew/opt/fluid-synth/share/sounds/sf3/MuseScore_General_Full.sf3",
+    // Fallback : répertoire local dans le même dossier que l'exécutable
+    "./MuseScore_General_Full.sf3",
+    "./soundfonts/MuseScore_General_Full.sf3",
+    // macOS : dans le HOME de l'utilisateur
+    "~/MuseScore_General_Full.sf3",
+    "~/soundfonts/MuseScore_General_Full.sf3",
+    // macOS : Library Audio/Sounds
+    "~/Library/Audio/Sounds/MuseScore_General_Full.sf3",
+];
+
+/// Trouve le chemin de la SoundFont MuseScore General Full.
+///
+/// Parcours les candidats dans l'ordre, retourne le premier trouvé.
+/// Si rien n'est trouvé, retourne None (le render WAV échouera,
+/// mais le live MIDI fonctionnera si FluidSynth tourne déjà).
+fn find_soundfont() -> Option<String> {
+    for &candidate in SF_CANDIDATES {
+        // Expand ~ si présent
+        let path = if candidate.starts_with("~/") {
+            let home = std::env::var("HOME").unwrap_or_default();
+            if home.is_empty() {
+                candidate.to_string()
+            } else {
+                candidate.replacen("~", &home, 1)
+            }
+        } else {
+            candidate.to_string()
+        };
+
+        if std::path::Path::new(&path).exists() {
+            println!("   🎹 SoundFont trouvée : {}", path);
+            return Some(path);
+        }
+    }
+
+    // Essayer de trouver avec `brew --prefix fluidsynth` sur macOS
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("brew")
+            .args(["--prefix", "fluid-synth"])
+            .output()
+        {
+            if output.status.success() {
+                let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                for ext in &["sf3", "sf2"] {
+                    let path = format!("{}/share/sounds/{}/MuseScore_General_Full.{}", prefix, ext, ext);
+                    if std::path::Path::new(&path).exists() {
+                        println!("   🎹 SoundFont trouvée via brew : {}", path);
+                        return Some(path);
+                    }
+                }
+                // Chercher dans le dossier sounds du prefix
+                let sf_dir = format!("{}/share/sounds", prefix);
+                if let Ok(entries) = std::fs::read_dir(&sf_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                            if name.contains("MuseScore") || name.contains("General") {
+                                if p.extension().map_or(false, |e| e == "sf3" || e == "sf2") {
+                                    println!("   🎹 SoundFont trouvée : {}", p.display());
+                                    return Some(p.to_string_lossy().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("   ⚠️  SoundFont non trouvée. Le rendu WAV ne fonctionnera pas.");
+    eprintln!("      Télécharge-la sur : https://musescore.org/fr/telechargement");
+    None
+}
+
 // ─── État global ────────────────────────────────────────────────────────
 
 /// État partagé du serveur, injecté dans chaque route via Axum State.
@@ -51,6 +197,7 @@ use midi::{
 struct AppState {
     midi: Option<MidiHandle>,   // Connexion MIDI vers FluidSynth (None si pas de port)
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
+    soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
 }
 
 // ─── Signature ──────────────────────────────────────────────────────────
@@ -163,7 +310,11 @@ fn notes_from_ev(e: &ChordEv) -> Vec<u8> {
 
 // ─── Routes ────────────────────────────────────────────────────────────
 
-/// GET / — Page d'accueil (inclut le HTML statique embed).
+/// GET / — Page d'accueil.
+///
+/// En mode standalone (frontend embarqué), cette route n'est pas utilisée
+/// car tout le routage frontend est géré par `frontend_embed::serve`.
+/// En mode dev, elle sert le vieil index.html statique.
 async fn idx() -> impl IntoResponse {
     Html(include_str!("../static/index.html"))
 }
@@ -179,8 +330,6 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
     let lv = &s.live;
 
     // ── Config ──────────────────────────────────────────────────
-    // Modifie l'état live AVANT de lancer le thread pour éviter
-    // les conditions de course.
     if b.tempo > 0 {
         lv.tempo.store(b.tempo as u16, std::sync::atomic::Ordering::Relaxed);
     }
@@ -234,7 +383,6 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
 
         // Séquence d'accords ou notes immédiates ?
         if !ev.is_empty() {
-            // Thread séparé pour la séquence : ne pas bloquer la réponse HTTP
             let sq = ev.to_vec();
             let l = Arc::clone(lv);
             std::thread::spawn(move || {
@@ -243,7 +391,6 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
                 }
             });
         } else if let Some(ref n) = b.notes {
-            // Notes immédiates (pas de séquence) — utile pour les tests
             let v = n.clone();
             let l2 = Arc::clone(lv);
             std::thread::spawn(move || {
@@ -261,19 +408,13 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
 }
 
 /// POST /config — Modifie la configuration en temps réel.
-///
-/// Contrairement à `/play`, cette route ne lance pas de nouvelle séquence.
-/// Elle met à jour l'état live atomiquement pendant que le thread audio
-/// continue de jouer.
 async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoResponse {
     let lv = &s.live;
 
-    // Mise à jour des pistes (si fournie)
     if let Some(ref t) = b.tracks {
         apply_tracks(lv, t);
     }
 
-    // Mise à jour des flags individuels (chaque Option est testée)
     if let Some(v) = b.drums {
         lv.tracks[TRACK_DRUMS].mute.store(!v, std::sync::atomic::Ordering::Relaxed);
     }
@@ -307,13 +448,10 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
         lv.master_vol.store(m, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Accordage 432Hz — envoie un pitch bend sur tous les canaux musicaux
+    // Accordage 432Hz
     if let Some(u) = b.use432 {
         let was = lv.use432.swap(u, std::sync::atomic::Ordering::Relaxed);
         if was != u {
-            // Appliquer le pitch bend immédiatement sur les canaux 0,2,3,4
-            // Valeur 6881 = pitch down de ~32 centièmes (pour passer de 440 à 432 Hz)
-            // 8192 = pas de bend (440 Hz)
             if let Some(ref h) = s.midi {
                 if let Ok(mut c) = h.lock() {
                     for &ch in &[0u8, 2, 3, 4] {
@@ -347,11 +485,6 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
 }
 
 /// POST /stop — Arrête la lecture live.
-///
-/// 1. Positionne le flag `stop` à true (le thread audio le détecte au
-///    prochain beat et sort de la boucle).
-/// 2. Arrête la boucle WAV drums.
-/// 3. Envoie All Notes Off (CC 123) sur tous les canaux.
 async fn stop(State(s): State<AppState>) -> impl IntoResponse {
     s.live.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     samples::stop_loop();
@@ -364,18 +497,12 @@ async fn stop(State(s): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /render-wav — Rendu batch d'une séquence en WAV.
-///
-/// Contrairement à `/play` (live MIDI temps réel), cette route :
-/// - Génère un fichier SMF Format 0 complet en mémoire
-/// - Appelle FluidSynth pour le convertir en WAV
-/// - Retourne le fichier WAV directement dans la réponse HTTP
-///
-/// C'est une opération synchrone : la réponse contient le fichier WAV
-/// complet, prêt à être téléchargé par le navigateur.
-async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
+async fn render_wav(
+    State(s): State<AppState>,
+    Json(b): Json<PlayReq>,
+) -> impl IntoResponse {
     use axum::http::HeaderMap;
 
-    // Extraire la séquence
     let ev: &[ChordEv] = if !b.seq.is_empty() {
         &b.seq
     } else if !b.sequence.is_empty() {
@@ -388,7 +515,6 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
         return (StatusCode::BAD_REQUEST, "Séquence vide — rien à rendre").into_response();
     }
 
-    // Convertir les ChordEv en tableaux de notes MIDI + durées
     let mut notes_arrays: Vec<Vec<u8>> = Vec::new();
     let mut beats: Vec<f64> = Vec::new();
     for e in ev {
@@ -396,8 +522,6 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
         beats.push(e.beats);
     }
 
-    // Configuration des tracks pour le render
-    // (valeurs par défaut, surchargées par `tracks` si fourni)
     let mut tracks_cfg: [render::TrackCfg; 5] = [
         render::TrackCfg { channel: 0, program: b.inst_val, volume: 15, mute: !b.arps },
         render::TrackCfg { channel: 2, program: 33, volume: 40, mute: !b.bass },
@@ -406,7 +530,6 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
         render::TrackCfg { channel: 4, program: 2, volume: 20, mute: false },
     ];
 
-    // Fusion avec la configuration des pistes envoyée par le frontend
     if let Some(ref tcfg) = b.tracks {
         for tc in tcfg {
             if let Some(t) = tracks_cfg.iter_mut().find(|t| t.channel == tc.channel) {
@@ -417,7 +540,6 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
         }
     }
 
-    // Créer la configuration de rendu
     let rcfg = render::RenderCfg {
         tempo: b.tempo,
         pattern: b.pattern.clone(),
@@ -427,20 +549,18 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
         tracks: tracks_cfg,
     };
 
-    // Générer le SMF
     let smf = render::generate_smf_fmt0(&notes_arrays, &beats, &rcfg);
 
-    // Chemin de la SoundFont (MuseScore General)
-    let sf_path = "/usr/share/sounds/sf3/MuseScore_General_Full.sf3";
+    // Utiliser la SoundFont détectée automatiquement
+    let sf_path = s.soundfont.as_deref().unwrap_or(
+        "/usr/share/sounds/sf3/MuseScore_General_Full.sf3"
+    );
 
-    // Durée totale en secondes (pour le trim)
     let total_beats: f64 = beats.iter().sum();
     let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
 
-    // Lancer le rendu FluidSynth
     match render::render_wav(&smf, sf_path, duration_sec) {
         Ok(wav) => {
-            // Retourner le WAV avec le bon Content-Type
             let mut headers = HeaderMap::new();
             headers.insert(
                 "Content-Type",
@@ -456,45 +576,40 @@ async fn render_wav(Json(b): Json<PlayReq>) -> impl IntoResponse {
 
 // ─── Main ───────────────────────────────────────────────────────────────
 
-/// Point d'entrée du serveur.
-///
-/// Initialisation :
-/// 1. Connexion MIDI (vers FluidSynth ou Roland)
-/// 2. Scan des boucles WAV drums
-/// 3. Création de l'état global AppState
-/// 4. Configuration des routes
-/// 5. Démarrage du serveur HTTP sur le port 4000 (ou variable PORT)
 #[tokio::main]
 async fn main() {
     println!("🚀 chordZIC backend — serveur de séquencement MIDI");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Initialisation
-    let midi = init_midi();            // Connexion MIDI (peut être None)
-    samples::init();                   // Scan des boucles WAV drums
+    // Détection automatique de la SoundFont
+    let soundfont = find_soundfont();
+
+    // Initialisation MIDI
+    let midi = init_midi();
+    samples::init();
 
     use patterns::PAT_ROCK;
     use std::sync::atomic::{AtomicI32, AtomicU16, AtomicU8};
     use std::sync::Mutex;
 
-    // Création de l'état global (5 pistes MIDI)
     let state = AppState {
         midi,
+        soundfont,
         live: Arc::new(Live {
             tracks: [
-                LiveTrack::new(0, 51, 15),   // Lead : Synth Strings 1 (canal 0)
-                LiveTrack::new(2, 33, 40),   // Bass : Electric Bass (finger) (canal 2)
-                LiveTrack::new(3, 48, 30),   // Strings : String Ensemble 1 (canal 3)
-                LiveTrack::new(9, 1, 80),    // Drums : Standard Kit (canal 9)
-                LiveTrack::new(4, 2, 20),    // Accent : Bright Acoustic Piano (canal 4)
+                LiveTrack::new(0, 51, 15),
+                LiveTrack::new(2, 33, 40),
+                LiveTrack::new(3, 48, 30),
+                LiveTrack::new(9, 1, 80),
+                LiveTrack::new(4, 2, 20),
             ],
             pattern: AtomicU8::new(PAT_ROCK),
             tempo: AtomicU16::new(120),
             stop: AtomicBool::new(false),
-            sig: AtomicU16::new(44),          // 4/4
+            sig: AtomicU16::new(44),
             walking: AtomicBool::new(false),
-            master_vol: AtomicU8::new(127),   // Master volume max
-            use432: AtomicBool::new(false),   // 440Hz par défaut
+            master_vol: AtomicU8::new(127),
+            use432: AtomicBool::new(false),
             loop_offset: AtomicI32::new(0),
             use_loops: AtomicBool::new(false),
             loop_name: Mutex::new(String::new()),
@@ -502,30 +617,46 @@ async fn main() {
         }),
     };
 
-    /// GET /samples-list — Liste les boucles WAV disponibles.
     async fn samples_list() -> impl IntoResponse {
         let data = samples::get_available();
         (StatusCode::OK, axum::Json(data))
     }
 
-    // Configuration des routes HTTP et démarrage
-    let app = Router::new()
-        .route("/", get(idx))
+    let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
+
+    // ── Construction du routeur ───────────────────────────────────
+    // En mode standalone, les routes du frontend sont servies par
+    // `frontend_embed::serve`.  En mode dev, la route GET / sert
+    // l'index.html statique (le frontend est servi par Vite sur :5176).
+    let mut app = Router::new()
         .route("/play", post(play))
         .route("/config", post(conf))
         .route("/stop", post(stop))
         .route("/render-wav", post(render_wav))
         .route("/samples-list", get(samples_list))
-        .layer(CorsLayer::permissive()) // Permet les requêtes cross-origin (dev frontend)
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
+    #[cfg(feature = "standalone")]
+    {
+        // Mode standalone : le frontend embarqué gère toutes les routes
+        // non-API (SPA routing + fichiers statiques)
+        app = app.fallback(frontend_embed::serve);
+        println!("\n   🎯 Mode standalone — frontend embarqué dans le binaire");
+    }
+
+    #[cfg(not(feature = "standalone"))]
+    {
+        // Mode dev : servir l'ancien index.html statique sur /
+        app = app.route("/", get(idx));
+    }
+
     println!(
         "\n📡 Serveur prêt sur http://0.0.0.0:{}",
         port
     );
     println!("   Routes :");
-    println!("     GET  /              → page d'accueil");
+    println!("     GET  /              → page d'accueil (frontend React)");  
     println!("     POST /play          → lancer la séquence live");
     println!("     POST /config        → modifier la config live");
     println!("     POST /stop          → arrêter la lecture");
