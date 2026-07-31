@@ -667,8 +667,9 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8
     // Étape 5 : tronquer à la durée exacte puis normaliser au pic
     let trimmed = trim_to_duration(&wav, duration_sec);
     let normalized = normalize_wav(&trimmed, master_vol);
-    // Étape 6 : fade-out court pour une boucle sans clic
-    Ok(fade_out_wav(&normalized, 80))
+    // Étape 6 : micro fade-out (30 ms) — anti-clic à l'arrêt ; la boucle
+    // est rendue seamless par le crossfade côté navigateur.
+    Ok(fade_out_wav(&normalized, 30))
 }
 
 // ─── Custom notes (PianoRoll) ──────────────────────────────────────────
