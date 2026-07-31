@@ -229,6 +229,18 @@ fn sig_code(s: &str) -> u16 {
 ///
 /// Tous les champs ont des valeurs par défaut via serde, ce qui permet
 /// d'envoyer des requêtes minimales (ex: juste la séquence).
+
+/// Note personnalisée issue du PianoRoll frontend.
+/// Utilisée pour remplacer les notes automatiques lors du rendu WAV.
+#[derive(Clone, Debug, Deserialize)]
+struct CustomNote {
+    channel: u8,        // Canal MIDI (0=Lead, 2=Bass, 3=Nappes, 4=Accent, 9=Drums)
+    start_time: f64,    // Position en beats
+    pitch: u8,          // Note MIDI (0-127)
+    duration: f64,      // Durée en beats
+    velocity: u8,       // Vélocité (0-127)
+}
+
 #[derive(Deserialize)]
 struct PlayReq {
     notes: Option<Vec<String>>,     // Notes à jouer immédiatement (pas de séquence)
@@ -255,6 +267,8 @@ struct PlayReq {
     loop_enabled: Option<bool>,      // Boucle activée ?
     tracks: Option<Vec<MidiTrackCfg>>, // Configuration des pistes
     walking: Option<bool>,           // Walking bass ?
+    #[serde(default)]
+    custom_notes: Vec<CustomNote>,    // Notes personnalisées du PianoRoll (optionnel)
 }
 
 /// Réponse standardisée du serveur.
@@ -511,7 +525,7 @@ async fn render_wav(
         &[]
     };
 
-    if ev.is_empty() {
+    if ev.is_empty() && b.custom_notes.is_empty() {
         return (StatusCode::BAD_REQUEST, "Séquence vide — rien à rendre").into_response();
     }
 
@@ -549,14 +563,41 @@ async fn render_wav(
         tracks: tracks_cfg,
     };
 
-    let smf = render::generate_smf_fmt0(&notes_arrays, &beats, &rcfg);
+    // ── Choix du mode de rendu ─────────────────────────────
+    // Si des notes personnalisées (PianoRoll) sont fournies, on les
+    // utilise directement. Sinon, rendu classique par accord.
+    let smf = if !b.custom_notes.is_empty() {
+        let custom: Vec<render::CustomNote> = b.custom_notes.iter().map(|cn| {
+            render::CustomNote {
+                channel: cn.channel,
+                start_time: cn.start_time,
+                pitch: cn.pitch,
+                duration: cn.duration,
+                velocity: cn.velocity,
+            }
+        }).collect();
+
+        // Utiliser les tracks configurées (ou défaut)
+        let tracks: Vec<render::TrackCfg> = tracks_cfg.to_vec();
+
+        render::generate_smf_from_custom(&custom, &tracks, b.tempo as u16)
+    } else {
+        render::generate_smf_fmt0(&notes_arrays, &beats, &rcfg)
+    };
 
     // Utiliser la SoundFont détectée automatiquement
     let sf_path = s.soundfont.as_deref().unwrap_or(
         "/usr/share/sounds/sf3/MuseScore_General_Full.sf3"
     );
 
-    let total_beats: f64 = beats.iter().sum();
+    // Durée totale en secondes
+    let total_beats: f64 = if !b.custom_notes.is_empty() {
+        b.custom_notes.iter()
+            .map(|n| n.start_time + n.duration)
+            .fold(0.0, f64::max)
+    } else {
+        beats.iter().sum()
+    };
     let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
 
     match render::render_wav(&smf, sf_path, duration_sec) {

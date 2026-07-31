@@ -574,3 +574,85 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64) -> Result<Vec<
     // Étape 5 : tronquer à la durée exacte
     Ok(trim_to_duration(&wav, duration_sec))
 }
+
+// ─── Custom notes (PianoRoll) ──────────────────────────────────────────
+
+/// Données d'une note personnalisée (provenant du PianoRoll frontend).
+pub struct CustomNote {
+    pub channel: u8,
+    pub start_time: f64,
+    pub pitch: u8,
+    pub duration: f64,
+    pub velocity: u8,
+}
+
+/// Génère un SMF à partir de notes personnalisées (PianoRoll).
+/// Remplace la génération automatique par accord.
+pub fn generate_smf_from_custom(
+    notes: &[CustomNote],
+    tracks: &[TrackCfg],
+    tempo: u16,
+) -> Vec<u8> {
+    let tpb = TICKS_PER_BEAT;
+    let tempo_us = (60_000_000u64 / tempo.max(1) as u64) as u32;
+    let mut evs: Vec<Ev> = Vec::new();
+
+    // Tempo meta event
+    e(&mut evs, 0, &[0xFF, 0x51, 0x03,
+        ((tempo_us >> 16) & 0xFF) as u8,
+        ((tempo_us >> 8)  & 0xFF) as u8,
+        (tempo_us & 0xFF) as u8]);
+
+    // Program changes pour chaque piste
+    for tc in tracks {
+        e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
+    }
+
+    // Trier les notes par start_time
+    let mut sorted: Vec<&CustomNote> = notes.iter().collect();
+    sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
+
+    for n in &sorted {
+        let start_tick = (n.start_time * tpb as f64) as u32;
+        let end_tick = ((n.start_time + n.duration) * tpb as f64) as u32;
+
+        // Note On
+        e(&mut evs, start_tick, &[0x90 | n.channel, n.pitch, n.velocity]);
+        // Note Off
+        e(&mut evs, end_tick, &[0x80 | n.channel, n.pitch, 64]);
+    }
+
+    // End of Track
+    let last_tick = sorted.last()
+        .map(|n| ((n.start_time + n.duration) * tpb as f64 + 4.0) as u32)
+        .unwrap_or(480);
+    e(&mut evs, last_tick, &[0xFF, 0x2F, 0x00]);
+
+    // Trier les événements par tick
+    evs.sort_by(|a, b| a.tick.cmp(&b.tick));
+
+    // ── Sérialisation SMF Format 0 ──
+    let mut buf = Vec::new();
+    // Header "MThd"
+    buf.extend_from_slice(b"MThd");
+    write_u32(&mut buf, 6);
+    write_u16(&mut buf, 0); // Format 0
+    write_u16(&mut buf, 1); // 1 track
+    write_u16(&mut buf, tpb as u16);
+
+    // Track chunk "MTrk"
+    let mut track_data = Vec::new();
+    let mut last_tick: u32 = 0;
+    for ev in &evs {
+        let delta = ev.tick.saturating_sub(last_tick);
+        write_vlq(&mut track_data, delta);
+        track_data.extend_from_slice(&ev.bytes);
+        last_tick = ev.tick;
+    }
+
+    buf.extend_from_slice(b"MTrk");
+    write_u32(&mut buf, track_data.len() as u32);
+    buf.extend_from_slice(&track_data);
+
+    buf
+}
