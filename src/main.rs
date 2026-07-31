@@ -334,6 +334,7 @@ fn notes_from_ev(e: &ChordEv) -> Vec<u8> {
 /// En mode standalone (frontend embarqué), cette route n'est pas utilisée
 /// car tout le routage frontend est géré par `frontend_embed::serve`.
 /// En mode dev, elle sert le vieil index.html statique.
+#[cfg(not(feature = "standalone"))]
 async fn idx() -> impl IntoResponse {
     Html(include_str!("../static/index.html"))
 }
