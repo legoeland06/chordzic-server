@@ -267,6 +267,8 @@ struct PlayReq {
     loop_enabled: Option<bool>,      // Boucle activée ?
     tracks: Option<Vec<MidiTrackCfg>>, // Configuration des pistes
     walking: Option<bool>,           // Walking bass ?
+    #[serde(default = "mv127")]
+    master_vol: u8,                  // Volume master (0-127, défaut 127)
     #[serde(default)]
     custom_notes: Vec<CustomNote>,    // Notes personnalisées du PianoRoll (optionnel)
 }
@@ -310,6 +312,7 @@ fn s44() -> String { "4/4".to_string() }
 fn i51() -> u16 { 51 }
 fn nv() -> u8 { 100 }
 fn nd() -> u64 { 400 }
+fn mv127() -> u8 { 127 }
 
 // ─── Notes depuis ChordEv ──────────────────────────────────────────────
 
@@ -675,7 +678,7 @@ async fn render_wav(
     };
     let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
 
-    match render::render_wav(&smf, sf_path, duration_sec) {
+    match render::render_wav(&smf, sf_path, duration_sec, b.master_vol) {
         Ok(wav) => {
             let mut headers = HeaderMap::new();
             headers.insert(

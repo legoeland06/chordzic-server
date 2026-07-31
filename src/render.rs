@@ -502,6 +502,42 @@ pub fn generate_notes(
 
 // ─── Render WAV ──────────────────────────────────────────────────────
 
+/// Normalise un WAV au pic cible (-1 dBFS) puis applique le master volume.
+///
+/// Le rendu FluidSynth utilise les vélocités des pistes (souvent faibles,
+/// ex: lead 15/127) → le WAV brut sort très bas. Cette fonction amplifie
+/// le WAV pour que le pic atteigne ~0.89×32768 (-1 dB), puis scale par
+/// `master_vol/127`. La normalisation au pic garantit l'absence de
+/// clipping (le gain ne dépasse jamais le ratio pic-cible).
+fn normalize_wav(wav: &[u8], master_vol: u8) -> Vec<u8> {
+    use hound::WavReader;
+    let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
+        return wav.to_vec();
+    };
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
+    if samples.is_empty() { return wav.to_vec(); }
+
+    // Pic absolu du WAV
+    let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(1) as f64;
+    if peak < 1.0 { return wav.to_vec(); }
+
+    // Pic cible : -1 dBFS ≈ 0.89 × 32768
+    let target = 0.89 * 32768.0;
+    let master = (master_vol as f64 / 127.0).clamp(0.0, 1.0);
+    let gain = (target / peak) * master;
+
+    let mut out = Vec::new();
+    if let Ok(mut w) = hound::WavWriter::new(std::io::Cursor::new(&mut out), spec) {
+        for &s in &samples {
+            let v = (s as f64 * gain).round().clamp(-32768.0, 32767.0) as i16;
+            let _ = w.write_sample(v);
+        }
+        let _ = w.finalize();
+    }
+    if out.is_empty() { wav.to_vec() } else { out }
+}
+
 /// Tronque un WAV à la durée attendue (`expected_sec` secondes).
 ///
 /// FluidSynth peut produire un WAV légèrement plus long que la durée
@@ -544,11 +580,12 @@ fn trim_to_duration(wav: &[u8], expected_sec: f64) -> Vec<u8> {
 /// - `smf` : contenu du fichier SMF (bytes)
 /// - `soundfont` : chemin vers le fichier .sf3 (SoundFont)
 /// - `duration_sec` : durée attendue en secondes (pour le trim)
+/// - `master_vol` : volume master (0-127), appliqué après normalisation
 ///
 /// # Erreurs
 /// - Retourne `Err(String)` si FluidSynth n'est pas installé, si le SMF
 ///   est invalide, ou si le fichier WAV ne peut pas être écrit/lu.
-pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64) -> Result<Vec<u8>, String> {
+pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8) -> Result<Vec<u8>, String> {
     let mid_path = std::env::temp_dir().join("chordj_render.mid");
     let wav_path = std::env::temp_dir().join("chordj_render.wav");
 
@@ -591,8 +628,9 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64) -> Result<Vec<
     let _ = std::fs::remove_file(&mid_path);
     let _ = std::fs::remove_file(&wav_path);
 
-    // Étape 5 : tronquer à la durée exacte
-    Ok(trim_to_duration(&wav, duration_sec))
+    // Étape 5 : tronquer à la durée exacte puis normaliser au pic
+    let trimmed = trim_to_duration(&wav, duration_sec);
+    Ok(normalize_wav(&trimmed, master_vol))
 }
 
 // ─── Custom notes (PianoRoll) ──────────────────────────────────────────
