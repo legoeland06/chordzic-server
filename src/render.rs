@@ -553,7 +553,8 @@ fn fade_out_wav(wav: &[u8], fade_ms: u64) -> Vec<u8> {
     let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
     if samples.is_empty() { return wav.to_vec(); }
 
-    let fade_samples = (fade_ms as usize) * spec.sample_rate as usize * spec.channels as usize;
+    let fade_samples = (fade_ms as usize) * spec.sample_rate as usize
+        * spec.channels as usize / 1000; // ms → secondes !
     let fade_samples = fade_samples.min(samples.len());
     let start = samples.len() - fade_samples;
 
