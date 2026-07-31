@@ -31,11 +31,11 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
-    #[cfg(not(feature = "standalone"))]
-    response::Html,
     routing::{get, post},
     Router,
 };
+#[cfg(not(feature = "standalone"))]
+use axum::response::Html;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
