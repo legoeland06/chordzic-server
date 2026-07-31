@@ -538,6 +538,41 @@ fn normalize_wav(wav: &[u8], master_vol: u8) -> Vec<u8> {
     if out.is_empty() { wav.to_vec() } else { out }
 }
 
+/// Applique un fade-out linéaire sur la fin du WAV.
+///
+/// Le rendu est tronqué à la durée musicale exacte (nécessaire pour que
+/// la boucle reste synchrone), mais les queues de notes/réverbération
+/// dépassent → coupure nette (clic) à la boucle. Un fade-out court
+/// (80 ms) rend la transition douce sans créer de silence perceptible.
+fn fade_out_wav(wav: &[u8], fade_ms: u64) -> Vec<u8> {
+    use hound::WavReader;
+    let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
+        return wav.to_vec();
+    };
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
+    if samples.is_empty() { return wav.to_vec(); }
+
+    let fade_samples = (fade_ms as usize) * spec.sample_rate as usize * spec.channels as usize;
+    let fade_samples = fade_samples.min(samples.len());
+    let start = samples.len() - fade_samples;
+
+    let mut out = Vec::new();
+    if let Ok(mut w) = hound::WavWriter::new(std::io::Cursor::new(&mut out), spec) {
+        for (i, &s) in samples.iter().enumerate() {
+            let v = if i >= start {
+                let t = (i - start) as f64 / fade_samples as f64; // 0→1
+                (s as f64 * (1.0 - t)).round() as i16
+            } else {
+                s
+            };
+            let _ = w.write_sample(v);
+        }
+        let _ = w.finalize();
+    }
+    if out.is_empty() { wav.to_vec() } else { out }
+}
+
 /// Tronque un WAV à la durée attendue (`expected_sec` secondes).
 ///
 /// FluidSynth peut produire un WAV légèrement plus long que la durée
@@ -631,7 +666,9 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8
 
     // Étape 5 : tronquer à la durée exacte puis normaliser au pic
     let trimmed = trim_to_duration(&wav, duration_sec);
-    Ok(normalize_wav(&trimmed, master_vol))
+    let normalized = normalize_wav(&trimmed, master_vol);
+    // Étape 6 : fade-out court pour une boucle sans clic
+    Ok(fade_out_wav(&normalized, 80))
 }
 
 // ─── Custom notes (PianoRoll) ──────────────────────────────────────────
