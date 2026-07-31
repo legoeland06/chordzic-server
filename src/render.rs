@@ -89,11 +89,11 @@ impl Default for RenderCfg {
         Self {
             tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
             tracks: [
-                TrackCfg { channel: 0, program: 51, volume: 15, mute: false },
-                TrackCfg { channel: 2, program: 33, volume: 40, mute: false },
-                TrackCfg { channel: 3, program: 48, volume: 30, mute: false },
-                TrackCfg { channel: 9, program: 1, volume: 80, mute: false },
-                TrackCfg { channel: 4, program: 2, volume: 20, mute: false },
+                TrackCfg { channel: 0, program: 51, volume: 60, mute: false },
+                TrackCfg { channel: 2, program: 33, volume: 70, mute: false },
+                TrackCfg { channel: 3, program: 48, volume: 60, mute: false },
+                TrackCfg { channel: 9, program: 1, volume: 90, mute: false },
+                TrackCfg { channel: 4, program: 2, volume: 50, mute: false },
             ],
         }
     }
@@ -596,13 +596,14 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8
     // Options :
     //   -F <wav> : fichier de sortie WAV
     //   -T wav   : format de sortie
-    //   -g 1.0   : gain (volume) de rendu
+    //   -g 0.5   : gain de rendu conservateur — garantit que le mix brut
+    //              ne sature JAMAIS (normalisation au pic ensuite)
     //   -n       : ne pas charger les defaults
     //   -i       : mode interactif (permet de charger un seul fichier)
     let output = Command::new("fluidsynth")
         .arg("-F").arg(&wav_path)
         .arg("-T").arg("wav")
-        .arg("-g").arg("1.0")
+        .arg("-g").arg("0.5")
         .arg("-n").arg("-i")
         .arg(soundfont)
         .arg(&mid_path)

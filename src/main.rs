@@ -535,11 +535,11 @@ fn render_inputs(b: &PlayReq) -> (Vec<Vec<u8>>, Vec<f64>, render::RenderCfg) {
     }
 
     let mut tracks_cfg: [render::TrackCfg; 5] = [
-        render::TrackCfg { channel: 0, program: b.inst_val, volume: 15, mute: !b.arps },
-        render::TrackCfg { channel: 2, program: 33, volume: 40, mute: !b.bass },
-        render::TrackCfg { channel: 3, program: 48, volume: 30, mute: !b.nappes },
-        render::TrackCfg { channel: 9, program: 1, volume: 80, mute: !b.drums },
-        render::TrackCfg { channel: 4, program: 2, volume: 20, mute: false },
+        render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps },
+        render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass },
+        render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes },
+        render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums },
+        render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false },
     ];
 
     if let Some(ref tcfg) = b.tracks {
@@ -716,11 +716,11 @@ async fn main() {
         soundfont,
         live: Arc::new(Live {
             tracks: [
-                LiveTrack::new(0, 51, 15),
-                LiveTrack::new(2, 33, 40),
-                LiveTrack::new(3, 48, 30),
-                LiveTrack::new(9, 1, 80),
-                LiveTrack::new(4, 2, 20),
+                LiveTrack::new(0, 51, 60),
+                LiveTrack::new(2, 33, 70),
+                LiveTrack::new(3, 48, 60),
+                LiveTrack::new(9, 1, 90),
+                LiveTrack::new(4, 2, 50),
             ],
             pattern: AtomicU8::new(PAT_ROCK),
             tempo: AtomicU16::new(120),
