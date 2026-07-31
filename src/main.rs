@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use patterns::pat;
 use midi::{
-    apply_tracks, init_midi, note_midi, play_seq, play_notes, rch, pb, ChordEv, Live, LiveTrack,
+    apply_tracks, init_midi, no, note_midi, pc, play_seq, play_notes, rch, pb, ChordEv, Live, LiveTrack,
     MidiHandle, TrackCfg as MidiTrackCfg, TRACK_BASS, TRACK_DRUMS, TRACK_LEAD, TRACK_STR,
 };
 
@@ -308,6 +308,8 @@ fn n() -> bool { false }
 fn rk() -> String { "rock".to_string() }
 fn s44() -> String { "4/4".to_string() }
 fn i51() -> u16 { 51 }
+fn nv() -> u8 { 100 }
+fn nd() -> u64 { 400 }
 
 // ─── Notes depuis ChordEv ──────────────────────────────────────────────
 
@@ -510,13 +512,10 @@ async fn stop(State(s): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"status": "stopped"}))
 }
 
-/// POST /render-wav — Rendu batch d'une séquence en WAV.
-async fn render_wav(
-    State(s): State<AppState>,
-    Json(b): Json<PlayReq>,
-) -> impl IntoResponse {
-    use axum::http::HeaderMap;
-
+/// Construit les entrées du rendu classique : notes MIDI par accord,
+/// durées en beats, et configuration complète (pattern, walking, sig,
+/// tracks). Partagé entre `/render-wav` et `/render-notes`.
+fn render_inputs(b: &PlayReq) -> (Vec<Vec<u8>>, Vec<f64>, render::RenderCfg) {
     let ev: &[ChordEv] = if !b.seq.is_empty() {
         &b.seq
     } else if !b.sequence.is_empty() {
@@ -524,10 +523,6 @@ async fn render_wav(
     } else {
         &[]
     };
-
-    if ev.is_empty() && b.custom_notes.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à rendre").into_response();
-    }
 
     let mut notes_arrays: Vec<Vec<u8>> = Vec::new();
     let mut beats: Vec<f64> = Vec::new();
@@ -563,6 +558,86 @@ async fn render_wav(
         tracks: tracks_cfg,
     };
 
+    (notes_arrays, beats, rcfg)
+}
+
+/// POST /render-notes — notes générées par le mode classique (base PianoRoll).
+///
+/// Renvoie la liste des notes MIDI (channel, start_time, pitch, duration,
+/// velocity — en beats) que le mode classique jouerait pour la séquence et
+/// la configuration données. Le frontend s'en sert pour pré-remplir les
+/// PianoRolls de chaque piste.
+async fn render_notes(
+    State(_s): State<AppState>,
+    Json(b): Json<PlayReq>,
+) -> impl IntoResponse {
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+    let notes = render::generate_notes(&notes_arrays, &beats, &rcfg);
+    axum::Json(serde_json::json!({ "notes": notes }))
+}
+
+/// POST /note — audition d'une note en direct (preview PianoRoll).
+///
+/// Joue immédiatement une note sur le canal demandé via FluidSynth
+/// (note on + note off après `duration_ms`). Le program de la piste
+/// configurée est appliqué avant la note (sauf drums, kit fixe).
+#[derive(Deserialize)]
+struct NoteReq {
+    channel: u8,
+    pitch: u8,
+    #[serde(default = "nv")]
+    velocity: u8,
+    #[serde(default = "nd")]
+    duration_ms: u64,
+}
+
+async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoResponse {
+    if let Some(ref h) = s.midi {
+        let lv = &s.live;
+        let prog = lv.tracks.iter()
+            .find(|t| t.channel == b.channel)
+            .map(|t| t.program.load(std::sync::atomic::Ordering::Relaxed));
+        let h2 = Arc::clone(h);
+        let ch = b.channel;
+        let pitch = b.pitch;
+        let vel = b.velocity.min(127);
+        let dur = b.duration_ms.min(5000);
+        std::thread::spawn(move || {
+            if let Ok(mut c) = h2.lock() {
+                // Program change (sauf drums : kit fixe)
+                if let Some(p) = prog {
+                    if ch != 9 { pc(&mut c, ch, p as u8); }
+                }
+                no(&mut c, ch, pitch, vel);
+                std::thread::sleep(std::time::Duration::from_millis(dur));
+                no(&mut c, ch, pitch, 0);
+            }
+        });
+    }
+    Json(Rsp { status: "ok".into() })
+}
+
+/// POST /render-wav — Rendu batch d'une séquence en WAV.
+async fn render_wav(
+    State(s): State<AppState>,
+    Json(b): Json<PlayReq>,
+) -> impl IntoResponse {
+    use axum::http::HeaderMap;
+
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
+    };
+
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à rendre").into_response();
+    }
+
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+
     // ── Choix du mode de rendu ─────────────────────────────
     // Si des notes personnalisées (PianoRoll) sont fournies, on les
     // utilise directement. Sinon, rendu classique par accord.
@@ -578,7 +653,7 @@ async fn render_wav(
         }).collect();
 
         // Utiliser les tracks configurées (ou défaut)
-        let tracks: Vec<render::TrackCfg> = tracks_cfg.to_vec();
+        let tracks: Vec<render::TrackCfg> = rcfg.tracks.to_vec();
 
         render::generate_smf_from_custom(&custom, &tracks, b.tempo as u16)
     } else {
@@ -674,6 +749,8 @@ async fn main() {
         .route("/config", post(conf))
         .route("/stop", post(stop))
         .route("/render-wav", post(render_wav))
+        .route("/render-notes", post(render_notes))
+        .route("/note", post(note))
         .route("/samples-list", get(samples_list))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -702,6 +779,8 @@ async fn main() {
     println!("     POST /config        → modifier la config live");
     println!("     POST /stop          → arrêter la lecture");
     println!("     POST /render-wav    → rendu WAV (batch)");
+    println!("     POST /render-notes  → notes mode classique (PianoRoll)");
+    println!("     POST /note          → audition note en direct (preview)");
     println!("     GET  /samples-list  → boucles WAV disponibles\n");
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))

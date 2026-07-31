@@ -16,6 +16,7 @@
 /// - Événements triés par tick (delta-time encoding)
 /// - Meta events : tempo, end-of-track
 use std::process::Command;
+use serde::Serialize;
 use crate::patterns::sc;
 use crate::walking::{is_minor as is_minor_chord, generate_walking_bass as walking_bass_notes};
 
@@ -117,16 +118,10 @@ fn e(evs: &mut Vec<Ev>, tick: u32, bytes: &[u8]) {
 /// # Étapes
 /// 1. Meta event : tempo (au tick 0)
 /// 2. Program Changes (au tick 0) pour chaque piste
-/// 3. Pour chaque accord :
-///    a. Lead : pompe skank sur contretemps (8ème, staccato 16ème)
-///    b. Basse : walking (4 notes/mesure) ou note tenue
-///    c. Nappes : notes tenues sur toute la durée
-///    d. Drums : pattern complet selon le style
-///    e. Accent : coup sur temps 2&4
+/// 3. Notes générées par `generate_notes()` (lead, basse, nappes, drums, accent)
 /// 4. End-of-track meta event
 ///
-/// Les événements sont d'abord collectés avec des ticks absolus, puis
-/// triés et sérialisés en delta-time encoding.
+/// Les événements sont triés par tick absolu puis sérialisés en delta-time.
 ///
 /// # Paramètres
 /// - `notes_arrays` : notes MIDI pour chaque accord (Vec<u8> = notes de l'accord)
@@ -140,13 +135,6 @@ pub fn generate_smf_fmt0(
     // Tempo en microsecondes par noire (MIDI meta event 0x51)
     let tempo_us = (60_000_000u64 / cfg.tempo.max(1) as u64) as u32;
     let tpb = TICKS_PER_BEAT;      // Ticks par noire
-    let eighth = tpb / 2;           // Ticks pour une croche (240)
-
-    // Résoudre la signature rythmique → temps par mesure
-    let sig_parts: Vec<&str> = cfg.sig.split('/').collect();
-    let beats_per_bar = sig_parts.first()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(4);  // Défaut 4/4
 
     let mut evs: Vec<Ev> = Vec::new();
 
@@ -168,281 +156,15 @@ pub fn generate_smf_fmt0(
         e(&mut evs, 0, &[0xC0 | CH_LEAD, cfg.lead_inst as u8]);
     }
 
-    // ── Extraire les configs par canal ─────────────────────────────
-    let lead_cfg = cfg.tracks.iter().find(|t| t.channel == CH_LEAD);
-    let bass_cfg = cfg.tracks.iter().find(|t| t.channel == CH_BASS);
-    let str_cfg = cfg.tracks.iter().find(|t| t.channel == CH_STR);
-    let drums_cfg = cfg.tracks.iter().find(|t| t.channel == CH_DRUMS);
-    let acc_cfg = cfg.tracks.iter().find(|t| t.channel == CH_ACC);
-
-    let lead_mute = lead_cfg.map_or(false, |t| t.mute);
-    let bass_mute = bass_cfg.map_or(false, |t| t.mute);
-    let str_mute = str_cfg.map_or(false, |t| t.mute);
-    let drums_mute = drums_cfg.map_or(false, |t| t.mute);
-    let acc_mute = acc_cfg.map_or(false, |t| t.mute);
-
-    let lead_vol = lead_cfg.map_or(80, |t| t.volume);
-    let bass_vol = bass_cfg.map_or(90, |t| t.volume);
-    let str_vol = str_cfg.map_or(60, |t| t.volume);
-    let drums_vol = drums_cfg.map_or(100, |t| t.volume);
-    let acc_vol = acc_cfg.map_or(70, |t| t.volume);
-
-    // ── Boucle sur les accords ─────────────────────────────────────
-    let mut abs_tick = 0u32;     // Tick absolu courant (accumulé)
-    let mut seed: u64 = 0;       // Seed pour la walking bass
-
-    for (ci, notes) in notes_arrays.iter().enumerate() {
-        // Nombre de temps que dure cet accord (4.0 = mesure complète)
-        let bc = if ci < beats.len() { beats[ci] } else { 4.0 };
-        let total_ticks = (bc * tpb as f64) as u32;
-        let nq = bc as u32;       // Temps dans cet accord (floor)
-
-        // Accord vide (silence) → skip sans générer de notes
-        if notes.is_empty() {
-            abs_tick += total_ticks;
-            continue;
-        }
-
-        let chord_start = abs_tick;            // Tick de début
-        let chord_end = abs_tick + total_ticks; // Tick de fin
-
-        // La première note = fondamentale (basse)
-        let bass_note = notes[0];
-        // Les notes suivantes = chord tones (lead, nappes, accent)
-        let chord: &[u8] = if notes.len() > 1 { &notes[1..] } else { &[] };
-
-        // ── Boucle sur les temps de cet accord ─────────────────
-
-        // Lead — pompe skank : staccato sur contretemps 8ème
-        // Formule : Note On au tick = beat*240 (milieu du temps), Off 120 ticks plus tard
-        // (120 ticks = 1/16ème de note à 480 tpb = durée staccato)
-        if !lead_mute {
-            let lv = sc(lead_vol, 127); // Vélocité lead scalée
-            for b in 0..nq {
-                let skank_on = chord_start + b * tpb + eighth; // 8ème offbeat = tick 240
-                for &n in chord {
-                    // 0x90 | CH_LEAD = Note On
-                    e(&mut evs, skank_on, &[0x90 | CH_LEAD, n, lv]);
-                }
-                let skank_off = skank_on + 120; // Staccato : off 1/16ème plus tard
-                for &n in chord {
-                    // 0x80 | CH_LEAD = Note Off
-                    e(&mut evs, skank_off, &[0x80 | CH_LEAD, n, 64]);
-                }
-            }
-        }
-
-        // Basse — walking bass ou note tenue
-        if !bass_mute {
-            let bv = sc(bass_vol, 127);
-            if cfg.walking && chord.len() >= 1 {
-                // Walking bass : 4 notes par mesure
-                let next_root = notes_arrays.get(ci + 1)
-                    .and_then(|n| n.first()).copied()
-                    .or_else(|| notes_arrays.first().and_then(|n| n.first()).copied())
-                    .unwrap_or(bass_note);
-
-                let wb_notes = walking_bass_notes(
-                    &[bass_note, chord[0], chord.get(1).copied().unwrap_or(bass_note)],
-                    next_root, seed,
-                    is_minor_chord(&[bass_note, chord[0]]),
-                );
-                seed = seed.wrapping_add(1);
-
-                for (bi, &bn) in wb_notes.iter().enumerate() {
-                    let bt = chord_start + (bi as u32) * tpb; // Une note par temps
-                    e(&mut evs, bt, &[0x90 | CH_BASS, bn, bv]); // Note On
-                    // Note Off 1 tick avant la note suivante (legato brisé)
-                    let off_tick = if bi < 3 {
-                        chord_start + ((bi + 1) as u32) * tpb - 1
-                    } else {
-                        chord_end
-                    };
-                    e(&mut evs, off_tick, &[0x80 | CH_BASS, bn, 64]); // Note Off
-                }
-            } else {
-                // Note tenue de basse sur toute la durée
-                e(&mut evs, chord_start, &[0x90 | CH_BASS, bass_note, bv]);
-                e(&mut evs, chord_end, &[0x80 | CH_BASS, bass_note, 64]);
-            }
-        }
-
-        // Nappes (strings) — notes tenues sur toute la durée de l'accord
-        // En reggae, les nappes ne jouent que sur les accords courts.
-        let reggae_skip_nappe = cfg.pattern == "reggae" && bc > 1.0;
-        if !str_mute && !reggae_skip_nappe {
-            let sv = sc(str_vol, 127);
-            for &n in chord {
-                e(&mut evs, chord_start, &[0x90 | CH_STR, n, sv]);
-            }
-            for &n in chord {
-                e(&mut evs, chord_end, &[0x80 | CH_STR, n, 64]);
-            }
-        }
-
-        // ── Drums + Accent : par temps ────────────
-        // On génère les événements pour chaque temps de l'accord
-        for b in 0..nq {
-            let on_tick = chord_start + b * tpb;         // Début du temps
-            let up_tick = on_tick + eighth;              // Contretemps 8ème
-            // Beat absolu pour le pattern (wrap à beats_per_bar)
-            let bar_beat = (abs_tick / tpb + b) % beats_per_bar;
-
-            // ── Drums — pattern exact comme dans drum_hit() ─────
-            // Chaque pattern définit quels instruments jouent sur quels temps.
-            // Voir midi.rs:drum_hit() pour la logique musicale détaillée.
-            if !drums_mute {
-                let dv = sc(drums_vol, 127);
-
-                // Pre-calculs des vélocités scalées
-                let hh_beat = sc(dv, 80);   // HH sur temps (fort)
-                let hh_eighth = sc(dv, 65); // HH sur croche (doux)
-                let hh55 = sc(dv, 55);
-                let hh45 = sc(dv, 45);
-                let hh40 = sc(dv, 10);      // HH ghost
-                let hh60 = sc(dv, 60);
-                let hh65 = sc(dv, 65);
-
-                match cfg.pattern.as_str() {
-                    "reggae" => {
-                        match bar_beat {
-                            0 | 1 | 3 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh60]);
-                            }
-                            2 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 120)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh65]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, RIM, sc(dv, 90)]);
-                            }
-                            _ => {}
-                        }
-                        e(&mut evs, up_tick, &[0x90 | CH_DRUMS, HH, hh40]);
-                    }
-                    "jazz" => {
-                        let bb2 = bar_beat % 8; // Le jazz se répète sur 2 mesures
-                        match bb2 {
-                            0 | 2 | 6 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, 51, hh60]); // Ride
-                            }
-                            4 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, 51, hh60]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, 44, sc(dv, 40)]); // HH pedale
-                            }
-                            7 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, 51, hh60]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, 44, sc(dv, 40)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, RIM, sc(dv, 50)]);
-                            }
-                            _ => {}
-                        }
-                        e(&mut evs, up_tick, &[0x90 | CH_DRUMS, HH, 35]);
-                    }
-                    "pop" => {
-                        match bar_beat % 4 {
-                            0 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 85)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, sc(dv, 50)]);
-                            }
-                            1 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, SNARE, sc(dv, 70)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, sc(dv, 50)]);
-                            }
-                            2 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 75)]);
-                            }
-                            3 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, SNARE, sc(dv, 65)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, sc(dv, 50)]);
-                            }
-                            _ => {}
-                        }
-                        e(&mut evs, up_tick, &[0x90 | CH_DRUMS, HH, sc(dv, 45)]);
-                    }
-                    "bossa" => {
-                        match bar_beat % 4 {
-                            0 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 55)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh45]);
-                            }
-                            1 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, SNARE, sc(dv, 30)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh45]);
-                            }
-                            2 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 60)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh45]);
-                            }
-                            3 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 50)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh45]);
-                            }
-                            _ => {}
-                        }
-                        e(&mut evs, up_tick, &[0x90 | CH_DRUMS, HH, hh40]);
-                    }
-                    "onedrop" => {
-                        match bar_beat % 4 {
-                            0 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 90)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh55]);
-                            }
-                            1 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh40]);
-                            }
-                            2 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 90)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, RIM, sc(dv, 65)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh45]);
-                            }
-                            3 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh55]);
-                            }
-                            _ => {}
-                        }
-                        e(&mut evs, up_tick, &[0x90 | CH_DRUMS, HH, hh40]);
-                    }
-                    // Pattern par défaut : ROCK
-                    _ => {
-                        match bar_beat % 4 {
-                            0 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 90)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh_beat]);
-                            }
-                            1 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, SNARE, sc(dv, 75)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh_beat]);
-                            }
-                            2 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, KICK, sc(dv, 80)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh_beat]);
-                            }
-                            3 => {
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, SNARE, sc(dv, 70)]);
-                                e(&mut evs, on_tick, &[0x90 | CH_DRUMS, HH, hh_beat]);
-                            }
-                            _ => {}
-                        }
-                        e(&mut evs, up_tick, &[0x90 | CH_DRUMS, HH, hh_eighth]);
-                    }
-                }
-            }
-
-            // ── Accent (temps 2&4) ──────────────────────
-            // Coup sec de Bright Acoustic Piano (canal 4) sur les temps
-            // faibles (backbeat), façon ska/rocksteady.
-            if !acc_mute && (b == 1 || b == 3) {
-                let av = sc(acc_vol, 127);
-                for &n in chord {
-                    e(&mut evs, on_tick, &[0x90 | CH_ACC, n, av]);
-                    // Note Off quasi immédiat (1 tick plus tard) pour un effet
-                    // percussif, pas de note tenue
-                    e(&mut evs, on_tick + 60, &[0x80 | CH_ACC, n, 64]); // Off 1/8ème plus tard
-                }
-            }
-        }
-
-        // Mise à jour du tick absolu pour le prochain accord
-        abs_tick = chord_end;
+    // ── Notes (lead, basse, nappes, drums, accent) ───────────────
+    // La génération musicale est centralisée dans `generate_notes()`,
+    // partagée avec le PianoRoll via l'endpoint /render-notes.
+    let notes = generate_notes(notes_arrays, beats, cfg);
+    for n in &notes {
+        let start_tick = (n.start_time * tpb as f64) as u32;
+        let end_tick = ((n.start_time + n.duration) * tpb as f64) as u32;
+        e(&mut evs, start_tick, &[0x90 | n.channel, n.pitch, n.velocity]);
+        e(&mut evs, end_tick, &[0x80 | n.channel, n.pitch, 64]);
     }
 
     // ── Sérialisation SMF ──────────────────────────────────────────
@@ -478,6 +200,304 @@ pub fn generate_smf_fmt0(
     smf.extend_from_slice(&track_data);
 
     smf
+}
+
+/// Génère les notes MIDI structurées de toutes les pistes (mode classique).
+///
+/// C'est la source de vérité musicale partagée entre :
+/// - `generate_smf_fmt0()` : rendu WAV classique (conversion en événements SMF)
+/// - Endpoint `POST /render-notes` : pré-remplissage des PianoRolls frontend
+///
+/// Retourne des notes avec positions/durées en **beats**, dans le même format
+/// que les `custom_notes` envoyées par le PianoRoll (channel, start_time,
+/// pitch, duration, velocity).
+///
+/// # Étapes (par accord)
+/// 1. Lead : pompe skank sur contretemps (8ème, staccato 16ème)
+/// 2. Basse : walking (4 notes/mesure) ou note tenue
+/// 3. Nappes : notes tenues sur toute la durée
+/// 4. Drums : pattern complet selon le style
+/// 5. Accent : coup sur temps 2&4
+pub fn generate_notes(
+    notes_arrays: &[Vec<u8>],
+    beats: &[f64],
+    cfg: &RenderCfg,
+) -> Vec<CustomNote> {
+    let tpb = TICKS_PER_BEAT as f64;
+    // Résoudre la signature rythmique → temps par mesure
+    let sig_parts: Vec<&str> = cfg.sig.split('/').collect();
+    let beats_per_bar = sig_parts.first()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(4);  // Défaut 4/4
+
+    // ── Extraire les configs par canal ─────────────────────────────
+    let lead_cfg = cfg.tracks.iter().find(|t| t.channel == CH_LEAD);
+    let bass_cfg = cfg.tracks.iter().find(|t| t.channel == CH_BASS);
+    let str_cfg = cfg.tracks.iter().find(|t| t.channel == CH_STR);
+    let drums_cfg = cfg.tracks.iter().find(|t| t.channel == CH_DRUMS);
+    let acc_cfg = cfg.tracks.iter().find(|t| t.channel == CH_ACC);
+
+    let lead_mute = lead_cfg.map_or(false, |t| t.mute);
+    let bass_mute = bass_cfg.map_or(false, |t| t.mute);
+    let str_mute = str_cfg.map_or(false, |t| t.mute);
+    let drums_mute = drums_cfg.map_or(false, |t| t.mute);
+    let acc_mute = acc_cfg.map_or(false, |t| t.mute);
+
+    let lead_vol = lead_cfg.map_or(80, |t| t.volume);
+    let bass_vol = bass_cfg.map_or(90, |t| t.volume);
+    let str_vol = str_cfg.map_or(60, |t| t.volume);
+    let drums_vol = drums_cfg.map_or(100, |t| t.volume);
+    let acc_vol = acc_cfg.map_or(70, |t| t.volume);
+
+    let mut out: Vec<CustomNote> = Vec::new();
+    let mut abs_beats = 0.0f64;   // Position absolue en beats
+    let mut seed: u64 = 0;        // Seed pour la walking bass
+
+    for (ci, notes) in notes_arrays.iter().enumerate() {
+        // Nombre de temps que dure cet accord (4.0 = mesure complète)
+        let bc = if ci < beats.len() { beats[ci] } else { 4.0 };
+        let nq = bc as u32;       // Temps entiers dans cet accord (floor)
+
+        // Accord vide (silence) → skip sans générer de notes
+        if notes.is_empty() {
+            abs_beats += bc;
+            continue;
+        }
+
+        // La première note = fondamentale (basse)
+        let bass_note = notes[0];
+        // Les notes suivantes = chord tones (lead, nappes, accent)
+        let chord: &[u8] = if notes.len() > 1 { &notes[1..] } else { &[] };
+
+        // ── Lead — pompe skank : staccato sur contretemps 8ème ──
+        // Start = beat + 0.5 (contretemps), durée 0.25 (1/16 staccato)
+        if !lead_mute {
+            let lv = sc(lead_vol, 127);
+            for b in 0..nq {
+                let start = abs_beats + b as f64 + 0.5;
+                for &n in chord {
+                    out.push(CustomNote {
+                        channel: CH_LEAD, start_time: start, pitch: n,
+                        duration: 0.25, velocity: lv,
+                    });
+                }
+            }
+        }
+
+        // ── Basse — walking bass ou note tenue ──
+        if !bass_mute {
+            let bv = sc(bass_vol, 127);
+            if cfg.walking && chord.len() >= 1 {
+                let next_root = notes_arrays.get(ci + 1)
+                    .and_then(|n| n.first()).copied()
+                    .or_else(|| notes_arrays.first().and_then(|n| n.first()).copied())
+                    .unwrap_or(bass_note);
+
+                let wb_notes = walking_bass_notes(
+                    &[bass_note, chord[0], chord.get(1).copied().unwrap_or(bass_note)],
+                    next_root, seed,
+                    is_minor_chord(&[bass_note, chord[0]]),
+                );
+                seed = seed.wrapping_add(1);
+
+                // Durée identique au SMF historique : off 1 tick avant la
+                // note suivante (legato brisé). Dernière note : jusqu'à la
+                // fin de l'accord. Si la durée est négative (accord < 3
+                // temps), la note était inaudible dans l'ancien rendu → on
+                // ne l'émet pas (comportement identique).
+                let short = (TICKS_PER_BEAT as f64 - 1.0) / tpb;
+                for (bi, &bn) in wb_notes.iter().enumerate() {
+                    let dur = if bi < 3 { short } else { bc - 3.0 };
+                    if dur > 0.0 {
+                        out.push(CustomNote {
+                            channel: CH_BASS, start_time: abs_beats + bi as f64,
+                            pitch: bn, duration: dur, velocity: bv,
+                        });
+                    }
+                }
+            } else {
+                // Note tenue de basse sur toute la durée
+                out.push(CustomNote {
+                    channel: CH_BASS, start_time: abs_beats, pitch: bass_note,
+                    duration: bc, velocity: bv,
+                });
+            }
+        }
+
+        // ── Nappes (strings) — notes tenues sur toute la durée ──
+        // En reggae, les nappes ne jouent que sur les accords courts.
+        let reggae_skip_nappe = cfg.pattern == "reggae" && bc > 1.0;
+        if !str_mute && !reggae_skip_nappe {
+            let sv = sc(str_vol, 127);
+            for &n in chord {
+                out.push(CustomNote {
+                    channel: CH_STR, start_time: abs_beats, pitch: n,
+                    duration: bc, velocity: sv,
+                });
+            }
+        }
+
+        // ── Drums + Accent : par temps ────────────
+        for b in 0..nq {
+            // Beat absolu pour le pattern (wrap à beats_per_bar)
+            let bar_beat = (abs_beats as u32 + b) % beats_per_bar;
+            let t0 = abs_beats + b as f64;   // Début du temps
+            let up = t0 + 0.5;               // Contretemps 8ème
+
+            // ── Drums — pattern exact comme drum_hit() ──────────
+            if !drums_mute {
+                let dv = sc(drums_vol, 127);
+
+                // Pre-calculs des vélocités scalées (identiques au SMF)
+                let hh_beat = sc(dv, 80);   // HH sur temps (fort)
+                let hh_eighth = sc(dv, 65); // HH sur croche (doux)
+                let hh55 = sc(dv, 55);
+                let hh45 = sc(dv, 45);
+                let hh40 = sc(dv, 10);      // HH ghost
+                let hh60 = sc(dv, 60);
+                let hh65 = sc(dv, 65);
+
+                // Durée drums : 1/16 (0.25 beat) — one-shot
+                let mut hit = |p: u8, v: u8, at: f64| {
+                    out.push(CustomNote {
+                        channel: CH_DRUMS, start_time: at, pitch: p,
+                        duration: 0.25, velocity: v,
+                    });
+                };
+
+                match cfg.pattern.as_str() {
+                    "reggae" => {
+                        match bar_beat {
+                            0 | 1 | 3 => { hit(HH, hh60, t0); }
+                            2 => {
+                                hit(KICK, sc(dv, 120), t0);
+                                hit(HH, hh65, t0);
+                                hit(RIM, sc(dv, 90), t0);
+                            }
+                            _ => {}
+                        }
+                        hit(HH, hh40, up);
+                    }
+                    "jazz" => {
+                        let bb2 = bar_beat % 8; // Le jazz se répète sur 2 mesures
+                        match bb2 {
+                            0 | 2 | 6 => { hit(51, hh60, t0); } // Ride
+                            4 => {
+                                hit(51, hh60, t0);
+                                hit(44, sc(dv, 40), t0); // HH pedale
+                            }
+                            7 => {
+                                hit(51, hh60, t0);
+                                hit(44, sc(dv, 40), t0);
+                                hit(RIM, sc(dv, 50), t0);
+                            }
+                            _ => {}
+                        }
+                        hit(HH, 35, up);
+                    }
+                    "pop" => {
+                        match bar_beat % 4 {
+                            0 => {
+                                hit(KICK, sc(dv, 85), t0);
+                                hit(HH, sc(dv, 50), t0);
+                            }
+                            1 => {
+                                hit(SNARE, sc(dv, 70), t0);
+                                hit(HH, sc(dv, 50), t0);
+                            }
+                            2 => { hit(KICK, sc(dv, 75), t0); }
+                            3 => {
+                                hit(SNARE, sc(dv, 65), t0);
+                                hit(HH, sc(dv, 50), t0);
+                            }
+                            _ => {}
+                        }
+                        hit(HH, sc(dv, 45), up);
+                    }
+                    "bossa" => {
+                        match bar_beat % 4 {
+                            0 => {
+                                hit(KICK, sc(dv, 55), t0);
+                                hit(HH, hh45, t0);
+                            }
+                            1 => {
+                                hit(SNARE, sc(dv, 30), t0);
+                                hit(HH, hh45, t0);
+                            }
+                            2 => {
+                                hit(KICK, sc(dv, 60), t0);
+                                hit(HH, hh45, t0);
+                            }
+                            3 => {
+                                hit(KICK, sc(dv, 50), t0);
+                                hit(HH, hh45, t0);
+                            }
+                            _ => {}
+                        }
+                        hit(HH, hh40, up);
+                    }
+                    "onedrop" => {
+                        match bar_beat % 4 {
+                            0 => {
+                                hit(KICK, sc(dv, 90), t0);
+                                hit(HH, hh55, t0);
+                            }
+                            1 => { hit(HH, hh40, t0); }
+                            2 => {
+                                hit(KICK, sc(dv, 90), t0);
+                                hit(RIM, sc(dv, 65), t0);
+                                hit(HH, hh45, t0);
+                            }
+                            3 => { hit(HH, hh55, t0); }
+                            _ => {}
+                        }
+                        hit(HH, hh40, up);
+                    }
+                    // Pattern par défaut : ROCK
+                    _ => {
+                        match bar_beat % 4 {
+                            0 => {
+                                hit(KICK, sc(dv, 90), t0);
+                                hit(HH, hh_beat, t0);
+                            }
+                            1 => {
+                                hit(SNARE, sc(dv, 75), t0);
+                                hit(HH, hh_beat, t0);
+                            }
+                            2 => {
+                                hit(KICK, sc(dv, 80), t0);
+                                hit(HH, hh_beat, t0);
+                            }
+                            3 => {
+                                hit(SNARE, sc(dv, 70), t0);
+                                hit(HH, hh_beat, t0);
+                            }
+                            _ => {}
+                        }
+                        hit(HH, hh_eighth, up);
+                    }
+                }
+            }
+
+            // ── Accent (temps 2&4) ──────────────────────
+            // Coup sec de Bright Acoustic Piano (canal 4) sur les temps
+            // faibles (backbeat), façon ska/rocksteady. Durée 1/8 (60 ticks).
+            if !acc_mute && (b == 1 || b == 3) {
+                let av = sc(acc_vol, 127);
+                for &n in chord {
+                    out.push(CustomNote {
+                        channel: CH_ACC, start_time: t0, pitch: n,
+                        duration: 0.125, velocity: av,
+                    });
+                }
+            }
+        }
+
+        // Position absolue pour le prochain accord
+        abs_beats += bc;
+    }
+
+    out
 }
 
 // ─── Render WAV ──────────────────────────────────────────────────────
@@ -578,6 +598,7 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64) -> Result<Vec<
 // ─── Custom notes (PianoRoll) ──────────────────────────────────────────
 
 /// Données d'une note personnalisée (provenant du PianoRoll frontend).
+#[derive(Clone, Debug, Serialize)]
 pub struct CustomNote {
     pub channel: u8,
     pub start_time: f64,
