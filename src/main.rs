@@ -30,7 +30,9 @@ mod walking;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{IntoResponse, Json},
+    #[cfg(not(feature = "standalone"))]
+    response::Html,
     routing::{get, post},
     Router,
 };
