@@ -98,10 +98,19 @@ mod frontend_embed {
 
     fn serve_embedded(path: &str, file: rust_embed::EmbeddedFile) -> Response<Body> {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        Response::builder()
-            .header(header::CONTENT_TYPE, mime.as_ref())
-            .body(Body::from(file.data))
-            .unwrap()
+        let mut builder = Response::builder().header(header::CONTENT_TYPE, mime.as_ref());
+        // Politique de cache :
+        // - index.html : toujours revalider (son contenu change à chaque release)
+        // - assets/ (hashés : index-<hash>.js/css) : cache long + immutable
+        // - autres : pas de cache
+        if path == "index.html" {
+            builder = builder.header(header::CACHE_CONTROL, "no-cache");
+        } else if path.starts_with("assets/") {
+            builder = builder.header(header::CACHE_CONTROL, "public, max-age=31536000, immutable");
+        } else {
+            builder = builder.header(header::CACHE_CONTROL, "no-cache");
+        }
+        builder.body(Body::from(file.data)).unwrap()
     }
 }
 
