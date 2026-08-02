@@ -10,6 +10,9 @@
 /// - `POST /stop`       : arrête la lecture live
 /// - `POST /render-wav` : rendu batch d'une séquence en fichier WAV (via FluidSynth)
 /// - `GET  /samples-list` : liste des boucles WAV disponibles
+/// - `POST /save`         : sauvegarde une grille en JSON (dossier ~/ChordZIC/grilles/)
+/// - `GET  /grilles`      : liste les grilles sauvegardées
+/// - `DELETE /grilles/<n>`: supprime une grille
 ///
 /// L'état global `AppState` est partagé entre toutes les routes via Axum
 /// State.  La connexion MIDI et l'état live sont encapsulés dans des
@@ -21,6 +24,8 @@
 /// - `render`   : génération SMF + rendu WAV batch
 /// - `samples`  : gestion des boucles WAV drums (rodio)
 /// - `walking`  : génération de walking bass
+/// - `grilles`  : sauvegarde/chargement des grilles en JSON
+mod grilles;
 mod midi;
 mod patterns;
 mod render;
@@ -770,6 +775,9 @@ async fn main() {
         .route("/render-notes", post(render_notes))
         .route("/note", post(note))
         .route("/samples-list", get(samples_list))
+        .route("/save", post(grilles::save_grille))
+        .route("/grilles", get(grilles::list_grilles))
+        .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -799,7 +807,10 @@ async fn main() {
     println!("     POST /render-wav    → rendu WAV (batch)");
     println!("     POST /render-notes  → notes mode classique (PianoRoll)");
     println!("     POST /note          → audition note en direct (preview)");
-    println!("     GET  /samples-list  → boucles WAV disponibles\n");
+    println!("     GET  /samples-list  → boucles WAV disponibles");
+    println!("     POST /save          → sauvegarder une grille (JSON)");
+    println!("     GET  /grilles       → lister les grilles");
+    println!("     DELETE /grilles/<n> → supprimer une grille\n");
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
