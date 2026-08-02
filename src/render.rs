@@ -12,7 +12,9 @@
 ///
 /// Format SMF produit :
 /// - Format 0 (single track, multi-canal)
-/// - Résolution : 480 ticks/noire
+/// - Résolution : 288 ticks/noire (divisible par 3 et 4 → triolets 1/12, 1/6,
+///   1/3 et sextolets 1/24, 1/18 exacts, ainsi que toutes les subdivisions
+///   binaires jusqu'au 1/32)
 /// - Événements triés par tick (delta-time encoding)
 /// - Meta events : tempo, end-of-track
 use std::process::Command;
@@ -20,8 +22,10 @@ use serde::Serialize;
 use crate::patterns::sc;
 use crate::walking::{is_minor as is_minor_chord, generate_walking_bass as walking_bass_notes};
 
-/// Résolution : 480 ticks par noire (standard MIDI, compatible tous séquenceurs).
-const TICKS_PER_BEAT: u32 = 480;
+/// Résolution : 288 ticks par noire (multiple commun de 32, 24, 18, 16, 12,
+/// 8, 6, 4, 3, 2, 1 → tous les snaps du PianoRoll sont exacts, notamment les
+/// triolets). 288 = 2^5 × 3^2, divisible par 18 et 24.
+const TICKS_PER_BEAT: u32 = 288;
 
 // ─── Helpers SMF ───────────────────────────────────────────────────────
 
@@ -724,7 +728,7 @@ pub fn generate_smf_from_custom(
     // End of Track
     let last_tick = sorted.last()
         .map(|n| ((n.start_time + n.duration) * tpb as f64 + 4.0) as u32)
-        .unwrap_or(480);
+        .unwrap_or(288);
     e(&mut evs, last_tick, &[0xFF, 0x2F, 0x00]);
 
     // Trier les événements par tick
