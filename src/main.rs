@@ -676,14 +676,20 @@ async fn render_wav(
             .filter(|n| !custom_channels.contains(&n.channel))
             .collect();
 
-        // Notes personnalisées du PianoRoll (canaux custom)
+        // Notes personnalisées du PianoRoll (canaux custom) — vélocité
+        // scalée par le volume de la piste (le mute est filtré plus bas
+        // dans generate_smf_from_custom)
         for cn in &b.custom_notes {
+            let vol = rcfg.tracks.iter()
+                .find(|t| t.channel == cn.channel)
+                .map_or(127, |t| t.volume) as u32;
+            let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
             merged.push(render::CustomNote {
                 channel: cn.channel,
                 start_time: cn.start_time,
                 pitch: cn.pitch,
                 duration: cn.duration,
-                velocity: cn.velocity,
+                velocity: v,
             });
         }
 

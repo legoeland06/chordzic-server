@@ -712,11 +712,20 @@ pub fn generate_smf_from_custom(
         e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
     }
 
-    // Trier les notes par start_time
-    let mut sorted: Vec<&CustomNote> = notes.iter().collect();
-    sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
+    // Appliquer les réglages de piste (mute) aux notes : une piste mutée
+    // est silencieuse. Le scaling de vélocité par volume de piste est fait
+    // en amont (render_wav pour les notes custom ; generate_notes pour les
+    // notes classiques) — pas de double scaling ici.
+    let find_track = |ch: u8| tracks.iter().find(|t| t.channel == ch);
+    let mut audible: Vec<CustomNote> = notes.iter()
+        .filter(|n| find_track(n.channel).map_or(true, |t| !t.mute))
+        .cloned()
+        .collect();
 
-    for n in &sorted {
+    // Trier les notes par start_time
+    audible.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
+
+    for n in &audible {
         let start_tick = (n.start_time * tpb as f64) as u32;
         let end_tick = ((n.start_time + n.duration) * tpb as f64) as u32;
 
@@ -727,7 +736,7 @@ pub fn generate_smf_from_custom(
     }
 
     // End of Track
-    let last_tick = sorted.last()
+    let last_tick = audible.last()
         .map(|n| ((n.start_time + n.duration) * tpb as f64 + 4.0) as u32)
         .unwrap_or(288);
     e(&mut evs, last_tick, &[0xFF, 0x2F, 0x00]);
