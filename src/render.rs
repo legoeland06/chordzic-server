@@ -513,7 +513,11 @@ pub fn generate_notes(
 /// le WAV pour que le pic atteigne ~0.89×32768 (-1 dB), puis scale par
 /// `master_vol/127`. La normalisation au pic garantit l'absence de
 /// clipping (le gain ne dépasse jamais le ratio pic-cible).
-fn normalize_wav(wav: &[u8], master_vol: u8) -> Vec<u8> {
+/// Applique le volume master comme gain linéaire (pas de normalisation au pic).
+/// Le gain Fluidsynth -g 0.5 + les vélocités modérées donnent un mix brut
+/// doux (pic ~0.14) ; on compense par un gain fixe ×3 (niveau plein ~-4 dBFS
+/// sans écraser les différences de volume entre pistes ni les mutes).
+fn apply_gain(wav: &[u8], master_vol: u8) -> Vec<u8> {
     use hound::WavReader;
     let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
         return wav.to_vec();
@@ -522,14 +526,8 @@ fn normalize_wav(wav: &[u8], master_vol: u8) -> Vec<u8> {
     let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
     if samples.is_empty() { return wav.to_vec(); }
 
-    // Pic absolu du WAV
-    let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(1) as f64;
-    if peak < 1.0 { return wav.to_vec(); }
-
-    // Pic cible : -1 dBFS ≈ 0.89 × 32768
-    let target = 0.89 * 32768.0;
     let master = (master_vol as f64 / 127.0).clamp(0.0, 1.0);
-    let gain = (target / peak) * master;
+    let gain = master * 3.0;
 
     let mut out = Vec::new();
     if let Ok(mut w) = hound::WavWriter::new(std::io::Cursor::new(&mut out), spec) {
@@ -669,9 +667,12 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8
     let _ = std::fs::remove_file(&mid_path);
     let _ = std::fs::remove_file(&wav_path);
 
-    // Étape 5 : tronquer à la durée exacte puis normaliser au pic
+    // Étape 5 : tronquer à la durée exacte puis appliquer le gain master
+    // (gain LINÉAIRE : les volumes par piste et les mutes restent réels.
+    // L'ancienne normalisation au pic remontait tout mix faible au maximum
+    // → volumes par piste inaudibles, bruit de fond amplifié sur silence.)
     let trimmed = trim_to_duration(&wav, duration_sec);
-    let normalized = normalize_wav(&trimmed, master_vol);
+    let normalized = apply_gain(&trimmed, master_vol);
     // Étape 6 : micro fade-out (30 ms) — anti-clic à l'arrêt ; la boucle
     // est rendue seamless par le crossfade côté navigateur.
     Ok(fade_out_wav(&normalized, 30))
