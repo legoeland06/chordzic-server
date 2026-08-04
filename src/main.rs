@@ -43,11 +43,11 @@ use axum::{
 use axum::response::Html;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 use patterns::pat;
 use midi::{
-    apply_tracks, init_midi, no, note_midi, pc, play_seq, play_notes, rch, pb, ChordEv, Live, LiveTrack,
+    apply_tracks, init_midi, note_midi, play_seq, play_notes, rch, pb, ChordEv, Live, LiveTrack,
     MidiHandle, TrackCfg as MidiTrackCfg, TRACK_BASS, TRACK_DRUMS, TRACK_LEAD, TRACK_STR,
 };
 
@@ -211,9 +211,39 @@ fn find_soundfont() -> Option<String> {
 /// État partagé du serveur, injecté dans chaque route via Axum State.
 #[derive(Clone)]
 struct AppState {
-    midi: Option<MidiHandle>,   // Connexion MIDI vers FluidSynth (None si pas de port)
+    /// Connexion MIDI vers FluidSynth (None si pas de port).
+    /// Arc<Mutex<…>> pour permettre la RECONNEXION automatique depuis les
+    /// handlers (la connexion meurt si FluidSynth redémarre).
+    midi: Arc<Mutex<Option<MidiHandle>>>,
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
     soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
+}
+
+/// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
+///
+/// La connexion MIDI peut mourir silencieusement (FluidSynth redémarré,
+/// port ALSA disparu) : le premier envoi échoue alors. On détecte l'échec,
+/// on rouvre une connexion (init_midi) et on réessaie une fois.
+/// Retourne true si le message est parti.
+fn midi_send(state: &AppState, msg: &[u8]) -> bool {
+    let mut guard = state.midi.lock().unwrap();
+    // Pas de connexion → (re)connecter
+    if guard.is_none() {
+        *guard = init_midi();
+    }
+    // Première tentative : si la connexion existe et envoie OK → c'est parti
+    {
+        let Some(handle) = guard.as_ref() else { return false; };
+        let Ok(mut conn) = handle.lock() else { return false; };
+        if conn.send(msg).is_ok() {
+            return true;
+        }
+    } // `conn` est droppé ici → `guard` peut être remplacé ensuite
+    // Connexion morte → remplacer et réessayer une fois
+    *guard = init_midi();
+    let Some(handle2) = guard.as_ref() else { return false; };
+    let Ok(mut conn2) = handle2.lock() else { return false; };
+    conn2.send(msg).is_ok()
 }
 
 // ─── Signature ──────────────────────────────────────────────────────────
@@ -405,9 +435,8 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
     };
 
     // ── Lancer le thread audio ──────────────────────────────────
-    if let Some(ref h) = s.midi {
-        let h2 = Arc::clone(h);
-
+    let h = s.midi.lock().unwrap().clone(); // Option<MidiHandle>
+    if let Some(h2) = h {
         // Lancer la boucle WAV (si active) AVANT la séquence MIDI
         let tempo_now = lv.tempo.load(std::sync::atomic::Ordering::Relaxed);
         let loop_active = lv.use_loops.load(std::sync::atomic::Ordering::Relaxed);
@@ -490,7 +519,8 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
     if let Some(u) = b.use432 {
         let was = lv.use432.swap(u, std::sync::atomic::Ordering::Relaxed);
         if was != u {
-            if let Some(ref h) = s.midi {
+            let h = s.midi.lock().unwrap().clone();
+            if let Some(h) = h {
                 if let Ok(mut c) = h.lock() {
                     for &ch in &[0u8, 2, 3, 4] {
                         pb(&mut c, ch, if u { 6881 } else { 8192 });
@@ -526,7 +556,8 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
 async fn stop(State(s): State<AppState>) -> impl IntoResponse {
     s.live.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     samples::stop_loop();
-    if let Some(ref h) = s.midi {
+    let h = s.midi.lock().unwrap().clone();
+    if let Some(h) = h {
         if let Ok(mut c) = h.lock() {
             rch(&mut c); // All Notes Off sur tous les canaux
         }
@@ -614,28 +645,27 @@ struct NoteReq {
 }
 
 async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoResponse {
-    if let Some(ref h) = s.midi {
-        let lv = &s.live;
-        let prog = lv.tracks.iter()
-            .find(|t| t.channel == b.channel)
-            .map(|t| t.program.load(std::sync::atomic::Ordering::Relaxed));
-        let h2 = Arc::clone(h);
-        let ch = b.channel;
-        let pitch = b.pitch;
-        let vel = b.velocity.min(127);
-        let dur = b.duration_ms.min(5000);
-        std::thread::spawn(move || {
-            if let Ok(mut c) = h2.lock() {
-                // Program change (sauf drums : kit fixe)
-                if let Some(p) = prog {
-                    if ch != 9 { pc(&mut c, ch, p as u8); }
-                }
-                no(&mut c, ch, pitch, vel);
-                std::thread::sleep(std::time::Duration::from_millis(dur));
-                no(&mut c, ch, pitch, 0);
+    let prog = s.live.tracks.iter()
+        .find(|t| t.channel == b.channel)
+        .map(|t| t.program.load(std::sync::atomic::Ordering::Relaxed));
+    let ch = b.channel;
+    let pitch = b.pitch;
+    let vel = b.velocity.min(127);
+    let dur = b.duration_ms.min(5000);
+    std::thread::spawn(move || {
+        // Program change (sauf drums : kit fixe)
+        if let Some(p) = prog {
+            if ch != 9 {
+                midi_send(&s, &[0xC0 | ch, p as u8]);
             }
-        });
-    }
+        }
+        // Note On → Note Off après `dur` ms. Si l'envoi échoue
+        // (connexion morte), midi_send reconnecte automatiquement.
+        if midi_send(&s, &[0x90 | ch, pitch, vel]) {
+            std::thread::sleep(std::time::Duration::from_millis(dur));
+            midi_send(&s, &[0x90 | ch, pitch, 0]);
+        }
+    });
     Json(Rsp { status: "ok".into() })
 }
 
@@ -739,7 +769,7 @@ async fn main() {
     let soundfont = find_soundfont();
 
     // Initialisation MIDI
-    let midi = init_midi();
+    let midi = Arc::new(Mutex::new(init_midi()));
     samples::init();
 
     use patterns::PAT_ROCK;
