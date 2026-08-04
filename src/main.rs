@@ -41,6 +41,7 @@ use axum::{
 };
 #[cfg(not(feature = "standalone"))]
 use axum::response::Html;
+use midir::MidiOutput;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -208,43 +209,63 @@ fn find_soundfont() -> Option<String> {
 
 // ─── État global ────────────────────────────────────────────────────────
 
+/// Connexion MIDI vivante : handle midir + nom du port connecté.
+/// Le nom contient le PID du client ALSA (ex: "FLUID Synth (1452036):…")
+/// → il change à chaque redémarrage de FluidSynth, ce qui permet de
+/// détecter une connexion devenue muette.
+struct MidiLink {
+    handle: MidiHandle,
+    port: String,
+}
+
+impl Clone for MidiLink {
+    fn clone(&self) -> Self {
+        MidiLink {
+            handle: Arc::clone(&self.handle),
+            port: self.port.clone(),
+        }
+    }
+}
+
 /// État partagé du serveur, injecté dans chaque route via Axum State.
 #[derive(Clone)]
 struct AppState {
     /// Connexion MIDI vers FluidSynth (None si pas de port).
     /// Arc<Mutex<…>> pour permettre la RECONNEXION automatique depuis les
     /// handlers (la connexion meurt si FluidSynth redémarre).
-    midi: Arc<Mutex<Option<MidiHandle>>>,
+    midi: Arc<Mutex<Option<MidiLink>>>,
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
     soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
 }
 
 /// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
 ///
-/// La connexion MIDI peut mourir silencieusement (FluidSynth redémarré,
-/// port ALSA disparu) : le premier envoi échoue alors. On détecte l'échec,
-/// on rouvre une connexion (init_midi) et on réessaie une fois.
+/// midir ne signale PAS d'erreur quand le port ALSA a disparu (FluidSynth
+/// redémarré) : le message partirait dans le vide. On compare donc le nom du
+/// port connecté à la liste des ports actuellement disponibles — s'il n'y est
+/// plus, on rouvre une connexion (init_midi) avant d'envoyer.
 /// Retourne true si le message est parti.
 fn midi_send(state: &AppState, msg: &[u8]) -> bool {
     let mut guard = state.midi.lock().unwrap();
-    // Pas de connexion → (re)connecter
-    if guard.is_none() {
-        *guard = init_midi();
+
+    // Ports actuellement disponibles (énumération légère, ~µs)
+    let available: Vec<String> = MidiOutput::new("chords-server-rs")
+        .map(|mo| mo.ports().iter().filter_map(|x| mo.port_name(x).ok()).collect())
+        .unwrap_or_default();
+
+    // Connexion absente ou port disparu → (re)connecter
+    let stale = match guard.as_ref() {
+        None => true,
+        Some(link) => !available.iter().any(|n| n == &link.port),
+    };
+    if stale {
+        eprintln!("⚠️ Sortie MIDI absente (FluidSynth redémarré ?) — reconnexion automatique…");
+        *guard = init_midi().map(|(handle, port)| MidiLink { handle, port });
     }
-    // Première tentative : si la connexion existe et envoie OK → c'est parti
-    {
-        let Some(handle) = guard.as_ref() else { return false; };
-        let Ok(mut conn) = handle.lock() else { return false; };
-        if conn.send(msg).is_ok() {
-            return true;
-        }
-    } // `conn` est droppé ici → `guard` peut être remplacé ensuite
-    // Connexion morte → remplacer et réessayer une fois
-    eprintln!("⚠️ Connexion MIDI morte — reconnexion automatique…");
-    *guard = init_midi();
-    let Some(handle2) = guard.as_ref() else { return false; };
-    let Ok(mut conn2) = handle2.lock() else { return false; };
-    conn2.send(msg).is_ok()
+
+    let Some(link) = guard.as_ref() else { return false; };
+    let Ok(mut conn) = link.handle.lock() else { return false; };
+    conn.send(msg).is_ok()
 }
 
 // ─── Signature ──────────────────────────────────────────────────────────
@@ -436,8 +457,10 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
     };
 
     // ── Lancer le thread audio ──────────────────────────────────
-    let h = s.midi.lock().unwrap().clone(); // Option<MidiHandle>
-    if let Some(h2) = h {
+    let link = s.midi.lock().unwrap().clone(); // Option<MidiLink>
+    if let Some(link) = link {
+        let h2 = link.handle;
+
         // Lancer la boucle WAV (si active) AVANT la séquence MIDI
         let tempo_now = lv.tempo.load(std::sync::atomic::Ordering::Relaxed);
         let loop_active = lv.use_loops.load(std::sync::atomic::Ordering::Relaxed);
@@ -520,9 +543,9 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
     if let Some(u) = b.use432 {
         let was = lv.use432.swap(u, std::sync::atomic::Ordering::Relaxed);
         if was != u {
-            let h = s.midi.lock().unwrap().clone();
-            if let Some(h) = h {
-                if let Ok(mut c) = h.lock() {
+            let link = s.midi.lock().unwrap().clone();
+            if let Some(link) = link {
+                if let Ok(mut c) = link.handle.lock() {
                     for &ch in &[0u8, 2, 3, 4] {
                         pb(&mut c, ch, if u { 6881 } else { 8192 });
                     }
@@ -557,9 +580,9 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
 async fn stop(State(s): State<AppState>) -> impl IntoResponse {
     s.live.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     samples::stop_loop();
-    let h = s.midi.lock().unwrap().clone();
-    if let Some(h) = h {
-        if let Ok(mut c) = h.lock() {
+    let link = s.midi.lock().unwrap().clone();
+    if let Some(link) = link {
+        if let Ok(mut c) = link.handle.lock() {
             rch(&mut c); // All Notes Off sur tous les canaux
         }
     }
@@ -770,7 +793,7 @@ async fn main() {
     let soundfont = find_soundfont();
 
     // Initialisation MIDI
-    let midi = Arc::new(Mutex::new(init_midi()));
+    let midi = Arc::new(Mutex::new(init_midi().map(|(handle, port)| MidiLink { handle, port })));
     samples::init();
 
     use patterns::PAT_ROCK;

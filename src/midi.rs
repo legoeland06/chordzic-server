@@ -136,7 +136,10 @@ pub fn notes_from_vec(notes: &[String]) -> Vec<u8> {
 /// Affiche la liste des ports disponibles au démarrage.
 ///
 /// Retourne `None` si aucun port n'est disponible.
-pub fn init_midi() -> Option<MidiHandle> {
+/// Retourne le handle ET le nom du port connecté (le nom contient le PID du
+/// client ALSA → permet de détecter la disparition du port : FluidSynth
+/// redémarré change de nom, la connexion devient muette).
+pub fn init_midi() -> Option<(MidiHandle, String)> {
     let mo = MidiOutput::new("chords-server-rs").ok()?;
     let p = mo.ports();
     if p.is_empty() {
@@ -188,8 +191,10 @@ pub fn init_midi() -> Option<MidiHandle> {
         eprintln!("Port MIDI {} invalide ({} ports disponibles)", i, p.len());
         return None;
     }
-    println!("✅ Connecté à MIDI : {}", mo.port_name(&p[i]).unwrap_or_default());
-    mo.connect(&p[i], "chords-server-rs").ok().map(|c| Arc::new(Mutex::new(c)))
+    let name = mo.port_name(&p[i]).unwrap_or_default();
+    println!("✅ Connecté à MIDI : {}", name);
+    mo.connect(&p[i], "chords-server-rs").ok()
+        .map(|c| (Arc::new(Mutex::new(c)), name))
 }
 
 // ─── Helpers MIDI ──────────────────────────────────────────────────────
