@@ -780,3 +780,70 @@ pub struct ChordEv {
     pub notes: Vec<String>,  // Noms de notes MIDI textuels ("C4", "F#3", etc.)
     pub beats: f64,          // Durée en temps (ex: 4.0 = noire, 2.0 = blanche)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live minimal pour les tests (pistes dynamiques).
+    fn live_with(tracks: Vec<LiveTrack>) -> Live {
+        Live {
+            tracks: Mutex::new(tracks),
+            pattern: AtomicU8::new(0),
+            tempo: AtomicU16::new(120),
+            stop: AtomicBool::new(false),
+            sig: AtomicU16::new(44),
+            walking: AtomicBool::new(false),
+            master_vol: AtomicU8::new(127),
+            use432: AtomicBool::new(false),
+            loop_offset: AtomicI32::new(0),
+            use_loops: AtomicBool::new(false),
+            loop_name: Mutex::new(String::new()),
+            loop_volume: AtomicU8::new(80),
+        }
+    }
+
+    #[test]
+    fn test_apply_tracks_ajoute_et_mute() {
+        let lc = live_with(vec![LiveTrack::new(0, 51, 60)]);
+        // Config : seule la nouvelle piste canal 5 est active
+        apply_tracks(&lc, &[TrackCfg {
+            channel: 5, program: Some(80), volume: Some(90), mute: Some(false),
+        }]);
+        let tracks = lc.tracks.lock().unwrap();
+        assert_eq!(tracks.len(), 2, "la nouvelle piste doit être ajoutée");
+        let t0 = tracks.iter().find(|t| t.channel == 0).unwrap();
+        assert!(t0.mute.load(Ordering::Relaxed), "piste absente de la config → mutée");
+        let t5 = tracks.iter().find(|t| t.channel == 5).unwrap();
+        assert_eq!(t5.program.load(Ordering::Relaxed), 80);
+        assert_eq!(t5.volume.load(Ordering::Relaxed), 90);
+        assert!(!t5.mute.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_apply_tracks_reactive_une_piste_supprimee() {
+        let lc = live_with(vec![LiveTrack::new(2, 33, 70), LiveTrack::new(9, 1, 90)]);
+        // On réactive le canal 2 avec un nouveau volume
+        apply_tracks(&lc, &[TrackCfg {
+            channel: 2, program: Some(40), volume: Some(55), mute: Some(false),
+        }]);
+        let tracks = lc.tracks.lock().unwrap();
+        let t2 = tracks.iter().find(|t| t.channel == 2).unwrap();
+        assert_eq!(t2.program.load(Ordering::Relaxed), 40);
+        assert_eq!(t2.volume.load(Ordering::Relaxed), 55);
+        assert!(!t2.mute.load(Ordering::Relaxed));
+        let t9 = tracks.iter().find(|t| t.channel == 9).unwrap();
+        assert!(t9.mute.load(Ordering::Relaxed), "canal 9 absent → muet");
+    }
+
+    #[test]
+    fn test_apply_tracks_mise_a_jour_sans_duplication() {
+        let lc = live_with(vec![LiveTrack::new(0, 51, 60)]);
+        apply_tracks(&lc, &[TrackCfg {
+            channel: 0, program: Some(10), volume: None, mute: None,
+        }]);
+        let tracks = lc.tracks.lock().unwrap();
+        assert_eq!(tracks.len(), 1, "mise à jour sans duplication");
+        assert_eq!(tracks[0].program.load(Ordering::Relaxed), 10);
+    }
+}

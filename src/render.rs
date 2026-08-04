@@ -241,11 +241,15 @@ pub fn generate_notes(
     let drums_cfg = cfg.tracks.iter().find(|t| t.channel == CH_DRUMS);
     let acc_cfg = cfg.tracks.iter().find(|t| t.channel == CH_ACC);
 
-    let lead_mute = lead_cfg.map_or(false, |t| t.mute);
-    let bass_mute = bass_cfg.map_or(false, |t| t.mute);
-    let str_mute = str_cfg.map_or(false, |t| t.mute);
-    let drums_mute = drums_cfg.map_or(false, |t| t.mute);
-    let acc_mute = acc_cfg.map_or(false, |t| t.mute);
+    // Canal ABSENT de la config = piste supprimée côté utilisateur → MUET.
+    // (map_or(true) : absence = muet. L'ancien map_or(false) laissait jouer
+    // la piste par défaut — inoffensif tant que le frontend envoyait toujours
+    // les 5 canaux, mais faux avec des pistes dynamiques.)
+    let lead_mute = lead_cfg.map_or(true, |t| t.mute);
+    let bass_mute = bass_cfg.map_or(true, |t| t.mute);
+    let str_mute = str_cfg.map_or(true, |t| t.mute);
+    let drums_mute = drums_cfg.map_or(true, |t| t.mute);
+    let acc_mute = acc_cfg.map_or(true, |t| t.mute);
 
     let lead_vol = lead_cfg.map_or(80, |t| t.volume);
     let bass_vol = bass_cfg.map_or(90, |t| t.volume);
