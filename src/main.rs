@@ -240,6 +240,7 @@ fn midi_send(state: &AppState, msg: &[u8]) -> bool {
         }
     } // `conn` est droppé ici → `guard` peut être remplacé ensuite
     // Connexion morte → remplacer et réessayer une fois
+    eprintln!("⚠️ Connexion MIDI morte — reconnexion automatique…");
     *guard = init_midi();
     let Some(handle2) = guard.as_ref() else { return false; };
     let Ok(mut conn2) = handle2.lock() else { return false; };
