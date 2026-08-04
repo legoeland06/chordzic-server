@@ -49,7 +49,7 @@ use tower_http::cors::CorsLayer;
 use patterns::pat;
 use midi::{
     apply_tracks, init_midi, note_midi, play_seq, play_notes, rch, pb, ChordEv, Live, LiveTrack,
-    MidiHandle, TrackCfg as MidiTrackCfg, TRACK_BASS, TRACK_DRUMS, TRACK_LEAD, TRACK_STR,
+    MidiHandle, TrackCfg as MidiTrackCfg,
 };
 
 // ─── Frontend embarqué (mode standalone) ────────────────────────────────
@@ -438,11 +438,20 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
 
     // Si pas de tracks, utiliser les flags simples (drums, bass, arps, nappes)
     if b.tracks.is_none() {
-        lv.tracks[TRACK_LEAD].program.store(b.inst_val, std::sync::atomic::Ordering::Relaxed);
-        lv.tracks[TRACK_LEAD].mute.store(!b.arps, std::sync::atomic::Ordering::Relaxed);
-        lv.tracks[TRACK_BASS].mute.store(!b.bass, std::sync::atomic::Ordering::Relaxed);
-        lv.tracks[TRACK_STR].mute.store(!b.nappes, std::sync::atomic::Ordering::Relaxed);
-        lv.tracks[TRACK_DRUMS].mute.store(!b.drums, std::sync::atomic::Ordering::Relaxed);
+        let mut tracks = lv.tracks.lock().unwrap();
+        if let Some(t) = tracks.iter_mut().find(|t| t.channel == 0) {
+            t.program.store(b.inst_val, std::sync::atomic::Ordering::Relaxed);
+            t.mute.store(!b.arps, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(t) = tracks.iter_mut().find(|t| t.channel == 2) {
+            t.mute.store(!b.bass, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(t) = tracks.iter_mut().find(|t| t.channel == 3) {
+            t.mute.store(!b.nappes, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(t) = tracks.iter_mut().find(|t| t.channel == 9) {
+            t.mute.store(!b.drums, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     let do_loop = b.loop_enabled.unwrap_or(false);
@@ -507,16 +516,24 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
     }
 
     if let Some(v) = b.drums {
-        lv.tracks[TRACK_DRUMS].mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = lv.tracks.lock().unwrap().iter_mut().find(|t| t.channel == 9) {
+            t.mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if let Some(v) = b.bass {
-        lv.tracks[TRACK_BASS].mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = lv.tracks.lock().unwrap().iter_mut().find(|t| t.channel == 2) {
+            t.mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if let Some(v) = b.arpeggios {
-        lv.tracks[TRACK_LEAD].mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = lv.tracks.lock().unwrap().iter_mut().find(|t| t.channel == 0) {
+            t.mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if let Some(v) = b.nappes {
-        lv.tracks[TRACK_STR].mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = lv.tracks.lock().unwrap().iter_mut().find(|t| t.channel == 3) {
+            t.mute.store(!v, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     if let Some(ref p) = b.pattern {
@@ -530,7 +547,9 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
         lv.sig.store(sig_code(sg), std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(iv) = b.instrument {
-        lv.tracks[TRACK_LEAD].program.store(iv, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = lv.tracks.lock().unwrap().iter_mut().find(|t| t.channel == 0) {
+            t.program.store(iv, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     if let Some(w) = b.walking {
         lv.walking.store(w, std::sync::atomic::Ordering::Relaxed);
@@ -608,23 +627,26 @@ fn render_inputs(b: &PlayReq) -> (Vec<Vec<u8>>, Vec<f64>, render::RenderCfg) {
         beats.push(e.beats);
     }
 
-    let mut tracks_cfg: [render::TrackCfg; 5] = [
-        render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps },
-        render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass },
-        render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes },
-        render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums },
-        render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false },
-    ];
-
-    if let Some(ref tcfg) = b.tracks {
-        for tc in tcfg {
-            if let Some(t) = tracks_cfg.iter_mut().find(|t| t.channel == tc.channel) {
-                t.program = tc.program.unwrap_or(t.program);
-                t.volume = tc.volume.unwrap_or(t.volume);
-                t.mute = tc.mute.unwrap_or(t.mute);
-            }
-        }
-    }
+    let tracks_cfg: Vec<render::TrackCfg> = if let Some(ref tcfg) = b.tracks {
+        // Liste EXACTE des pistes actives envoyée par le frontend (dynamique :
+        // ajout/suppression de pistes). Les canaux absents sont traités comme
+        // muets par generate_notes (lookup `map_or(false)`).
+        tcfg.iter().map(|tc| render::TrackCfg {
+            channel: tc.channel,
+            program: tc.program.unwrap_or(0),
+            volume: tc.volume.unwrap_or(100),
+            mute: tc.mute.unwrap_or(false),
+        }).collect()
+    } else {
+        // Anciens clients / API directe : 5 rôles par défaut avec flags simples
+        vec![
+            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps },
+            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass },
+            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes },
+            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums },
+            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false },
+        ]
+    };
 
     let rcfg = render::RenderCfg {
         tempo: b.tempo,
@@ -669,7 +691,8 @@ struct NoteReq {
 }
 
 async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoResponse {
-    let prog = s.live.tracks.iter()
+    let prog = s.live.tracks.lock().unwrap()
+        .iter()
         .find(|t| t.channel == b.channel)
         .map(|t| t.program.load(std::sync::atomic::Ordering::Relaxed));
     let ch = b.channel;
@@ -804,13 +827,13 @@ async fn main() {
         midi,
         soundfont,
         live: Arc::new(Live {
-            tracks: [
+            tracks: Mutex::new(vec![
                 LiveTrack::new(0, 51, 60),
                 LiveTrack::new(2, 33, 70),
                 LiveTrack::new(3, 48, 60),
                 LiveTrack::new(9, 1, 90),
                 LiveTrack::new(4, 2, 50),
-            ],
+            ]),
             pattern: AtomicU8::new(PAT_ROCK),
             tempo: AtomicU16::new(120),
             stop: AtomicBool::new(false),

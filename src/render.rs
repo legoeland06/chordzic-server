@@ -75,7 +75,7 @@ pub struct RenderCfg {
     pub walking: bool,              // Walking bass activée ?
     pub sig: String,                // Signature rythmique, ex "4/4"
     pub lead_inst: u16,             // Program MIDI pour le lead
-    pub tracks: [TrackCfg; 5],      // Configuration des 5 pistes
+    pub tracks: Vec<TrackCfg>,      // Configuration des pistes (DYNAMIQUE : ajout/suppression)
 }
 
 /// Configuration d'une piste pour le render.
@@ -92,7 +92,7 @@ impl Default for RenderCfg {
     fn default() -> Self {
         Self {
             tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
-            tracks: [
+            tracks: vec![
                 TrackCfg { channel: 0, program: 51, volume: 60, mute: false },
                 TrackCfg { channel: 2, program: 33, volume: 70, mute: false },
                 TrackCfg { channel: 3, program: 48, volume: 60, mute: false },

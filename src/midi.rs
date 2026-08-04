@@ -26,13 +26,11 @@ use crate::walking::{generate_walking_bass, is_minor, MIN_NOTE};
 /// Handle MIDI partagé entre threads — wrapping atomique de la connection midir.
 pub type MidiHandle = Arc<Mutex<MidiOutputConnection>>;
 
-// ─── Index des pistes dans Live.tracks ──────────────────────────────────
-// Ces constantes définissent l'ordre des 5 pistes MIDI dans le tableau.
-pub const TRACK_LEAD: usize = 0;   // Canal 0 — lead / mélodie (skank)
-pub const TRACK_BASS: usize = 1;   // Canal 2 — basse (walking ou tenue)
-pub const TRACK_STR: usize = 2;    // Canal 3 — nappes (strings/pad)
-pub const TRACK_DRUMS: usize = 3;  // Canal 9 — batterie (GM drums)
-pub const TRACK_ACCENT: usize = 4; // Canal 4 — accent 2&4 (Bright Acoustic Piano)
+// ─── Rôles des pistes (identifiés par canal MIDI) ─────────────────────
+// Les rôles classiques sont sur les canaux 0 (lead), 2 (bass), 3 (nappes),
+// 9 (drums) et 4 (accent). Les pistes sont DYNAMIQUES : l'utilisateur peut
+// ajouter/supprimer des pistes — un rôle absent est simplement muet
+// (lookup par canal dans play_seq / generate_notes).
 
 /// Configuration mutable d'une piste MIDI.
 /// Chaque champ est atomique pour permettre la modification depuis
@@ -61,7 +59,11 @@ impl LiveTrack {
 /// Tous les champs sont atomiques ou Mutex pour un accès thread-safe
 /// sans contention significative.
 pub struct Live {
-    pub tracks: [LiveTrack; 5],           // 5 pistes MIDI
+    /// Pistes MIDI — DYNAMIQUE : l'utilisateur peut ajouter/supprimer des
+    /// pistes (chaque piste = un canal MIDI avec instrument, volume, mute).
+    /// Mutex : modifiable depuis les handlers HTTP (ajout/suppression),
+    /// lu une fois au début de play_seq (références gardées sous le guard).
+    pub tracks: Mutex<Vec<LiveTrack>>,
     pub pattern: AtomicU8,                // Pattern de batterie (PAT_ROCK, etc.)
     pub tempo: AtomicU16,                 // BPM actuel
     pub stop: AtomicBool,                 // Flag d'arrêt — thread audio vérifie à chaque beat
@@ -425,8 +427,8 @@ pub fn play_notes(c: &mut MidiOutputConnection, notes: &[String], mv: u8) {
 
 /// Initialise les pistes en envoyant les Program Change sur chaque canal.
 /// Le canal drums (9) utilise le kit par défaut (program 1 = Standard Kit).
-fn setup_tracks(c: &mut MidiOutputConnection, lc: &Live) {
-    for t in &lc.tracks {
+fn setup_tracks(c: &mut MidiOutputConnection, tracks: &[LiveTrack]) {
+    for t in tracks {
         let ch = t.channel;
         if ch == 9 {
             // Drums : program 1 = Standard Kit (toujours)
@@ -440,14 +442,38 @@ fn setup_tracks(c: &mut MidiOutputConnection, lc: &Live) {
 // ─── Apply tracks ───────────────────────────────────────────────────────
 
 /// Applique une configuration externe (depuis le frontend) aux pistes live.
-/// Met à jour program, volume et mute pour chaque piste dont le channel
-/// correspond à l'entrée dans `cfg`.
+///
+/// Règles (pistes dynamiques) :
+/// - Canal déjà présent → met à jour program/volume/mute (champs Option).
+/// - Canal inconnu → la piste est AJOUTÉE (nouvelle piste instrument).
+/// - Canal existant ABSENT de la config → MUTÉ (piste supprimée côté UI :
+///   le frontend envoie la liste exacte des pistes actives).
 pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
+    let mut tracks = lc.tracks.lock().unwrap();
     for tc in cfg {
-        if let Some(i) = lc.tracks.iter().position(|t| t.channel == tc.channel) {
-            if let Some(p) = tc.program { lc.tracks[i].program.store(p, Ordering::Relaxed); }
-            if let Some(v) = tc.volume { lc.tracks[i].volume.store(v, Ordering::Relaxed); }
-            if let Some(m) = tc.mute { lc.tracks[i].mute.store(m, Ordering::Relaxed); }
+        match tracks.iter_mut().find(|t| t.channel == tc.channel) {
+            Some(t) => {
+                if let Some(p) = tc.program { t.program.store(p, Ordering::Relaxed); }
+                if let Some(v) = tc.volume { t.volume.store(v, Ordering::Relaxed); }
+                if let Some(m) = tc.mute { t.mute.store(m, Ordering::Relaxed); }
+            }
+            None => {
+                // Nouvelle piste → l'ajouter (défauts : program 0, vol 100)
+                let nt = LiveTrack::new(
+                    tc.channel,
+                    tc.program.unwrap_or(0),
+                    tc.volume.unwrap_or(100),
+                );
+                if let Some(m) = tc.mute { nt.mute.store(m, Ordering::Relaxed); }
+                tracks.push(nt);
+            }
+        }
+    }
+    // Muter les pistes existantes absentes de la nouvelle config
+    let active: Vec<u8> = cfg.iter().map(|tc| tc.channel).collect();
+    for t in tracks.iter_mut() {
+        if !active.contains(&t.channel) {
+            t.mute.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -486,7 +512,12 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
     'outer: loop {
         // Reset : coupe toutes les notes, initialise les programmes
         rch(c);
-        setup_tracks(c, lc);
+        // Verrouiller les pistes pour TOUTE la séquence : les références
+        // ci-dessous restent valides tant que le guard est vivant. Les
+        // handlers HTTP (apply_tracks) attendent la fin de l'itération
+        // courante → pas de deadlock.
+        let tracks = lc.tracks.lock().unwrap();
+        setup_tracks(c, &tracks);
         std::thread::sleep(Duration::from_millis(2));
 
         // Buffers de notes pour couper les notes précédentes avant
@@ -495,16 +526,25 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
         let mut prev_lead: Vec<u8> = vec![];
         let mut prev_accent: Vec<u8> = vec![];
 
-        // Références vers les pistes pour un accès plus lisible
-        let t_lead = &lc.tracks[TRACK_LEAD];
-        let t_bass = &lc.tracks[TRACK_BASS];
-        let t_str = &lc.tracks[TRACK_STR];
-        let t_drums = &lc.tracks[TRACK_DRUMS];
-        let ch_lead = t_lead.channel;
-        let ch_bass = t_bass.channel;
-        let ch_str = t_str.channel;
-        let t_accent = &lc.tracks[TRACK_ACCENT];
-        let ch_accent = t_accent.channel;
+        // Rôles par CANAL (lookup dynamique) : une piste absente = muette.
+        // Le moteur supporte ainsi l'ajout/suppression de pistes sans
+        // hypothèse sur un nombre fixe.
+        let t_lead = tracks.iter().find(|t| t.channel == 0);
+        let t_bass = tracks.iter().find(|t| t.channel == 2);
+        let t_str = tracks.iter().find(|t| t.channel == 3);
+        let t_drums = tracks.iter().find(|t| t.channel == 9);
+        let t_accent = tracks.iter().find(|t| t.channel == 4);
+        let (ch_lead, ch_bass, ch_str, ch_accent) = (0u8, 2u8, 3u8, 4u8);
+        let lead_mute = t_lead.map_or(true, |t| t.mute.load(Ordering::Relaxed));
+        let bass_mute = t_bass.map_or(true, |t| t.mute.load(Ordering::Relaxed));
+        let str_mute = t_str.map_or(true, |t| t.mute.load(Ordering::Relaxed));
+        let drums_mute = t_drums.map_or(true, |t| t.mute.load(Ordering::Relaxed));
+        let accent_mute = t_accent.map_or(true, |t| t.mute.load(Ordering::Relaxed));
+        let vol_lead = t_lead.map(|t| t.volume.load(Ordering::Relaxed)).unwrap_or(0);
+        let vol_bass = t_bass.map(|t| t.volume.load(Ordering::Relaxed)).unwrap_or(0);
+        let vol_str = t_str.map(|t| t.volume.load(Ordering::Relaxed)).unwrap_or(0);
+        let vol_drums = t_drums.map(|t| t.volume.load(Ordering::Relaxed)).unwrap_or(0);
+        let vol_accent = t_accent.map(|t| t.volume.load(Ordering::Relaxed)).unwrap_or(0);
 
         let walking = lc.walking.load(Ordering::Relaxed);
         let mv = lc.master_vol.load(Ordering::Relaxed);
@@ -587,8 +627,8 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
             }
 
             // ── Jouer la première note de basse ─────────────────
-            if !t_bass.mute.load(Ordering::Relaxed) {
-                let bvol = sc(t_bass.volume.load(Ordering::Relaxed), mv);
+            if !bass_mute {
+                let bvol = sc(vol_bass, mv);
                 let bass_note = if walking { walking_notes[0] } else { root };
                 no_mv(c, ch_bass, bass_note, bvol, mv);
                 prev_bass_note = bass_note;
@@ -601,10 +641,10 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
             let pat = lc.pattern.load(Ordering::Relaxed);
             let short_chord = e.beats <= 1.0;
             let skip_nappe = pat == PAT_REGGAE && !short_chord;
-            if !t_str.mute.load(Ordering::Relaxed) && !skip_nappe {
+            if !str_mute && !skip_nappe {
                 // Couper les nappes précédentes (Note Off = vélocité 0)
                 for n in &prev_nappe { no(c, ch_str, *n, 0); }
-                let str_vol = sc(t_str.volume.load(Ordering::Relaxed), mv);
+                let str_vol = sc(vol_str, mv);
                 // Jouer toutes les chord tones en simultané (effet nappe)
                 for n in &nappe_notes { no_mv(c, ch_str, *n, str_vol, mv); }
                 prev_nappe = nappe_notes.clone();
@@ -627,24 +667,24 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 let beat = (elapsed_ms / bd_ms) as u64;
 
                 // ── Drums (sur le temps) ─────────────────
-                if !t_drums.mute.load(Ordering::Relaxed) {
+                if !drums_mute {
                     if last_b_drums == u64::MAX || beat > last_b_drums {
-                        let dvol = sc(t_drums.volume.load(Ordering::Relaxed), mv);
+                        let dvol = sc(vol_drums, mv);
                         drum_hit(c, beat, pt, true, false, bars, dvol, 127);
                         last_b_drums = beat;
                     }
                     // Drums (sur le contretemps)
                     let beat_pos = elapsed_ms % bd_ms;
                     if beat_pos > bd_ms / 2.0 - 10.0 && beat_pos < bd_ms / 2.0 + 10.0 {
-                        let dvol = sc(t_drums.volume.load(Ordering::Relaxed), mv);
+                        let dvol = sc(vol_drums, mv);
                         drum_hit(c, beat, pt, false, true, bars, dvol, 127);
                     }
                 }
 
                 // ── Basse (1 note par temps) ────────────
-                if !t_bass.mute.load(Ordering::Relaxed) {
+                if !bass_mute {
                     if beat > last_b_bass {
-                        let bvol = sc(t_bass.volume.load(Ordering::Relaxed), mv);
+                        let bvol = sc(vol_bass, mv);
                         let bass_note = if walking {
                             let bi = (beat % 4) as usize;
                             walking_notes[bi]
@@ -662,7 +702,6 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 // ── Lead (pompe skank) ──────────────────
                 // Staccato sur contretemps : on au 3/4 de temps, off au 1/4 suivant
                 if !m.is_empty() {
-                    let lead_mute = t_lead.mute.load(Ordering::Relaxed);
                     // Note Off des notes précédentes (à idx=3, soit 3/4 du pas)
                     if idx % 4 == 3 && !prev_lead.is_empty() {
                         for &n in &prev_lead { no(c, ch_lead, n, 0); }
@@ -670,7 +709,7 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                     }
                     // Note On sur contretemps (à idx=2, soit 2/4 = 1/2 pas)
                     if idx % 4 == 2 && !lead_mute {
-                        let lvol = sc(t_lead.volume.load(Ordering::Relaxed), mv);
+                        let lvol = sc(vol_lead, mv);
                         prev_lead = m.clone();
                         for &note in &m { no_mv(c, ch_lead, note, lvol, mv); }
                     }
@@ -680,7 +719,6 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 // Seulement pour les accords de plus d'1 temps (pas sur
                 // les 4:, 8:, 16: qui sont trop courts pour un backbeat).
                 if !m.is_empty() && e.beats > 1.0 {
-                    let accent_mute = t_accent.mute.load(Ordering::Relaxed);
                     // Note Off (à idx=5)
                     if idx % 8 == 5 && !prev_accent.is_empty() {
                         for &n in &prev_accent { no(c, ch_accent, n, 0); }
@@ -688,7 +726,7 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                     }
                     // Note On sur temps 2 ou 4 (à idx=4)
                     if idx % 8 == 4 && !accent_mute {
-                        let avol = sc(t_accent.volume.load(Ordering::Relaxed), mv);
+                        let avol = sc(vol_accent, mv);
                         prev_accent = m.clone();
                         for &note in &m { no_mv(c, ch_accent, note, avol, mv); }
                     }
