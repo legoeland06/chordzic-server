@@ -40,6 +40,10 @@ pub struct LiveTrack {
     pub program: AtomicU16,       // Program change (instrument GM)
     pub volume: AtomicU8,         // Volume de la piste (0-127)
     pub mute: AtomicBool,         // Mute — si true, la piste ne joue pas
+    /// Reverb send (CC91) appliqué en live. 0-100.
+    pub fx_reverb: AtomicU8,
+    /// Chorus send (CC93) appliqué en live. 0-100.
+    pub fx_chorus: AtomicU8,
 }
 
 impl LiveTrack {
@@ -49,6 +53,8 @@ impl LiveTrack {
             program: AtomicU16::new(pg),
             volume: AtomicU8::new(vol),
             mute: AtomicBool::new(false),
+            fx_reverb: AtomicU8::new(0),
+            fx_chorus: AtomicU8::new(0),
         }
     }
 }
@@ -427,15 +433,19 @@ pub fn play_notes(c: &mut MidiOutputConnection, notes: &[String], mv: u8) {
 
 /// Initialise les pistes en envoyant les Program Change sur chaque canal.
 /// Le canal drums (9) utilise le kit par défaut (program 1 = Standard Kit).
+/// Applique aussi les sends d'effets live (CC91 reverb, CC93 chorus).
 fn setup_tracks(c: &mut MidiOutputConnection, tracks: &[LiveTrack]) {
     for t in tracks {
         let ch = t.channel;
         if ch == 9 {
             // Drums : program 1 = Standard Kit (toujours)
             pc(c, ch, 1);
-            continue;
+        } else {
+            pc(c, ch, t.program.load(Ordering::Relaxed) as u8);
         }
-        pc(c, ch, t.program.load(Ordering::Relaxed) as u8);
+        // Sends d'effets (FluidSynth les applique en live)
+        cc(c, ch, 91, t.fx_reverb.load(Ordering::Relaxed));
+        cc(c, ch, 93, t.fx_chorus.load(Ordering::Relaxed));
     }
 }
 
@@ -456,6 +466,10 @@ pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
                 if let Some(p) = tc.program { t.program.store(p, Ordering::Relaxed); }
                 if let Some(v) = tc.volume { t.volume.store(v, Ordering::Relaxed); }
                 if let Some(m) = tc.mute { t.mute.store(m, Ordering::Relaxed); }
+                if let Some(fx) = tc.effects {
+                    t.fx_reverb.store(fx.reverb, Ordering::Relaxed);
+                    t.fx_chorus.store(fx.chorus, Ordering::Relaxed);
+                }
             }
             None => {
                 // Nouvelle piste → l'ajouter (défauts : program 0, vol 100)
@@ -465,6 +479,10 @@ pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
                     tc.volume.unwrap_or(100),
                 );
                 if let Some(m) = tc.mute { nt.mute.store(m, Ordering::Relaxed); }
+                if let Some(fx) = tc.effects {
+                    nt.fx_reverb.store(fx.reverb, Ordering::Relaxed);
+                    nt.fx_chorus.store(fx.chorus, Ordering::Relaxed);
+                }
                 tracks.push(nt);
             }
         }
@@ -764,6 +782,8 @@ pub struct TrackCfg {
     pub program: Option<u16>,       // Nouveau program (None = ne pas changer)
     pub volume: Option<u8>,         // Nouveau volume (None = ne pas changer)
     pub mute: Option<bool>,         // Nouvel état mute (None = ne pas changer)
+    /// Effets (reverb/chorus appliqués en live via CC MIDI 91/93).
+    pub effects: Option<crate::dsp::Fx>,
 }
 
 // ─── ChordEv (partagé avec main.rs) ──────────────────────────────────────
@@ -809,6 +829,7 @@ mod tests {
         // Config : seule la nouvelle piste canal 5 est active
         apply_tracks(&lc, &[TrackCfg {
             channel: 5, program: Some(80), volume: Some(90), mute: Some(false),
+            effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
         assert_eq!(tracks.len(), 2, "la nouvelle piste doit être ajoutée");
@@ -826,6 +847,7 @@ mod tests {
         // On réactive le canal 2 avec un nouveau volume
         apply_tracks(&lc, &[TrackCfg {
             channel: 2, program: Some(40), volume: Some(55), mute: Some(false),
+            effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
         let t2 = tracks.iter().find(|t| t.channel == 2).unwrap();
@@ -841,6 +863,7 @@ mod tests {
         let lc = live_with(vec![LiveTrack::new(0, 51, 60)]);
         apply_tracks(&lc, &[TrackCfg {
             channel: 0, program: Some(10), volume: None, mute: None,
+            effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
         assert_eq!(tracks.len(), 1, "mise à jour sans duplication");

@@ -25,6 +25,7 @@
 /// - `samples`  : gestion des boucles WAV drums (rodio)
 /// - `walking`  : génération de walking bass
 /// - `grilles`  : sauvegarde/chargement des grilles en JSON
+mod dsp;
 mod grilles;
 mod midi;
 mod patterns;
@@ -636,15 +637,16 @@ fn render_inputs(b: &PlayReq) -> (Vec<Vec<u8>>, Vec<f64>, render::RenderCfg) {
             program: tc.program.unwrap_or(0),
             volume: tc.volume.unwrap_or(100),
             mute: tc.mute.unwrap_or(false),
+            fx: tc.effects.unwrap_or_default(),
         }).collect()
     } else {
         // Anciens clients / API directe : 5 rôles par défaut avec flags simples
         vec![
-            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps },
-            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass },
-            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes },
-            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums },
-            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false },
+            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps, fx: Default::default() },
+            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass, fx: Default::default() },
+            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes, fx: Default::default() },
+            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums, fx: Default::default() },
+            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false, fx: Default::default() },
         ]
     };
 
@@ -740,7 +742,7 @@ async fn render_wav(
     // ── Choix du mode de rendu ─────────────────────────────
     // Si des notes personnalisées (PianoRoll) sont fournies, on les
     // utilise directement. Sinon, rendu classique par accord.
-    let (smf, total_beats) = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
+    let (smf, total_beats, all_notes) = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
         // Canaux en mode PianoRoll : même sans notes (pianoRoll vidé) → muets
         let custom_channels: std::collections::HashSet<u8> = b.custom_channels.iter()
             .copied()
@@ -775,11 +777,12 @@ async fn render_wav(
         let tb = merged.iter()
             .map(|n| n.start_time + n.duration)
             .fold(0.0, f64::max);
-        (smf, tb)
+        (smf, tb, merged)
     } else {
         let smf = render::generate_smf_fmt0(&notes_arrays, &beats, &rcfg);
         let tb = beats.iter().sum();
-        (smf, tb)
+        let classic = render::generate_notes(&notes_arrays, &beats, &rcfg);
+        (smf, tb, classic)
     };
 
     // Utiliser la SoundFont détectée automatiquement
@@ -790,7 +793,15 @@ async fn render_wav(
     // Durée totale en secondes
     let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
 
-    match render::render_wav(&smf, sf_path, duration_sec, b.master_vol) {
+    // ── Rendu : simple (1 passe, rapide) ou par piste (si effets actifs) ──
+    let has_fx = rcfg.tracks.iter().any(|t| !t.fx.is_off());
+    let render_result = if has_fx {
+        render::render_wav_mixed(&all_notes, &rcfg, sf_path, duration_sec, b.master_vol)
+    } else {
+        render::render_wav(&smf, sf_path, duration_sec, b.master_vol)
+    };
+
+    match render_result {
         Ok(wav) => {
             let mut headers = HeaderMap::new();
             headers.insert(

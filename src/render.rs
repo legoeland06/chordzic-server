@@ -86,6 +86,7 @@ pub struct TrackCfg {
     pub program: u16,   // Program change (instrument GM)
     pub volume: u8,     // Volume (0-127)
     pub mute: bool,     // Mute — si true, la piste est silencieuse
+    pub fx: crate::dsp::Fx,  // Effets par piste (reverb/chorus/delay/drive)
 }
 
 impl Default for RenderCfg {
@@ -93,11 +94,11 @@ impl Default for RenderCfg {
         Self {
             tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
             tracks: vec![
-                TrackCfg { channel: 0, program: 51, volume: 60, mute: false },
-                TrackCfg { channel: 2, program: 33, volume: 70, mute: false },
-                TrackCfg { channel: 3, program: 48, volume: 60, mute: false },
-                TrackCfg { channel: 9, program: 1, volume: 90, mute: false },
-                TrackCfg { channel: 4, program: 2, volume: 50, mute: false },
+                TrackCfg { channel: 0, program: 51, volume: 60, mute: false, fx: Default::default() },
+                TrackCfg { channel: 2, program: 33, volume: 70, mute: false, fx: Default::default() },
+                TrackCfg { channel: 3, program: 48, volume: 60, mute: false, fx: Default::default() },
+                TrackCfg { channel: 9, program: 1, volume: 90, mute: false, fx: Default::default() },
+                TrackCfg { channel: 4, program: 2, volume: 50, mute: false, fx: Default::default() },
             ],
         }
     }
@@ -609,7 +610,8 @@ fn trim_to_duration(wav: &[u8], expected_sec: f64) -> Vec<u8> {
     if out.is_empty() { wav.to_vec() } else { out }
 }
 
-/// Lance FluidSynth en ligne de commande pour convertir un SMF en WAV.
+/// Lance FluidSynth en ligne de commande pour convertir un SMF en WAV
+/// (sans gain master ni fade : traitement du mix fait par l'appelant).
 ///
 /// # Pipeline
 /// 1. Écrit le SMF dans `/tmp/chordj_render.mid`
@@ -617,17 +619,7 @@ fn trim_to_duration(wav: &[u8], expected_sec: f64) -> Vec<u8> {
 /// 3. Lit le WAV produit
 /// 4. Nettoie les fichiers temporaires
 /// 5. Tronque le WAV à la durée exacte
-///
-/// # Paramètres
-/// - `smf` : contenu du fichier SMF (bytes)
-/// - `soundfont` : chemin vers le fichier .sf3 (SoundFont)
-/// - `duration_sec` : durée attendue en secondes (pour le trim)
-/// - `master_vol` : volume master (0-127), appliqué après normalisation
-///
-/// # Erreurs
-/// - Retourne `Err(String)` si FluidSynth n'est pas installé, si le SMF
-///   est invalide, ou si le fichier WAV ne peut pas être écrit/lu.
-pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8) -> Result<Vec<u8>, String> {
+pub fn render_wav_raw(smf: &[u8], soundfont: &str, duration_sec: f64) -> Result<Vec<u8>, String> {
     let mid_path = std::env::temp_dir().join("chordj_render.mid");
     let wav_path = std::env::temp_dir().join("chordj_render.wav");
 
@@ -671,15 +663,109 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8
     let _ = std::fs::remove_file(&mid_path);
     let _ = std::fs::remove_file(&wav_path);
 
-    // Étape 5 : tronquer à la durée exacte puis appliquer le gain master
-    // (gain LINÉAIRE : les volumes par piste et les mutes restent réels.
-    // L'ancienne normalisation au pic remontait tout mix faible au maximum
-    // → volumes par piste inaudibles, bruit de fond amplifié sur silence.)
-    let trimmed = trim_to_duration(&wav, duration_sec);
-    let normalized = apply_gain(&trimmed, master_vol);
-    // Étape 6 : micro fade-out (30 ms) — anti-clic à l'arrêt ; la boucle
-    // est rendue seamless par le crossfade côté navigateur.
+    // Étape 5 : tronquer à la durée exacte (le gain/fade sont appliqués
+    // par l'appelant : rendu unique → render_wav ; rendu par piste →
+    // render_wav_mixed après le mixage).
+    Ok(trim_to_duration(&wav, duration_sec))
+}
+
+/// Rendu simple (chemin historique) : SMF unique multi-canaux → WAV,
+/// puis gain master (×3 normalisé) et micro fade-out.
+pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8) -> Result<Vec<u8>, String> {
+    let raw = render_wav_raw(smf, soundfont, duration_sec)?;
+    let normalized = apply_gain(&raw, master_vol);
     Ok(fade_out_wav(&normalized, 30))
+}
+
+/// Rendu « par piste » : chaque piste active est rendue séparément
+/// (SMF mono-piste → FluidSynth → WAV), passe dans sa chaîne d'effets
+/// (dsp::apply_fx : overdrive → delay → chorus → reverb), puis les WAVs
+/// sont mixés (somme), normalisés au pic (~0.5) et le master volume est
+/// appliqué, avec fade-out final.
+///
+/// Les notes (`all_notes`) doivent être DÉJÀ scalées par volume de piste
+/// (fait en amont : generate_notes pour le classique, scaling custom).
+pub fn render_wav_mixed(
+    all_notes: &[CustomNote],
+    cfg: &RenderCfg,
+    soundfont: &str,
+    duration_sec: f64,
+    master_vol: u8,
+) -> Result<Vec<u8>, String> {
+    use hound::{WavReader, WavSpec, WavWriter, SampleFormat};
+
+    // Delay musical : une croche (0.5 beat) → 30000/tempo ms
+    let delay_ms = (30_000u32 / cfg.tempo.max(20)).max(1);
+    let tempo = cfg.tempo.max(20) as u16;
+
+    let mut mix_l: Option<Vec<f32>> = None;
+    let mut mix_r: Option<Vec<f32>> = None;
+
+    for t in cfg.tracks.iter().filter(|t| !t.mute) {
+        let notes: Vec<CustomNote> = all_notes
+            .iter()
+            .filter(|n| n.channel == t.channel)
+            .cloned()
+            .collect();
+        if notes.is_empty() {
+            continue;
+        }
+
+        // SMF de la piste seule (program change + notes du canal)
+        let smf = generate_smf_from_custom(&notes, std::slice::from_ref(t), tempo);
+        let wav = render_wav_raw(&smf, soundfont, duration_sec)?;
+
+        // Chaîne d'effets de la piste (si réglée)
+        let wav = if t.fx.is_off() { wav } else { crate::dsp::apply_fx(&wav, &t.fx, delay_ms) };
+
+        // Décoder et additionner au mix
+        let Ok(mut rd) = WavReader::new(std::io::Cursor::new(&wav)) else { continue; };
+        let ch = rd.spec().channels as usize;
+        let s: Vec<i16> = rd.samples::<i16>().filter_map(|x| x.ok()).collect();
+        let n = s.len() / ch.max(1);
+        if n == 0 { continue; }
+        if mix_l.is_none() {
+            mix_l = Some(vec![0f32; n]);
+            mix_r = Some(vec![0f32; n]);
+        }
+        if let (Some(ml), Some(mr)) = (mix_l.as_mut(), mix_r.as_mut()) {
+            let m = ml.len().min(n);
+            for i in 0..m {
+                ml[i] += s[i * ch] as f32 / 32768.0;
+                mr[i] += if ch > 1 { s[i * ch + 1] as f32 / 32768.0 } else { s[i * ch] as f32 / 32768.0 };
+            }
+        }
+    }
+
+    let (Some(ml), Some(mr)) = (mix_l, mix_r) else {
+        return Err("Aucune piste à rendre".into());
+    };
+
+    // Normalisation au pic (~0.5, -6 dBFS) → niveau stable quel que soit
+    // le nombre de pistes, puis gain du master volume.
+    let mut pic = 0f32;
+    for i in 0..ml.len() {
+        pic = pic.max(ml[i].abs()).max(mr[i].abs());
+    }
+    let norm = if pic > 1e-6 { 0.5 / pic } else { 1.0 };
+    let gain = norm * (master_vol as f32) / 127.0;
+
+    let spec = WavSpec {
+        channels: 2, sample_rate: 44100,
+        bits_per_sample: 16, sample_format: SampleFormat::Int,
+    };
+    let mut buf = Vec::new();
+    if let Ok(mut w) = WavWriter::new(std::io::Cursor::new(&mut buf), spec) {
+        for i in 0..ml.len() {
+            let _ = w.write_sample(((ml[i] * gain).clamp(-1.0, 1.0) * 32767.0) as i16);
+            let _ = w.write_sample(((mr[i] * gain).clamp(-1.0, 1.0) * 32767.0) as i16);
+        }
+        let _ = w.finalize();
+    }
+    if buf.is_empty() {
+        return Err("Écriture du WAV impossible".into());
+    }
+    Ok(fade_out_wav(&buf, 30))
 }
 
 // ─── Custom notes (PianoRoll) ──────────────────────────────────────────
