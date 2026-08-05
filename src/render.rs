@@ -86,6 +86,9 @@ pub struct TrackCfg {
     pub program: u16,   // Program change (instrument GM)
     pub volume: u8,     // Volume (0-127)
     pub mute: bool,     // Mute — si true, la piste est silencieuse
+    /// Piste percussion (kit drums) sur un canal ≠ 9 : programmée via la
+    /// banque percussion GM2 (bank select 128) + kit Standard (program 0).
+    pub drums: bool,
     pub fx: crate::dsp::Fx,  // Effets par piste (reverb/chorus/delay/drive)
 }
 
@@ -94,11 +97,11 @@ impl Default for RenderCfg {
         Self {
             tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
             tracks: vec![
-                TrackCfg { channel: 0, program: 51, volume: 60, mute: false, fx: Default::default() },
-                TrackCfg { channel: 2, program: 33, volume: 70, mute: false, fx: Default::default() },
-                TrackCfg { channel: 3, program: 48, volume: 60, mute: false, fx: Default::default() },
-                TrackCfg { channel: 9, program: 1, volume: 90, mute: false, fx: Default::default() },
-                TrackCfg { channel: 4, program: 2, volume: 50, mute: false, fx: Default::default() },
+                TrackCfg { channel: 0, program: 51, volume: 60, mute: false, drums: false, fx: Default::default() },
+                TrackCfg { channel: 2, program: 33, volume: 70, mute: false, drums: false, fx: Default::default() },
+                TrackCfg { channel: 3, program: 48, volume: 60, mute: false, drums: false, fx: Default::default() },
+                TrackCfg { channel: 9, program: 1, volume: 90, mute: false, drums: false, fx: Default::default() },
+                TrackCfg { channel: 4, program: 2, volume: 50, mute: false, drums: false, fx: Default::default() },
             ],
         }
     }
@@ -150,10 +153,17 @@ pub fn generate_smf_fmt0(
         (tempo_us & 0xFF) as u8]);
 
     // ── Program Changes initiaux ─────────────────────────────────
-    // Chaque piste reçoit son instrument GM au tick 0.
+    // Chaque piste reçoit son instrument GM au tick 0. Les pistes
+    // percussion (canal ≠ 9) reçoivent la banque percussion GM2
+    // (bank select 128) + le kit Standard (program 0).
     for tc in &cfg.tracks {
-        // 0xC0 | channel = Program Change, suivi du numéro de program
-        e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
+        if tc.drums && tc.channel != CH_DRUMS {
+            e(&mut evs, 0, &[0xB0 | tc.channel, 0, 128]);
+            e(&mut evs, 0, &[0xC0 | tc.channel, 0]);
+        } else {
+            // 0xC0 | channel = Program Change, suivi du numéro de program
+            e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
+        }
     }
     // Fallback : si CH_LEAD n'est pas dans tracks, envoyer cfg.lead_inst
     let has_lead = cfg.tracks.iter().any(|t| t.channel == CH_LEAD);
@@ -797,9 +807,15 @@ pub fn generate_smf_from_custom(
         ((tempo_us >> 8)  & 0xFF) as u8,
         (tempo_us & 0xFF) as u8]);
 
-    // Program changes pour chaque piste
+    // Program changes pour chaque piste (pistes percussion ≠ canal 9 :
+    // banque percussion GM2 + kit Standard)
     for tc in tracks {
-        e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
+        if tc.drums && tc.channel != CH_DRUMS {
+            e(&mut evs, 0, &[0xB0 | tc.channel, 0, 128]);
+            e(&mut evs, 0, &[0xC0 | tc.channel, 0]);
+        } else {
+            e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
+        }
     }
 
     // Appliquer les réglages de piste (mute) aux notes : une piste mutée

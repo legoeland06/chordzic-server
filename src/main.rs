@@ -637,16 +637,17 @@ fn render_inputs(b: &PlayReq) -> (Vec<Vec<u8>>, Vec<f64>, render::RenderCfg) {
             program: tc.program.unwrap_or(0),
             volume: tc.volume.unwrap_or(100),
             mute: tc.mute.unwrap_or(false),
+            drums: tc.drums.unwrap_or(false),
             fx: tc.effects.unwrap_or_default(),
         }).collect()
     } else {
         // Anciens clients / API directe : 5 rôles par défaut avec flags simples
         vec![
-            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps, fx: Default::default() },
-            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass, fx: Default::default() },
-            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes, fx: Default::default() },
-            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums, fx: Default::default() },
-            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false, fx: Default::default() },
+            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false, fx: Default::default(), drums: false },
         ]
     };
 
@@ -693,17 +694,28 @@ struct NoteReq {
 }
 
 async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoResponse {
-    let prog = s.live.tracks.lock().unwrap()
-        .iter()
-        .find(|t| t.channel == b.channel)
-        .map(|t| t.program.load(std::sync::atomic::Ordering::Relaxed));
+    let (prog, is_drum) = {
+        let tracks = s.live.tracks.lock().unwrap();
+        match tracks.iter().find(|t| t.channel == b.channel) {
+            Some(t) => (
+                Some(t.program.load(std::sync::atomic::Ordering::Relaxed)),
+                t.drums.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            None => (None, false),
+        }
+    };
     let ch = b.channel;
     let pitch = b.pitch;
     let vel = b.velocity.min(127);
     let dur = b.duration_ms.min(5000);
     std::thread::spawn(move || {
-        // Program change (sauf drums : kit fixe)
-        if let Some(p) = prog {
+        // Piste percussion ajoutée (canal ≠ 9) : banque percussion GM2 + kit
+        // Standard (testé avec FluidSynth). Drums canal 9 : kit fixe, rien.
+        if is_drum && ch != 9 {
+            midi_send(&s, &[0xB0 | ch, 0, 128]);
+            midi_send(&s, &[0xC0 | ch, 0]);
+        } else if let Some(p) = prog {
+            // Program change (sauf drums : kit fixe)
             if ch != 9 {
                 midi_send(&s, &[0xC0 | ch, p as u8]);
             }

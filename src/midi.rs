@@ -44,6 +44,9 @@ pub struct LiveTrack {
     pub fx_reverb: AtomicU8,
     /// Chorus send (CC93) appliqué en live. 0-100.
     pub fx_chorus: AtomicU8,
+    /// Piste percussion (kit drums) sur un canal ≠ 9 : programmée via la
+    /// banque percussion GM2 (bank select 128) + kit Standard (program 0).
+    pub drums: AtomicBool,
 }
 
 impl LiveTrack {
@@ -55,6 +58,7 @@ impl LiveTrack {
             mute: AtomicBool::new(false),
             fx_reverb: AtomicU8::new(0),
             fx_chorus: AtomicU8::new(0),
+            drums: AtomicBool::new(false),
         }
     }
 }
@@ -433,11 +437,18 @@ pub fn play_notes(c: &mut MidiOutputConnection, notes: &[String], mv: u8) {
 
 /// Initialise les pistes en envoyant les Program Change sur chaque canal.
 /// Le canal drums (9) utilise le kit par défaut (program 1 = Standard Kit).
+/// Les pistes percussion (flag drums) sur d'autres canaux sont programmées
+/// via la banque percussion GM2 (bank select 128) + kit Standard (program 0).
 /// Applique aussi les sends d'effets live (CC91 reverb, CC93 chorus).
 fn setup_tracks(c: &mut MidiOutputConnection, tracks: &[LiveTrack]) {
     for t in tracks {
         let ch = t.channel;
-        if ch == 9 {
+        if t.drums.load(Ordering::Relaxed) && ch != 9 {
+            // Piste percussion ajoutée (canal non-GM-drums) : banque
+            // percussion GM2 + kit Standard (testé avec FluidSynth).
+            cc(c, ch, 0, 128);
+            pc(c, ch, 0);
+        } else if ch == 9 {
             // Drums : program 1 = Standard Kit (toujours)
             pc(c, ch, 1);
         } else {
@@ -466,6 +477,7 @@ pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
                 if let Some(p) = tc.program { t.program.store(p, Ordering::Relaxed); }
                 if let Some(v) = tc.volume { t.volume.store(v, Ordering::Relaxed); }
                 if let Some(m) = tc.mute { t.mute.store(m, Ordering::Relaxed); }
+                if let Some(d) = tc.drums { t.drums.store(d, Ordering::Relaxed); }
                 if let Some(fx) = tc.effects {
                     t.fx_reverb.store(fx.reverb, Ordering::Relaxed);
                     t.fx_chorus.store(fx.chorus, Ordering::Relaxed);
@@ -478,6 +490,7 @@ pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
                     tc.program.unwrap_or(0),
                     tc.volume.unwrap_or(100),
                 );
+                nt.drums.store(tc.drums.unwrap_or(false), Ordering::Relaxed);
                 if let Some(m) = tc.mute { nt.mute.store(m, Ordering::Relaxed); }
                 if let Some(fx) = tc.effects {
                     nt.fx_reverb.store(fx.reverb, Ordering::Relaxed);
@@ -782,6 +795,8 @@ pub struct TrackCfg {
     pub program: Option<u16>,       // Nouveau program (None = ne pas changer)
     pub volume: Option<u8>,         // Nouveau volume (None = ne pas changer)
     pub mute: Option<bool>,         // Nouvel état mute (None = ne pas changer)
+    /// Piste percussion (kit drums) sur un canal ≠ 9 (None = ne pas changer).
+    pub drums: Option<bool>,
     /// Effets (reverb/chorus appliqués en live via CC MIDI 91/93).
     pub effects: Option<crate::dsp::Fx>,
 }
@@ -829,6 +844,7 @@ mod tests {
         // Config : seule la nouvelle piste canal 5 est active
         apply_tracks(&lc, &[TrackCfg {
             channel: 5, program: Some(80), volume: Some(90), mute: Some(false),
+            drums: None,
             effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
@@ -847,6 +863,7 @@ mod tests {
         // On réactive le canal 2 avec un nouveau volume
         apply_tracks(&lc, &[TrackCfg {
             channel: 2, program: Some(40), volume: Some(55), mute: Some(false),
+            drums: None,
             effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
@@ -863,6 +880,7 @@ mod tests {
         let lc = live_with(vec![LiveTrack::new(0, 51, 60)]);
         apply_tracks(&lc, &[TrackCfg {
             channel: 0, program: Some(10), volume: None, mute: None,
+            drums: None,
             effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
