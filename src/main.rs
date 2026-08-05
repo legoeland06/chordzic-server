@@ -709,22 +709,20 @@ async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoRes
     let vel = b.velocity.min(127);
     let dur = b.duration_ms.min(5000);
     std::thread::spawn(move || {
-        // Piste percussion ajoutée (canal ≠ 9) : banque percussion GM2 + kit
-        // Standard (testé avec FluidSynth). Drums canal 9 : kit fixe, rien.
-        if is_drum && ch != 9 {
-            midi_send(&s, &[0xB0 | ch, 0, 128]);
-            midi_send(&s, &[0xC0 | ch, 0]);
-        } else if let Some(p) = prog {
+        // Piste percussion : la note est jouée sur le canal drums natif (9)
+        // — le kit sonne quel que soit le canal de saisie de la piste.
+        let out_ch = if is_drum && ch != 9 { 9 } else { ch };
+        if let Some(p) = prog {
             // Program change (sauf drums : kit fixe)
-            if ch != 9 {
-                midi_send(&s, &[0xC0 | ch, p as u8]);
+            if out_ch != 9 {
+                midi_send(&s, &[0xC0 | out_ch, p as u8]);
             }
         }
         // Note On → Note Off après `dur` ms. Si l'envoi échoue
         // (connexion morte), midi_send reconnecte automatiquement.
-        if midi_send(&s, &[0x90 | ch, pitch, vel]) {
+        if midi_send(&s, &[0x90 | out_ch, pitch, vel]) {
             std::thread::sleep(std::time::Duration::from_millis(dur));
-            midi_send(&s, &[0x90 | ch, pitch, 0]);
+            midi_send(&s, &[0x90 | out_ch, pitch, 0]);
         }
     });
     Json(Rsp { status: "ok".into() })

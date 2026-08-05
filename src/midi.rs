@@ -437,17 +437,16 @@ pub fn play_notes(c: &mut MidiOutputConnection, notes: &[String], mv: u8) {
 
 /// Initialise les pistes en envoyant les Program Change sur chaque canal.
 /// Le canal drums (9) utilise le kit par défaut (program 1 = Standard Kit).
-/// Les pistes percussion (flag drums) sur d'autres canaux sont programmées
-/// via la banque percussion GM2 (bank select 128) + kit Standard (program 0).
+/// Les pistes percussion sur d'autres canaux n'ont pas besoin de
+/// programmation : leurs notes sont redirigées vers le canal drums natif (9).
 /// Applique aussi les sends d'effets live (CC91 reverb, CC93 chorus).
 fn setup_tracks(c: &mut MidiOutputConnection, tracks: &[LiveTrack]) {
     for t in tracks {
         let ch = t.channel;
         if t.drums.load(Ordering::Relaxed) && ch != 9 {
-            // Piste percussion ajoutée (canal non-GM-drums) : banque
-            // percussion GM2 + kit Standard (testé avec FluidSynth).
-            cc(c, ch, 0, 128);
-            pc(c, ch, 0);
+            // Piste percussion ajoutée : rien à programmer ici (le canal 9
+            // drums natif reçoit ses notes — voir play_seq / note).
+            continue;
         } else if ch == 9 {
             // Drums : program 1 = Standard Kit (toujours)
             pc(c, ch, 1);

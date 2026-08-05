@@ -154,16 +154,11 @@ pub fn generate_smf_fmt0(
 
     // ── Program Changes initiaux ─────────────────────────────────
     // Chaque piste reçoit son instrument GM au tick 0. Les pistes
-    // percussion (canal ≠ 9) reçoivent la banque percussion GM2
-    // (bank select 128) + le kit Standard (program 0).
+    // percussion sur d'autres canaux n'ont pas besoin de programmation
+    // (leurs notes sont redirigées vers le canal drums natif 9).
     for tc in &cfg.tracks {
-        if tc.drums && tc.channel != CH_DRUMS {
-            e(&mut evs, 0, &[0xB0 | tc.channel, 0, 128]);
-            e(&mut evs, 0, &[0xC0 | tc.channel, 0]);
-        } else {
-            // 0xC0 | channel = Program Change, suivi du numéro de program
-            e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
-        }
+        // 0xC0 | channel = Program Change, suivi du numéro de program
+        e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
     }
     // Fallback : si CH_LEAD n'est pas dans tracks, envoyer cfg.lead_inst
     let has_lead = cfg.tracks.iter().any(|t| t.channel == CH_LEAD);
@@ -807,15 +802,11 @@ pub fn generate_smf_from_custom(
         ((tempo_us >> 8)  & 0xFF) as u8,
         (tempo_us & 0xFF) as u8]);
 
-    // Program changes pour chaque piste (pistes percussion ≠ canal 9 :
-    // banque percussion GM2 + kit Standard)
+    // Program changes pour chaque piste (le canal drums 9 est natif :
+    // les pistes percussion sur d'autres canaux n'ont pas besoin de
+    // programmation — leurs notes sont redirigées vers le canal 9).
     for tc in tracks {
-        if tc.drums && tc.channel != CH_DRUMS {
-            e(&mut evs, 0, &[0xB0 | tc.channel, 0, 128]);
-            e(&mut evs, 0, &[0xC0 | tc.channel, 0]);
-        } else {
-            e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
-        }
+        e(&mut evs, 0, &[0xC0 | tc.channel, tc.program as u8]);
     }
 
     // Appliquer les réglages de piste (mute) aux notes : une piste mutée
@@ -827,6 +818,17 @@ pub fn generate_smf_from_custom(
         .filter(|n| find_track(n.channel).map_or(true, |t| !t.mute))
         .cloned()
         .collect();
+
+    // Pistes percussion (drums, canal ≠ 9) : leurs notes sont redirigées
+    // vers le canal drums natif (9) — le kit sonne sur n'importe quelle
+    // piste drums, quel que soit son canal de saisie.
+    for n in audible.iter_mut() {
+        if let Some(t) = find_track(n.channel) {
+            if t.drums && n.channel != CH_DRUMS {
+                n.channel = CH_DRUMS;
+            }
+        }
+    }
 
     // Trier les notes par start_time
     audible.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
