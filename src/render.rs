@@ -682,30 +682,33 @@ pub fn render_wav(smf: &[u8], soundfont: &str, duration_sec: f64, master_vol: u8
     Ok(fade_out_wav(&normalized, 30))
 }
 
-/// Rendu « par piste » : chaque piste active est rendue séparément
-/// (SMF mono-piste → FluidSynth → WAV), passe dans sa chaîne d'effets
-/// (dsp::apply_fx : overdrive → delay → chorus → reverb), puis les WAVs
-/// sont mixés (somme), normalisés au pic (~0.5) et le master volume est
-/// appliqué, avec fade-out final.
+/// Résultat d'un rendu de piste individuelle (bounce multitrack).
+pub struct RenderedTrack {
+    pub channel: u8,
+    pub wav: Vec<u8>,
+}
+
+/// Rendu « par piste » SANS mixage (bounce multitrack pour le mode PostProd).
+///
+/// Chaque piste active est rendue séparément (SMF mono-piste → FluidSynth →
+/// WAV), passe dans sa chaîne d'effets (dsp::apply_fx : overdrive → delay →
+/// chorus → reverb), puis retournée telle quelle : les niveaux relatifs entre
+/// pistes sont préservés (le gain master et la normalisation au pic sont
+/// appliqués par l'appelant — mix pour `/render-wav`, frontend pour PostProd).
 ///
 /// Les notes (`all_notes`) doivent être DÉJÀ scalées par volume de piste
 /// (fait en amont : generate_notes pour le classique, scaling custom).
-pub fn render_wav_mixed(
+pub fn render_tracks_individual(
     all_notes: &[CustomNote],
     cfg: &RenderCfg,
     soundfont: &str,
     duration_sec: f64,
-    master_vol: u8,
-) -> Result<Vec<u8>, String> {
-    use hound::{WavReader, WavSpec, WavWriter, SampleFormat};
-
+) -> Result<Vec<RenderedTrack>, String> {
     // Delay musical : une croche (0.5 beat) → 30000/tempo ms
     let delay_ms = (30_000u32 / cfg.tempo.max(20)).max(1);
     let tempo = cfg.tempo.max(20) as u16;
 
-    let mut mix_l: Option<Vec<f32>> = None;
-    let mut mix_r: Option<Vec<f32>> = None;
-
+    let mut out: Vec<RenderedTrack> = Vec::new();
     for t in cfg.tracks.iter().filter(|t| !t.mute) {
         let notes: Vec<CustomNote> = all_notes
             .iter()
@@ -723,8 +726,35 @@ pub fn render_wav_mixed(
         // Chaîne d'effets de la piste (si réglée)
         let wav = if t.fx.is_off() { wav } else { crate::dsp::apply_fx(&wav, &t.fx, delay_ms) };
 
+        out.push(RenderedTrack { channel: t.channel, wav });
+    }
+    Ok(out)
+}
+
+/// Rendu « par piste » mixé : rend chaque piste séparément (voir
+/// `render_tracks_individual`), additionne les WAVs, normalise au pic
+/// (~0.5, -6 dBFS) pour un niveau stable quel que soit le nombre de pistes,
+/// applique le master volume, et termine par un fade-out final.
+pub fn render_wav_mixed(
+    all_notes: &[CustomNote],
+    cfg: &RenderCfg,
+    soundfont: &str,
+    duration_sec: f64,
+    master_vol: u8,
+) -> Result<Vec<u8>, String> {
+    use hound::{WavReader, WavSpec, WavWriter, SampleFormat};
+
+    let tracks = render_tracks_individual(all_notes, cfg, soundfont, duration_sec)?;
+    if tracks.is_empty() {
+        return Err("Aucune piste à rendre".into());
+    }
+
+    let mut mix_l: Option<Vec<f32>> = None;
+    let mut mix_r: Option<Vec<f32>> = None;
+
+    for rt in &tracks {
         // Décoder et additionner au mix
-        let Ok(mut rd) = WavReader::new(std::io::Cursor::new(&wav)) else { continue; };
+        let Ok(mut rd) = WavReader::new(std::io::Cursor::new(&rt.wav)) else { continue; };
         let ch = rd.spec().channels as usize;
         let s: Vec<i16> = rd.samples::<i16>().filter_map(|x| x.ok()).collect();
         let n = s.len() / ch.max(1);

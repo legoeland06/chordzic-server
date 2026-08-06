@@ -826,6 +826,178 @@ async fn render_wav(
     }
 }
 
+// ─── Bounce multitrack (mode PostProd) ─────────────────────────────────
+
+/// Fichier WAV temporaire d'une piste (bounce multitrack).
+#[derive(Serialize)]
+struct RenderedTrackFile {
+    channel: u8,
+    program: u16,
+    url: String,
+}
+
+/// Réponse de `POST /render-tracks`.
+#[derive(Serialize)]
+struct RenderTracksResp {
+    tracks: Vec<RenderedTrackFile>,
+    duration_sec: f64,
+    tempo: u16,
+    sig: String,
+    /// Gain master par défaut (normalisation au pic du mix Navig) : le
+    /// frontend PostProd l'applique pour retrouver le même niveau qu'en
+    /// mode Navig au premier Play, avant ajustement par les faders.
+    master_gain: f64,
+}
+
+/// POST /render-tracks — Bounce multitrack (mode PostProd).
+///
+/// Même requête que `/render-wav` (sequence, tracks, custom_notes...), mais
+/// renvoie UN WAV par piste active (avec ses effets MIDI appliqués) au lieu
+/// d'un mix unique. Les WAVs sont écrits dans le répertoire temporaire et
+/// servis par `GET /rendered/<file>` (URLs, pas de base64 : les boucles
+/// longues rendraient le JSON trop lourd).
+async fn render_tracks(
+    State(s): State<AppState>,
+    Json(b): Json<PlayReq>,
+) -> impl IntoResponse {
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
+    };
+
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à rendre").into_response();
+    }
+
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+
+    // Même construction des notes que /render-wav (classique + PianoRoll)
+    let (total_beats, all_notes) = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
+        let custom_channels: std::collections::HashSet<u8> = b.custom_channels.iter()
+            .copied()
+            .chain(b.custom_notes.iter().map(|n| n.channel))
+            .collect();
+        let classic = render::generate_notes(&notes_arrays, &beats, &rcfg);
+        let mut merged: Vec<render::CustomNote> = classic.into_iter()
+            .filter(|n| !custom_channels.contains(&n.channel))
+            .collect();
+        for cn in &b.custom_notes {
+            let vol = rcfg.tracks.iter()
+                .find(|t| t.channel == cn.channel)
+                .map_or(127, |t| t.volume) as u32;
+            let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
+            merged.push(render::CustomNote {
+                channel: cn.channel,
+                start_time: cn.start_time,
+                pitch: cn.pitch,
+                duration: cn.duration,
+                velocity: v,
+            });
+        }
+        let tb = merged.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max);
+        (tb, merged)
+    } else {
+        let tb = beats.iter().sum();
+        (tb, render::generate_notes(&notes_arrays, &beats, &rcfg))
+    };
+
+    let sf_path = s.soundfont.as_deref().unwrap_or(
+        "/usr/share/sounds/sf3/MuseScore_General_Full.sf3"
+    );
+    let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
+
+    match render::render_tracks_individual(&all_notes, &rcfg, sf_path, duration_sec) {
+        Ok(tracks) => {
+            // Répertoire temporaire + purge des fichiers > 30 min
+            let dir = std::env::temp_dir().join("chordj_rendered");
+            let _ = std::fs::create_dir_all(&dir);
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let now = std::time::SystemTime::now();
+                for e in rd.flatten() {
+                    let fresh = e.metadata()
+                        .and_then(|m| m.modified())
+                        .map(|t| now.duration_since(t).map(|d| d.as_secs() < 1800).unwrap_or(false))
+                        .unwrap_or(false);
+                    if !fresh {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+
+            // Écrire chaque piste + calculer le pic du mix (pour master_gain)
+            let mut files = Vec::new();
+            let mut pic: f32 = 0.0;
+            for rt in &tracks {
+                let fname = format!("pp_{}_{}.wav", ts, rt.channel);
+                let path = dir.join(&fname);
+                if std::fs::write(&path, &rt.wav).is_err() {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Écriture du WAV impossible").into_response();
+                }
+                // Pic du mix (somme des pistes) pour la normalisation par défaut
+                if let Ok(mut rd) = hound::WavReader::new(std::io::Cursor::new(&rt.wav)) {
+                    let ch = rd.spec().channels as usize;
+                    let s: Vec<i16> = rd.samples::<i16>().filter_map(|x| x.ok()).collect();
+                    for i in 0..s.len() / ch.max(1) {
+                        let l = s[i * ch] as f32 / 32768.0;
+                        let r = if ch > 1 { s[i * ch + 1] as f32 / 32768.0 } else { l };
+                        pic = pic.max(l.abs()).max(r.abs());
+                    }
+                }
+                let prog = rcfg.tracks.iter()
+                    .find(|t| t.channel == rt.channel)
+                    .map(|t| t.program)
+                    .unwrap_or(0);
+                files.push(RenderedTrackFile {
+                    channel: rt.channel,
+                    program: prog,
+                    url: format!("/rendered/{}", fname),
+                });
+            }
+
+            let norm = if pic > 1e-6 { 0.5 / pic } else { 1.0 };
+            let master_gain = norm as f64 * (b.master_vol as f64) / 127.0;
+
+            axum::Json(RenderTracksResp {
+                tracks: files,
+                duration_sec,
+                tempo: b.tempo.max(1) as u16,
+                sig: b.sig.clone(),
+                master_gain,
+            })
+            .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// GET /rendered/<file> — Sert un WAV temporaire produit par le bounce
+/// multitrack (mode PostProd). Le nom est strictement validé (anti
+/// path traversal : uniquement alphanumérique, point, tiret, underscore).
+async fn serve_rendered(axum::extract::Path(file): axum::extract::Path<String>) -> impl IntoResponse {
+    use axum::http::HeaderMap;
+    if file.is_empty()
+        || !file.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return (StatusCode::BAD_REQUEST, "Nom invalide").into_response();
+    }
+    let path = std::env::temp_dir().join("chordj_rendered").join(&file);
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let mut headers = HeaderMap::new();
+            headers.insert("Content-Type", "audio/wav".parse().unwrap());
+            (StatusCode::OK, headers, data).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "Fichier introuvable").into_response(),
+    }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -885,9 +1057,11 @@ async fn main() {
         .route("/config", post(conf))
         .route("/stop", post(stop))
         .route("/render-wav", post(render_wav))
+        .route("/render-tracks", post(render_tracks))
         .route("/render-notes", post(render_notes))
         .route("/note", post(note))
         .route("/samples-list", get(samples_list))
+        .route("/rendered/:file", get(serve_rendered))
         .route("/save", post(grilles::save_grille))
         .route("/grilles", get(grilles::list_grilles))
         .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))
@@ -918,6 +1092,8 @@ async fn main() {
     println!("     POST /config        → modifier la config live");
     println!("     POST /stop          → arrêter la lecture");
     println!("     POST /render-wav    → rendu WAV (batch)");
+    println!("     POST /render-tracks → bounce multitrack (mode PostProd)");
+    println!("     GET  /rendered/<f>  → WAV temporaire du bounce PostProd");
     println!("     POST /render-notes  → notes mode classique (PianoRoll)");
     println!("     POST /note          → audition note en direct (preview)");
     println!("     GET  /samples-list  → boucles WAV disponibles");
