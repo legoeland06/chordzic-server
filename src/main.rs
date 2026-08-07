@@ -323,6 +323,8 @@ struct PlayReq {
     tempo: u32,                      // BPM (120 par défaut)
     #[serde(default)]
     click_in_render: bool,           // Clic intégré au rendu WAV (mode Navig)
+    #[serde(default)]
+    click_separate: bool,            // Clic séparé : réponse JSON {main_url, click_url}
     #[serde(default = "y")]
     drums: bool,                     // Drums activées
     #[serde(default = "y")]
@@ -817,29 +819,61 @@ async fn render_wav(
 
     match render_result {
         Ok(mut wav) => {
-            // Clic intégré au rendu (mode Navig) : le clic est rendu à part
-            // (SMF métronome/woodblock…) puis MÉLANGÉ au WAV principal → synchro
-            // échantillon-parfaite par construction (même tempo, même passe).
-            // La checkbox « Dans le rendu » (click_in_render) EST l'intention.
-            if b.click_in_render {
-                let (click_vol, click_accent, click_sound) = click::load(&s.click);
+            // ── Clic (mode Navig) ────────────────────────────────────
+            // Deux modes au choix :
+            //  - MIXÉ (« Dans le rendu ») : le clic est rendu à part puis
+            //    MÉLANGÉ au WAV principal → synchro échantillon-parfaite.
+            //  - SÉPARÉ (sortie dédiée) : 2 WAV (main + clic) écrits en
+            //    temp → réponse JSON ; le serveur jouera le clic sur la
+            //    sortie choisie (POST /navig-click-start) pendant que le
+            //    navigateur joue le main.
+            let click_cfg = click::load(&s.click);
+            let mix_click = b.click_in_render || click_cfg.in_render;
+            let sep_click = b.click_separate || (click_cfg.out_device.is_some() && !click_cfg.in_render);
+            if mix_click || sep_click {
                 let bars = (sig_code(&b.sig) / 10).max(1) as u64;
                 let click_smf = render::generate_click_smf(
                     b.tempo.max(1) as u16,
                     bars,
                     total_beats,
-                    click_accent,
-                    click_sound,
+                    click_cfg.accent,
+                    click_cfg.sound,
                 );
-                match render::render_wav(&click_smf, sf_path, duration_sec, 127) {
-                    Ok(cwav) => {
-                        let gain = (click_vol as f32 / 100.0) * 1.0;
+                let cwav = match render::render_wav(&click_smf, sf_path, duration_sec, 127) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("   ⚠️ Clic : rendu clic échoué ({})", e);
+                        Vec::new()
+                    }
+                };
+                if !cwav.is_empty() {
+                    if sep_click {
+                        // Mode SÉPARÉ : 2 WAV en temp → le frontend récupère
+                        // les URLs, joue le main, et déclenche le clic serveur.
+                        let dir = std::env::temp_dir().join("chordj_rendered");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let main_name = format!("navig_{}_main.wav", ts);
+                        let click_name = format!("navig_{}_click.wav", ts);
+                        let _ = std::fs::write(dir.join(&main_name), &wav);
+                        let _ = std::fs::write(dir.join(&click_name), &cwav);
+                        let json = serde_json::json!({
+                            "main_url": format!("/rendered/{}", main_name),
+                            "click_url": format!("/rendered/{}", click_name),
+                            "duration_sec": duration_sec,
+                        });
+                        return (StatusCode::OK, axum::Json(json)).into_response();
+                    } else {
+                        // Mode MIXÉ : synchro parfaite par construction
+                        let gain = (click_cfg.volume as f32 / 100.0) * 1.0;
                         match render::mix_wavs(&wav, &cwav, gain) {
                             Ok(mixed) => wav = mixed,
                             Err(e) => eprintln!("   ⚠️ Clic : mix échoué ({})", e),
                         }
                     }
-                    Err(e) => eprintln!("   ⚠️ Clic : rendu clic échoué ({})", e),
                 }
             }
 
@@ -1036,14 +1070,17 @@ async fn audio_devices() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(serde_json::json!({ "devices": devs })))
 }
 
-/// GET /click — config de la piste de clic (mode rendu).
+/// GET /click — config de la piste de clic (mode Navig).
 async fn get_click(State(s): State<AppState>) -> impl IntoResponse {
-    let (volume, accent, sound) = click::load(&s.click);
+    let c = click::load(&s.click);
     let cfg = serde_json::json!({
-        "volume": volume,
-        "accent": accent,
-        "sound": sound,
-        "sound_name": click::sound_name(sound),
+        "volume": c.volume,
+        "accent": c.accent,
+        "sound": c.sound,
+        "sound_name": click::sound_name(c.sound),
+        "in_render": c.in_render,
+        "out_device": c.out_device,
+        "delay_ms": c.delay_ms,
         "sounds": [
             { "id": 0, "name": "Métronome GM" },
             { "id": 1, "name": "Woodblock" },
@@ -1059,9 +1096,12 @@ struct ClickReq {
     volume: Option<u8>,
     accent: Option<bool>,
     sound: Option<u8>,
+    in_render: Option<bool>,
+    out_device: Option<String>,
+    delay_ms: Option<i32>,
 }
 
-/// POST /click — met à jour la config de la piste de clic (mode rendu).
+/// POST /click — met à jour la config de la piste de clic.
 async fn post_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> impl IntoResponse {
     let st = &s.click;
     if let Some(v) = b.volume {
@@ -1073,6 +1113,44 @@ async fn post_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> impl 
     if let Some(v) = b.sound {
         st.sound.store(v.min(3), std::sync::atomic::Ordering::Relaxed);
     }
+    if let Some(v) = b.in_render {
+        st.in_render.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(d) = b.out_device {
+        let d2 = if d.is_empty() { None } else { Some(d) };
+        *st.out_device.lock().unwrap() = d2;
+    }
+    if let Some(v) = b.delay_ms {
+        st.delay_ms.store(v.max(0).min(500), std::sync::atomic::Ordering::Relaxed);
+    }
+    (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(serde::Deserialize)]
+struct ClickStartReq {
+    file: String,           // nom du fichier /rendered/<file> (clic)
+    device: Option<String>, // sortie dédiée (None = défaut)
+    start_in_ms: u64,       // délai avant lecture (handshake avec le navigateur)
+}
+
+/// POST /navig-click-start — le serveur joue le clic séparé sur la sortie
+/// choisie, synchronisé avec le démarrage du navigateur (start_in_ms).
+async fn navig_click_start(State(s): State<AppState>, Json(b): Json<ClickStartReq>) -> impl IntoResponse {
+    let dir = std::env::temp_dir().join("chordj_rendered");
+    let path = dir.join(&b.file);
+    if !path.exists() {
+        return (StatusCode::NOT_FOUND, "Clic introuvable").into_response();
+    }
+    let delay = s.click.delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+    match click::play_click_wav(path.to_str().unwrap_or(""), b.device, b.start_in_ms, delay) {
+        Ok(()) => (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Clic : {}", e)).into_response(),
+    }
+}
+
+/// POST /navig-click-stop — arrête le clic séparé en cours.
+async fn navig_click_stop() -> impl IntoResponse {
+    click::stop_click();
     (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1127,6 +1205,15 @@ async fn main() {
             sound: std::sync::atomic::AtomicU8::new(
                 std::env::var("CLICK_SOUND").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
+            in_render: std::sync::atomic::AtomicBool::new(
+                std::env::var("CLICK_IN_RENDER").map(|v| v == "1").unwrap_or(false),
+            ),
+            out_device: std::sync::Mutex::new(
+                std::env::var("CLICK_OUT_DEVICE").ok().filter(|s| !s.is_empty()),
+            ),
+            delay_ms: std::sync::atomic::AtomicI32::new(
+                std::env::var("CLICK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
         }),
     };
 
@@ -1153,6 +1240,8 @@ async fn main() {
         .route("/rendered/:file", get(serve_rendered))
         .route("/audio-devices", get(audio_devices))
         .route("/click", get(get_click).post(post_click))
+        .route("/navig-click-start", post(navig_click_start))
+        .route("/navig-click-stop", post(navig_click_stop))
         .route("/save", post(grilles::save_grille))
         .route("/grilles", get(grilles::list_grilles))
         .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))
