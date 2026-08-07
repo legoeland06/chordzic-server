@@ -43,7 +43,7 @@ impl Default for ClickState {
             enabled: AtomicBool::new(false),
             device: Mutex::new(None),
             volume: AtomicU8::new(80),
-            delay_ms: AtomicI32::new(20),
+            delay_ms: AtomicI32::new(10),
             accent: AtomicBool::new(true),
         }
     }
@@ -59,7 +59,6 @@ enum Msg {
 enum CtrlMsg {
     SetEnabled(bool),
     SetDevice(Option<String>),
-    Shutdown,
 }
 
 /// Sender clonable utilisé par le moteur live pour déclencher les ticks.
@@ -99,9 +98,6 @@ impl ClickHandle {
         *self.state.device.lock().unwrap() = name.clone();
         let _ = self.ctrl.send(Msg::Ctrl(CtrlMsg::SetDevice(name)));
     }
-    pub fn shutdown(&self) {
-        let _ = self.ctrl.send(Msg::Ctrl(CtrlMsg::Shutdown));
-    }
 }
 
 /// Démarre le thread audio du clic. Retourne le handle.
@@ -118,7 +114,6 @@ struct AudioOut {
     _stream: cpal::Stream,
     ring: Arc<Mutex<VecDeque<f32>>>,
     sample_rate: f32,
-    channels: u16,
 }
 
 fn open_output(device_name: &Option<String>) -> Option<AudioOut> {
@@ -150,14 +145,13 @@ fn open_output(device_name: &Option<String>) -> Option<AudioOut> {
     let default_cfg = device.default_output_config().ok()?;
     let sample_rate = default_cfg.sample_rate().0 as f32;
     let channels = default_cfg.channels().min(2).max(1); // stéréo ou mono natif
-    let config: cpal::StreamConfig = default_cfg.into();
 
+    // Petit buffer (latence minimale) avec repli sur la config par défaut
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let ring_cb = ring.clone();
     let err_cb = |e| eprintln!("   ⚠️ Clic : erreur audio : {}", e);
-
-    let stream = device
-        .build_output_stream(
+    let build = |config: cpal::StreamConfig, ring: Arc<Mutex<VecDeque<f32>>>| {
+        let ring_cb = ring.clone();
+        device.build_output_stream(
             &config,
             move |data: &mut [f32], _| {
                 let mut r = ring_cb.lock().unwrap();
@@ -172,10 +166,18 @@ fn open_output(device_name: &Option<String>) -> Option<AudioOut> {
             err_cb,
             None,
         )
+    };
+    let fast_cfg = cpal::StreamConfig {
+        channels,
+        sample_rate: default_cfg.sample_rate(),
+        buffer_size: cpal::BufferSize::Fixed(128),
+    };
+    let stream = build(fast_cfg, ring.clone())
+        .or_else(|_| build(default_cfg.into(), ring.clone()))
         .ok()?;
 
     stream.play().ok()?;
-    Some(AudioOut { _stream: stream, ring, sample_rate, channels })
+    Some(AudioOut { _stream: stream, ring, sample_rate })
 }
 
 /// Synthèse d'un tick : sinus avec decay exponentiel.
@@ -200,8 +202,14 @@ fn click_audio_thread(rx: Receiver<Msg>, state: Arc<ClickState>) {
     let mut last_enabled = state.enabled.load(Ordering::Relaxed);
 
     loop {
-        // 1. Traiter les messages disponibles
-        let msg = rx.recv_timeout(Duration::from_millis(15));
+        // 1. Traiter les messages disponibles. Polling serré (2 ms) quand
+        //    des ticks attendent (moins de gigue), large (15 ms) sinon.
+        let poll = if pending.is_empty() {
+            Duration::from_millis(15)
+        } else {
+            Duration::from_millis(2)
+        };
+        let msg = rx.recv_timeout(poll);
         match msg {
             Ok(Msg::Tick { accent, at }) => pending.push_back((accent, at)),
             Ok(Msg::Ctrl(CtrlMsg::SetEnabled(v))) => {
@@ -213,7 +221,6 @@ fn click_audio_thread(rx: Receiver<Msg>, state: Arc<ClickState>) {
                 // reconstruit le stream au prochain passage
                 audio.take();
             }
-            Ok(Msg::Ctrl(CtrlMsg::Shutdown)) => break,
             Err(_) => {} // timeout
         }
 

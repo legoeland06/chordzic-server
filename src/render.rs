@@ -803,6 +803,77 @@ pub fn render_wav_mixed(
     Ok(fade_out_wav(&buf, 30))
 }
 
+// ─── Piste de clic pour le rendu (mode Navig) ────────────────────────────
+
+/// SMF de la piste de clic : Woodblock (GM 115) sur le canal 15, un coup par
+/// temps, accent (vélocité 120) sur le 1ᵉʳ temps de chaque mesure.
+/// Rendu séparément puis mélangé au WAV principal → synchronisation
+/// échantillon-parfaite par construction (même passe de rendu).
+pub fn generate_click_smf(tempo: u16, beats_per_bar: u64, total_beats: f64, accent: bool) -> Vec<u8> {
+    let mut notes: Vec<CustomNote> = Vec::new();
+    let total = total_beats.ceil() as u64;
+    for b in 0..total {
+        let acc = accent && b % beats_per_bar.max(1) == 0;
+        notes.push(CustomNote {
+            channel: 15,
+            start_time: b as f64,
+            pitch: 115,               // Woodblock
+            duration: 0.15,           // 0,15 temps (~75 ms à 120 BPM)
+            velocity: if acc { 127 } else { 110 },
+        });
+    }
+    // Piste synthétique : program change Woodblock sur le canal 15
+    let tracks = vec![TrackCfg {
+        channel: 15,
+        program: 115,
+        volume: 127,
+        mute: false,
+        drums: false,
+        fx: Default::default(),
+    }];
+    generate_smf_from_custom(&notes, &tracks, tempo)
+}
+
+/// Mélange deux WAV 16-bit (même fréquence d'échantillonnage) :
+/// `main + click * click_gain`. Le click mono est dupliqué sur tous les
+/// canaux du main ; la sortie est tronquée à la plus courte des deux.
+pub fn mix_wavs(main: &[u8], click: &[u8], click_gain: f32) -> Result<Vec<u8>, String> {
+    let mut mr = hound::WavReader::new(std::io::Cursor::new(main)).map_err(|e| e.to_string())?;
+    let mut cr = hound::WavReader::new(std::io::Cursor::new(click)).map_err(|e| e.to_string())?;
+    let spec = mr.spec();
+    let mch = spec.channels.max(1) as usize;
+    let cch = cr.spec().channels.max(1) as usize;
+    let ms: Vec<i16> = mr.samples::<i16>().collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    let cs: Vec<i16> = cr.samples::<i16>().collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+
+    let nframes = (ms.len() / mch).min(cs.len() / cch);
+    let mut out: Vec<i16> = Vec::with_capacity(nframes * mch);
+    for f in 0..nframes {
+        for ch in 0..mch {
+            let m = ms[f * mch + ch];
+            let c = cs[f * cch + (ch % cch)] as f32 * click_gain;
+            out.push((m as f32 + c).clamp(-32768.0, 32767.0) as i16);
+        }
+    }
+
+    let wspec = hound::WavSpec {
+        channels: spec.channels,
+        sample_rate: spec.sample_rate,
+        bits_per_sample: spec.bits_per_sample,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), wspec)
+            .map_err(|e| e.to_string())?;
+        for s in out {
+            w.write_sample(s).map_err(|e| e.to_string())?;
+        }
+        w.finalize().map_err(|e| e.to_string())?;
+    }
+    Ok(buf)
+}
+
 // ─── Custom notes (PianoRoll) ──────────────────────────────────────────
 
 /// Données d'une note personnalisée (provenant du PianoRoll frontend).

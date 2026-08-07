@@ -321,6 +321,8 @@ struct PlayReq {
     sequence: Vec<ChordEv>,          // Séquence d'accords (alias, pour compatibilité)
     #[serde(default = "t120")]
     tempo: u32,                      // BPM (120 par défaut)
+    #[serde(default)]
+    click_in_render: bool,           // Clic intégré au rendu WAV (mode Navig)
     #[serde(default = "y")]
     drums: bool,                     // Drums activées
     #[serde(default = "y")]
@@ -815,7 +817,34 @@ async fn render_wav(
     };
 
     match render_result {
-        Ok(wav) => {
+        Ok(mut wav) => {
+            // Clic intégré au rendu (mode Navig) : le clic est rendu à part
+            // (SMF woodblock) puis MÉLANGÉ au WAV principal → synchro
+            // échantillon-parfaite par construction (même tempo, même passe).
+            if b.click_in_render
+                && s.click.state.enabled.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let click_vol = s.click.state.volume.load(std::sync::atomic::Ordering::Relaxed);
+                let click_accent = s.click.state.accent.load(std::sync::atomic::Ordering::Relaxed);
+                let bars = (sig_code(&b.sig) / 10).max(1) as u64;
+                let click_smf = render::generate_click_smf(
+                    b.tempo.max(1) as u16,
+                    bars,
+                    total_beats,
+                    click_accent,
+                );
+                match render::render_wav(&click_smf, sf_path, duration_sec, 127) {
+                    Ok(cwav) => {
+                        let gain = (click_vol as f32 / 100.0) * 1.0;
+                        match render::mix_wavs(&wav, &cwav, gain) {
+                            Ok(mixed) => wav = mixed,
+                            Err(e) => eprintln!("   ⚠️ Clic : mix échoué ({})", e),
+                        }
+                    }
+                    Err(e) => eprintln!("   ⚠️ Clic : rendu clic échoué ({})", e),
+                }
+            }
+
             let mut headers = HeaderMap::new();
             headers.insert(
                 "Content-Type",
@@ -1107,7 +1136,7 @@ async fn main() {
                     std::env::var("CLICK_VOLUME").ok().and_then(|v| v.parse().ok()).unwrap_or(80),
                 ),
                 delay_ms: std::sync::atomic::AtomicI32::new(
-                    std::env::var("CLICK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+                    std::env::var("CLICK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10),
                 ),
                 accent: std::sync::atomic::AtomicBool::new(
                     std::env::var("CLICK_ACCENT").map(|v| v != "0").unwrap_or(true),
