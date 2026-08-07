@@ -1241,7 +1241,10 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
         }
     };
 
-    // 4. Fichiers temporaires + lecture double canaux
+    // 4. Fichiers temporaires + lecture : double canaux si l'appareil est
+    //    MULTICANAL (≥ 4 canaux — agrégat Mac / multi ALSA), sinon REPLI
+    //    automatique : clic MÉLANGÉ au son principal (synchro parfaite
+    //    quand même — un seul WAV). Plus jamais d'erreur bloquante.
     let dir = std::env::temp_dir().join("chordj_rendered");
     let _ = std::fs::create_dir_all(&dir);
     let ts = std::time::SystemTime::now()
@@ -1253,17 +1256,53 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     let _ = std::fs::write(dir.join(&main_name), &main_wav);
     let _ = std::fs::write(dir.join(&click_name), &click_wav);
     let gain = (cfg.volume as f32 / 100.0) * 1.0;
-    match click::play_dual(
-        dir.join(&main_name).to_str().unwrap_or(""),
-        dir.join(&click_name).to_str().unwrap_or(""),
-        &out_device,
-        gain,
-    ) {
-        Ok(()) => (
-            StatusCode::OK,
-            axum::Json(serde_json::json!({ "ok": true, "mode": "channels", "duration_sec": duration_sec })),
-        ).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    let main_path = dir.join(&main_name).to_str().unwrap_or("").to_string();
+    let click_path = dir.join(&click_name).to_str().unwrap_or("").to_string();
+
+    let chans = click::device_channels(&out_device).unwrap_or(0);
+    if chans >= 4 {
+        match click::play_dual(&main_path, &click_path, &out_device, gain) {
+            Ok(()) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "mode": "channels",
+                    "duration_sec": duration_sec,
+                })),
+            ).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        }
+    } else {
+        // Repli : pas d'appareil multicanal → clic mélangé (1 seul WAV)
+        let mixed = match render::mix_wavs(&main_wav, &click_wav, gain) {
+            Ok(m) => m,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Mix : {}", e)).into_response()
+            }
+        };
+        let mixed_name = format!("dual_{}_mixed.wav", ts);
+        let _ = std::fs::write(dir.join(&mixed_name), &mixed);
+        eprintln!(
+            "   ℹ️ Clic : sortie « {} » non multicanal ({} ch) → repli MIXÉ (synchro parfaite)",
+            out_device, chans
+        );
+        match click::play_click_wav(
+            dir.join(&mixed_name).to_str().unwrap_or(""),
+            Some(out_device.clone()),
+            0,
+            0,
+        ) {
+            Ok(()) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "mode": "mixed_fallback",
+                    "reason": format!("Sortie « {} » non multicanal ({} ch) → clic mélangé au son principal (synchro parfaite)", out_device, chans),
+                    "duration_sec": duration_sec,
+                })),
+            ).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+        }
     }
 }
 

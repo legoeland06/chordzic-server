@@ -72,6 +72,12 @@ fn find_device(name: &str) -> Option<cpal::Device> {
     })
 }
 
+/// Nombre de canaux de sortie d'un device (None si introuvable/illisible).
+pub fn device_channels(name: &str) -> Option<u16> {
+    let device = find_device(name)?;
+    device.default_output_config().ok().map(|c| c.channels())
+}
+
 /// Joue un WAV de clic sur la sortie choisie, après `start_in_ms` (+ delay_ms
 /// de calage). Retourne immédiatement (lecture en arrière-plan).
 pub fn play_click_wav(path: &str, device: Option<String>, start_in_ms: u64, delay_ms: i32) -> Result<(), String> {
