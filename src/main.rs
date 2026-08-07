@@ -238,7 +238,7 @@ struct AppState {
     midi: Arc<Mutex<Option<MidiLink>>>,
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
     soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
-    click: click::ClickHandle,  // Piste de clic + sortie audio dédiée
+    click: Arc<click::ClickState>, // Config du clic (mode rendu uniquement)
 }
 
 /// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
@@ -490,10 +490,9 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
         if !ev.is_empty() {
             let sq = ev.to_vec();
             let l = Arc::clone(lv);
-            let click_sender = s.click.sender();
             std::thread::spawn(move || {
                 if let Ok(mut c) = h2.lock() {
-                    play_seq(&mut c, &sq, &l, do_loop, &click_sender);
+                    play_seq(&mut c, &sq, &l, do_loop);
                 }
             });
         } else if let Some(ref n) = b.notes {
@@ -819,19 +818,18 @@ async fn render_wav(
     match render_result {
         Ok(mut wav) => {
             // Clic intégré au rendu (mode Navig) : le clic est rendu à part
-            // (SMF woodblock) puis MÉLANGÉ au WAV principal → synchro
+            // (SMF métronome/woodblock…) puis MÉLANGÉ au WAV principal → synchro
             // échantillon-parfaite par construction (même tempo, même passe).
-            // Le flag click_in_render suffit (la checkbox « Dans le rendu »
-            // EST l'intention) — indépendant du toggle live.
+            // La checkbox « Dans le rendu » (click_in_render) EST l'intention.
             if b.click_in_render {
-                let click_vol = s.click.state.volume.load(std::sync::atomic::Ordering::Relaxed);
-                let click_accent = s.click.state.accent.load(std::sync::atomic::Ordering::Relaxed);
+                let (click_vol, click_accent, click_sound) = click::load(&s.click);
                 let bars = (sig_code(&b.sig) / 10).max(1) as u64;
                 let click_smf = render::generate_click_smf(
                     b.tempo.max(1) as u16,
                     bars,
                     total_beats,
                     click_accent,
+                    click_sound,
                 );
                 match render::render_wav(&click_smf, sf_path, duration_sec, 127) {
                     Ok(cwav) => {
@@ -1038,46 +1036,42 @@ async fn audio_devices() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(serde_json::json!({ "devices": devs })))
 }
 
-/// GET /click — état actuel de la piste de clic.
+/// GET /click — config de la piste de clic (mode rendu).
 async fn get_click(State(s): State<AppState>) -> impl IntoResponse {
-    let st = &s.click.state;
+    let (volume, accent, sound) = click::load(&s.click);
     let cfg = serde_json::json!({
-        "enabled": st.enabled.load(std::sync::atomic::Ordering::Relaxed),
-        "device": st.device.lock().unwrap().clone(),
-        "volume": st.volume.load(std::sync::atomic::Ordering::Relaxed),
-        "delay_ms": st.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
-        "accent": st.accent.load(std::sync::atomic::Ordering::Relaxed),
+        "volume": volume,
+        "accent": accent,
+        "sound": sound,
+        "sound_name": click::sound_name(sound),
+        "sounds": [
+            { "id": 0, "name": "Métronome GM" },
+            { "id": 1, "name": "Woodblock" },
+            { "id": 2, "name": "Agogo" },
+            { "id": 3, "name": "Taiko" },
+        ],
     });
     (StatusCode::OK, axum::Json(cfg))
 }
 
 #[derive(serde::Deserialize)]
 struct ClickReq {
-    enabled: Option<bool>,
-    device: Option<String>,
     volume: Option<u8>,
-    delay_ms: Option<i32>,
     accent: Option<bool>,
+    sound: Option<u8>,
 }
 
-/// POST /click — met à jour la config de la piste de clic.
+/// POST /click — met à jour la config de la piste de clic (mode rendu).
 async fn post_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> impl IntoResponse {
-    let st = &s.click.state;
-    if let Some(v) = b.enabled {
-        s.click.set_enabled(v);
-    }
-    if let Some(d) = b.device {
-        let d2 = if d.is_empty() { None } else { Some(d) };
-        s.click.set_device(d2);
-    }
+    let st = &s.click;
     if let Some(v) = b.volume {
         st.volume.store(v.min(100), std::sync::atomic::Ordering::Relaxed);
     }
-    if let Some(v) = b.delay_ms {
-        st.delay_ms.store(v.max(0).min(500), std::sync::atomic::Ordering::Relaxed);
-    }
     if let Some(v) = b.accent {
         st.accent.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(v) = b.sound {
+        st.sound.store(v.min(3), std::sync::atomic::Ordering::Relaxed);
     }
     (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
 }
@@ -1123,31 +1117,17 @@ async fn main() {
             loop_name: Mutex::new(String::new()),
             loop_volume: AtomicU8::new(80),
         }),
-        click: {
-            // Piste de clic : config par variables d'environnement
-            let st = click::ClickState {
-                enabled: std::sync::atomic::AtomicBool::new(
-                    std::env::var("CLICK_ENABLED").map(|v| v == "1").unwrap_or(false),
-                ),
-                device: std::sync::Mutex::new(
-                    std::env::var("CLICK_DEVICE").ok().filter(|s| !s.is_empty()),
-                ),
-                volume: std::sync::atomic::AtomicU8::new(
-                    std::env::var("CLICK_VOLUME").ok().and_then(|v| v.parse().ok()).unwrap_or(80),
-                ),
-                delay_ms: std::sync::atomic::AtomicI32::new(
-                    std::env::var("CLICK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10),
-                ),
-                accent: std::sync::atomic::AtomicBool::new(
-                    std::env::var("CLICK_ACCENT").map(|v| v != "0").unwrap_or(true),
-                ),
-            };
-            let h = click::start_click(std::sync::Arc::new(st));
-            if h.state.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-                h.set_enabled(true);
-            }
-            h
-        },
+        click: Arc::new(click::ClickState {
+            volume: std::sync::atomic::AtomicU8::new(
+                std::env::var("CLICK_VOLUME").ok().and_then(|v| v.parse().ok()).unwrap_or(80),
+            ),
+            accent: std::sync::atomic::AtomicBool::new(
+                std::env::var("CLICK_ACCENT").map(|v| v != "0").unwrap_or(true),
+            ),
+            sound: std::sync::atomic::AtomicU8::new(
+                std::env::var("CLICK_SOUND").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            ),
+        }),
     };
 
     async fn samples_list() -> impl IntoResponse {

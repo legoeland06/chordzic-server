@@ -805,32 +805,41 @@ pub fn render_wav_mixed(
 
 // ─── Piste de clic pour le rendu (mode Navig) ────────────────────────────
 
-/// SMF de la piste de clic : Woodblock (GM 115) sur le canal 15, un coup par
-/// temps, accent (vélocité 120) sur le 1ᵉʳ temps de chaque mesure.
-/// Rendu séparément puis mélangé au WAV principal → synchronisation
-/// échantillon-parfaite par construction (même passe de rendu).
-pub fn generate_click_smf(tempo: u16, beats_per_bar: u64, total_beats: f64, accent: bool) -> Vec<u8> {
-    let mut notes: Vec<CustomNote> = Vec::new();
+/// SMF de la piste de clic, rendu séparément puis mélangé au WAV principal →
+/// synchronisation échantillon-parfaite par construction.
+/// `sound` : 0 = métronome GM (percussion 33/34), 1 = Woodblock (115),
+/// 2 = Agogo (114), 3 = Taiko (116). L'accent est sur le 1ᵉʳ temps de mesure.
+pub fn generate_click_smf(tempo: u16, beats_per_bar: u64, total_beats: f64, accent: bool, sound: u8) -> Vec<u8> {
     let total = total_beats.ceil() as u64;
+    let mut notes: Vec<CustomNote> = Vec::new();
     for b in 0..total {
         let acc = accent && b % beats_per_bar.max(1) == 0;
+        let vel = if acc { 127 } else { 120 };
+        // (canal, pitch, durée) selon le son choisi
+        let (channel, pitch) = match sound {
+            // Métronome GM : note 33 (clic) / 34 (cloche) sur le canal drums
+            0 => (9u8, if acc { 34 } else { 33 }),
+            // Sons mélodiques sur le canal 15 (program change ci-dessous)
+            1 => (15u8, 72), // Woodblock
+            2 => (15u8, 74), // Agogo
+            _ => (15u8, 55), // Taiko
+        };
         notes.push(CustomNote {
-            channel: 15,
+            channel,
             start_time: b as f64,
-            pitch: 115,               // Woodblock
-            duration: 0.15,           // 0,15 temps (~75 ms à 120 BPM)
-            velocity: if acc { 127 } else { 110 },
+            pitch,
+            duration: 0.15,
+            velocity: vel,
         });
     }
-    // Piste synthétique : program change Woodblock sur le canal 15
-    let tracks = vec![TrackCfg {
-        channel: 15,
-        program: 115,
-        volume: 127,
-        mute: false,
-        drums: false,
-        fx: Default::default(),
-    }];
+
+    // Piste synthétique pour le program change des sons mélodiques
+    let tracks: Vec<TrackCfg> = match sound {
+        1 => vec![TrackCfg { channel: 15, program: 115, volume: 127, mute: false, drums: false, fx: Default::default() }],
+        2 => vec![TrackCfg { channel: 15, program: 114, volume: 127, mute: false, drums: false, fx: Default::default() }],
+        3 => vec![TrackCfg { channel: 15, program: 116, volume: 127, mute: false, drums: false, fx: Default::default() }],
+        _ => vec![], // métronome GM : kit drums natif, pas de program change
+    };
     generate_smf_from_custom(&notes, &tracks, tempo)
 }
 

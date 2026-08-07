@@ -17,7 +17,6 @@
 ///   à 100 BPM pour une résolution en 16ème de note ~= 30ms min).
 use midir::{MidiOutput, MidiOutputConnection};
 use serde::Deserialize;
-use crate::click::ClickSender;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -539,7 +538,7 @@ pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
 /// - `ev`      : séquence d'accords (ChordEv)
 /// - `lc`      : état live partagé
 /// - `do_loop` : si vrai, boucle infinie
-pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop: bool, click: &ClickSender) {
+pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop: bool) {
     'outer: loop {
         // Reset : coupe toutes les notes, initialise les programmes
         rch(c);
@@ -581,7 +580,6 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
         let mv = lc.master_vol.load(Ordering::Relaxed);
 
         let mut seed: u64 = 0; // Seed pour la walking bass (déterministe)
-        let mut global_beat: u64 = 0; // Temps écoulés (pour l'accent du clic)
 
         // ── Parcours de la grille d'accords ─────────────────────
         for (i, e) in ev.iter().enumerate() {
@@ -602,11 +600,6 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 let start = std::time::Instant::now();
                 let dur_f = dur as f64;
 
-                // Clic pendant les silences : le timing avance quand même
-                let bd_ms_s = 60_000.0 / lc.tempo.load(Ordering::Relaxed).max(20) as f64;
-                let bars_s = (lc.sig.load(Ordering::Relaxed) / 10).max(1) as u64;
-                let mut last_sbeat: u64 = u64::MAX;
-
                 // Boucle de silence : attendre sans rien jouer
                 while start.elapsed().as_secs_f64() * 1000.0 < dur_f && !lc.stop.load(Ordering::Relaxed) {
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
@@ -615,16 +608,6 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                         std::thread::sleep(Duration::from_millis(
                             (remaining.min(50.0).max(5.0)) as u64
                         ));
-                    }
-                    // Tick de clic à chaque temps du silence
-                    let sbeat = (elapsed / bd_ms_s) as u64;
-                    if sbeat != last_sbeat {
-                        last_sbeat = sbeat;
-                        let at = start + Duration::from_millis((sbeat as f64 * bd_ms_s) as u64);
-                        let accent = click.state.accent.load(Ordering::Relaxed)
-                            && global_beat % bars_s == 0;
-                        click.beat(accent, at);
-                        global_beat += 1;
                     }
                 }
                 if lc.stop.load(Ordering::Relaxed) { break 'outer; }
@@ -712,16 +695,6 @@ pub fn play_seq(c: &mut MidiOutputConnection, ev: &[ChordEv], lc: &Live, do_loop
                 let sig_val = lc.sig.load(Ordering::Relaxed);
                 let bars = (sig_val / 10).max(1) as u64;
                 let beat = (elapsed_ms / bd_ms) as u64;
-
-                // ── Clic (métronome) ──────────────────────────
-                // Tick sur chaque temps (idx%4==0), accent sur le 1er
-                // temps de chaque mesure (compteur global de temps).
-                if idx % 4 == 0 {
-                    let accent = click.state.accent.load(Ordering::Relaxed)
-                        && global_beat % bars == 0;
-                    click.beat(accent, target);
-                    global_beat += 1;
-                }
 
                 // ── Drums (sur le temps) ─────────────────
                 if !drums_mute {
