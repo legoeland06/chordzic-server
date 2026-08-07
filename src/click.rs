@@ -73,6 +73,7 @@ fn find_device(name: &str) -> Option<cpal::Device> {
 }
 
 /// Nombre de canaux de sortie d'un device (None si introuvable/illisible).
+#[allow(dead_code)]
 pub fn device_channels(name: &str) -> Option<u16> {
     let device = find_device(name)?;
     device.default_output_config().ok().map(|c| c.channels())
@@ -215,13 +216,9 @@ pub fn play_dual(
     let device = find_device(device_name)
         .ok_or_else(|| format!("Sortie « {} » introuvable", device_name))?;
     let default_cfg = device.default_output_config().map_err(|e| e.to_string())?;
-    let channels = default_cfg.channels();
-    if channels < 4 {
-        return Err(format!(
-            "La sortie « {} » n'a que {} canaux. Il faut un appareil MULTICANAL (≥ 4 canaux) : sur Mac, crée un Agrégat dans Configuration Audio-MIDI (sortie intégrée + hub USB-C) et choisis-le comme sortie du clic.",
-            device_name, channels
-        ));
-    }
+    // Le mode séparé exige 4 canaux : on force 4 (le device ALSA multi/agrégat
+    // accepte ; sinon erreur → le serveur replie sur le clic mélangé).
+    let channels: u16 = 4;
 
     let (main_s, main_ch, main_sr) = read_wav_i16(main_path)?;
     let (click_s, click_ch, click_sr) = read_wav_i16(click_path)?;
@@ -240,7 +237,11 @@ pub fn play_dual(
     let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
     let ring_cb = ring.clone();
     let err_cb = |e| eprintln!("   ⚠️ Dual : erreur audio : {}", e);
-    let config: cpal::StreamConfig = default_cfg.into();
+    let config = cpal::StreamConfig {
+        channels,
+        sample_rate: default_cfg.sample_rate(),
+        buffer_size: cpal::BufferSize::Default,
+    };
     let ch = channels.max(1) as usize;
 
     let stream = device
