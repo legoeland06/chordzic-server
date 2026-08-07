@@ -25,6 +25,7 @@
 /// - `samples`  : gestion des boucles WAV drums (rodio)
 /// - `walking`  : génération de walking bass
 /// - `grilles`  : sauvegarde/chargement des grilles en JSON
+mod click;
 mod dsp;
 mod grilles;
 mod midi;
@@ -237,6 +238,7 @@ struct AppState {
     midi: Arc<Mutex<Option<MidiLink>>>,
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
     soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
+    click: click::ClickHandle,  // Piste de clic + sortie audio dédiée
 }
 
 /// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
@@ -486,9 +488,10 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
         if !ev.is_empty() {
             let sq = ev.to_vec();
             let l = Arc::clone(lv);
+            let click_sender = s.click.sender();
             std::thread::spawn(move || {
                 if let Ok(mut c) = h2.lock() {
-                    play_seq(&mut c, &sq, &l, do_loop);
+                    play_seq(&mut c, &sq, &l, do_loop, &click_sender);
                 }
             });
         } else if let Some(ref n) = b.notes {
@@ -998,6 +1001,58 @@ async fn serve_rendered(axum::extract::Path(file): axum::extract::Path<String>) 
     }
 }
 
+// ─── Piste de clic : endpoints ──────────────────────────────────────────
+
+/// GET /audio-devices — liste les sorties audio disponibles (cpal).
+async fn audio_devices() -> impl IntoResponse {
+    let devs = click::list_output_devices();
+    (StatusCode::OK, axum::Json(serde_json::json!({ "devices": devs })))
+}
+
+/// GET /click — état actuel de la piste de clic.
+async fn get_click(State(s): State<AppState>) -> impl IntoResponse {
+    let st = &s.click.state;
+    let cfg = serde_json::json!({
+        "enabled": st.enabled.load(std::sync::atomic::Ordering::Relaxed),
+        "device": st.device.lock().unwrap().clone(),
+        "volume": st.volume.load(std::sync::atomic::Ordering::Relaxed),
+        "delay_ms": st.delay_ms.load(std::sync::atomic::Ordering::Relaxed),
+        "accent": st.accent.load(std::sync::atomic::Ordering::Relaxed),
+    });
+    (StatusCode::OK, axum::Json(cfg))
+}
+
+#[derive(serde::Deserialize)]
+struct ClickReq {
+    enabled: Option<bool>,
+    device: Option<String>,
+    volume: Option<u8>,
+    delay_ms: Option<i32>,
+    accent: Option<bool>,
+}
+
+/// POST /click — met à jour la config de la piste de clic.
+async fn post_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> impl IntoResponse {
+    let st = &s.click.state;
+    if let Some(v) = b.enabled {
+        s.click.set_enabled(v);
+    }
+    if let Some(d) = b.device {
+        let d2 = if d.is_empty() { None } else { Some(d) };
+        s.click.set_device(d2);
+    }
+    if let Some(v) = b.volume {
+        st.volume.store(v.min(100), std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(v) = b.delay_ms {
+        st.delay_ms.store(v.max(0).min(500), std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(v) = b.accent {
+        st.accent.store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1039,6 +1094,31 @@ async fn main() {
             loop_name: Mutex::new(String::new()),
             loop_volume: AtomicU8::new(80),
         }),
+        click: {
+            // Piste de clic : config par variables d'environnement
+            let st = click::ClickState {
+                enabled: std::sync::atomic::AtomicBool::new(
+                    std::env::var("CLICK_ENABLED").map(|v| v == "1").unwrap_or(false),
+                ),
+                device: std::sync::Mutex::new(
+                    std::env::var("CLICK_DEVICE").ok().filter(|s| !s.is_empty()),
+                ),
+                volume: std::sync::atomic::AtomicU8::new(
+                    std::env::var("CLICK_VOLUME").ok().and_then(|v| v.parse().ok()).unwrap_or(80),
+                ),
+                delay_ms: std::sync::atomic::AtomicI32::new(
+                    std::env::var("CLICK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20),
+                ),
+                accent: std::sync::atomic::AtomicBool::new(
+                    std::env::var("CLICK_ACCENT").map(|v| v != "0").unwrap_or(true),
+                ),
+            };
+            let h = click::start_click(std::sync::Arc::new(st));
+            if h.state.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                h.set_enabled(true);
+            }
+            h
+        },
     };
 
     async fn samples_list() -> impl IntoResponse {
@@ -1062,6 +1142,8 @@ async fn main() {
         .route("/note", post(note))
         .route("/samples-list", get(samples_list))
         .route("/rendered/:file", get(serve_rendered))
+        .route("/audio-devices", get(audio_devices))
+        .route("/click", get(get_click).post(post_click))
         .route("/save", post(grilles::save_grille))
         .route("/grilles", get(grilles::list_grilles))
         .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))
@@ -1096,6 +1178,9 @@ async fn main() {
     println!("     GET  /rendered/<f>  → WAV temporaire du bounce PostProd");
     println!("     POST /render-notes  → notes mode classique (PianoRoll)");
     println!("     POST /note          → audition note en direct (preview)");
+    println!("     GET  /audio-devices → lister les sorties audio (cpal)");
+    println!("     GET  /click         → config de la piste de clic");
+    println!("     POST /click         → modifier la config du clic");
     println!("     GET  /samples-list  → boucles WAV disponibles");
     println!("     POST /save          → sauvegarder une grille (JSON)");
     println!("     GET  /grilles       → lister les grilles");
