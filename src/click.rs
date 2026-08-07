@@ -209,6 +209,7 @@ pub fn play_dual(
     click_path: &str,
     device_name: &str,
     click_gain: f32,
+    click_delay_ms: i32,
 ) -> Result<(), String> {
     // Arrêter un éventuel lecteur précédent
     stop_dual();
@@ -272,6 +273,20 @@ pub fn play_dual(
         let mch = main_ch.max(1) as usize;
         let cch = click_ch.max(1) as usize;
         let max_frames = (main_s.len() / mch).max(click_s.len() / cch);
+        // Compensation de latence : `click_delay_ms` > 0 → retarde le CLIC
+        // (le chemin USB direct sort en avance sur le chemin PipeWire) ;
+        // < 0 → retarde le MAIN. Silence inséré au début du flux concerné.
+        let sr_us = sr.max(1) as usize;
+        let click_delay_frames = if click_delay_ms > 0 {
+            (click_delay_ms as usize * sr_us) / 1000
+        } else {
+            0
+        };
+        let main_delay_frames = if click_delay_ms < 0 {
+            ((-click_delay_ms) as usize * sr_us) / 1000
+        } else {
+            0
+        };
         let mut i = 0usize;
         while i < max_frames && !stop.load(Ordering::Relaxed) {
             // Backpressure : garder ~200 ms d'avance max
@@ -283,10 +298,12 @@ pub fn play_dual(
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
-            let ml = main_s.get(i * mch).copied().unwrap_or(0) as f32 / 32768.0;
-            let mr = main_s.get(i * mch + 1).copied().unwrap_or(0) as f32 / 32768.0;
-            let cl = click_s.get(i * cch).copied().unwrap_or(0) as f32 / 32768.0 * click_gain;
-            let cr = click_s.get(i * cch + 1).copied().unwrap_or(0) as f32 / 32768.0 * click_gain;
+            let mi = if i >= main_delay_frames { i - main_delay_frames } else { usize::MAX };
+            let ci = if i >= click_delay_frames { i - click_delay_frames } else { usize::MAX };
+            let ml = main_s.get(mi * mch).copied().unwrap_or(0) as f32 / 32768.0;
+            let mr = main_s.get(mi * mch + 1).copied().unwrap_or(0) as f32 / 32768.0;
+            let cl = click_s.get(ci * cch).copied().unwrap_or(0) as f32 / 32768.0 * click_gain;
+            let cr = click_s.get(ci * cch + 1).copied().unwrap_or(0) as f32 / 32768.0 * click_gain;
             let mut frame = vec![ml, mr, cl, cr];
             frame.resize(ch, 0.0);
             let mut r = ring_feed.lock().unwrap();
