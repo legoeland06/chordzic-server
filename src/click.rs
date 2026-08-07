@@ -208,8 +208,7 @@ pub fn play_dual(
     main_path: &str,
     click_path: &str,
     device_name: &str,
-    click_gain: f32,
-    click_delay_ms: i32,
+    state: Arc<ClickState>,
 ) -> Result<(), String> {
     // Arrêter un éventuel lecteur précédent
     stop_dual();
@@ -273,22 +272,25 @@ pub fn play_dual(
         let mch = main_ch.max(1) as usize;
         let cch = click_ch.max(1) as usize;
         let max_frames = (main_s.len() / mch).max(click_s.len() / cch);
-        // Compensation de latence : `click_delay_ms` > 0 → retarde le CLIC
-        // (le chemin USB direct sort en avance sur le chemin PipeWire) ;
-        // < 0 → retarde le MAIN. Silence inséré au début du flux concerné.
         let sr_us = sr.max(1) as usize;
-        let click_delay_frames = if click_delay_ms > 0 {
-            (click_delay_ms as usize * sr_us) / 1000
-        } else {
-            0
-        };
-        let main_delay_frames = if click_delay_ms < 0 {
-            ((-click_delay_ms) as usize * sr_us) / 1000
-        } else {
-            0
-        };
         let mut i = 0usize;
         while i < max_frames && !stop.load(Ordering::Relaxed) {
+            // Compensation de latence LUE EN DIRECT dans l'état partagé :
+            // modifier delay_ms/volume PENDANT la lecture décale le clic
+            // immédiatement (calage à l'oreille sans relancer).
+            //   delay_ms > 0 → retarde le CLIC ; < 0 → retarde le MAIN.
+            let delay_ms = state.delay_ms.load(Ordering::Relaxed);
+            let click_gain = state.volume.load(Ordering::Relaxed) as f32 / 100.0;
+            let click_delay_frames = if delay_ms > 0 {
+                (delay_ms as usize * sr_us) / 1000
+            } else {
+                0
+            };
+            let main_delay_frames = if delay_ms < 0 {
+                ((-delay_ms) as usize * sr_us) / 1000
+            } else {
+                0
+            };
             // Backpressure : garder ~200 ms d'avance max
             let frames_ready = {
                 let r = ring_feed.lock().unwrap();

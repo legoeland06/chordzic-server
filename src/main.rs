@@ -1262,8 +1262,9 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     // Essai du mode SÉPARÉ (appareil 4 canaux : agrégat Mac / multi ALSA).
     // En cas d'échec (sortie non multicanal, introuvable, occupée…) →
     // REPLI automatique : clic MÉLANGÉ au son principal (synchro parfaite).
-    let click_delay_ms = cfg.delay_ms;
-    match click::play_dual(&main_path, &click_path, &out_device, gain, click_delay_ms) {
+    // Le décalage/volume du clic sont lus EN DIRECT dans l'état partagé
+    // (réglables pendant la lecture).
+    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone()) {
         Ok(()) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({
