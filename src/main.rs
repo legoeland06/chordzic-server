@@ -1148,10 +1148,123 @@ async fn navig_click_start(State(s): State<AppState>, Json(b): Json<ClickStartRe
     }
 }
 
-/// POST /navig-click-stop — arrête le clic séparé en cours.
+/// POST /navig-click-stop — arrête le clic séparé (ou la lecture double canaux).
 async fn navig_click_stop() -> impl IntoResponse {
     click::stop_click();
+    click::stop_dual();
     (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+}
+
+/// POST /navig-play — lecture SERVEUR du rendu en double canaux :
+/// le WAV principal (canaux 1-2) + le clic (canaux 3-4) sur un appareil
+/// MULTICANAL (agrégat CoreAudio) → UNE seule horloge, synchro
+/// échantillon-parfaite entre les deux sorties physiques.
+async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoResponse {
+    // 1. Rendu du WAV principal (sans clic)
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
+    };
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à jouer").into_response();
+    }
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+    let (smf, total_beats, all_notes) = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
+        let custom_channels: std::collections::HashSet<u8> = b.custom_channels
+            .iter()
+            .copied()
+            .chain(b.custom_notes.iter().map(|n| n.channel))
+            .collect();
+        let classic = render::generate_notes(&notes_arrays, &beats, &rcfg);
+        let mut merged: Vec<render::CustomNote> = classic
+            .into_iter()
+            .filter(|n| !custom_channels.contains(&n.channel))
+            .collect();
+        for cn in &b.custom_notes {
+            let vol = rcfg.tracks.iter()
+                .find(|t| t.channel == cn.channel)
+                .map_or(127, |t| t.volume) as u32;
+            let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
+            merged.push(render::CustomNote {
+                channel: cn.channel,
+                start_time: cn.start_time,
+                pitch: cn.pitch,
+                duration: cn.duration,
+                velocity: v,
+            });
+        }
+        let tracks: Vec<render::TrackCfg> = rcfg.tracks.to_vec();
+        let smf = render::generate_smf_from_custom(&merged, &tracks, b.tempo as u16);
+        let tb = merged.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max);
+        (smf, tb, merged)
+    } else {
+        let smf = render::generate_smf_fmt0(&notes_arrays, &beats, &rcfg);
+        let tb = beats.iter().sum();
+        let classic = render::generate_notes(&notes_arrays, &beats, &rcfg);
+        (smf, tb, classic)
+    };
+
+    let sf_path = s.soundfont.as_deref().unwrap_or("/usr/share/sounds/sf3/MuseScore_General_Full.sf3");
+    let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
+    let has_fx = rcfg.tracks.iter().any(|t| !t.fx.is_off());
+    let main_wav = if has_fx {
+        render::render_wav_mixed(&all_notes, &rcfg, sf_path, duration_sec, b.master_vol)
+    } else {
+        render::render_wav(&smf, sf_path, duration_sec, b.master_vol)
+    };
+    let main_wav = match main_wav {
+        Ok(w) => w,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Rendu : {}", e)).into_response(),
+    };
+
+    // 2. Sortie dédiée (l'appareil MULTICANAL — agrégat)
+    let cfg = click::load(&s.click);
+    let out_device = match cfg.out_device {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            return (StatusCode::BAD_REQUEST,
+                "Aucune sortie dédiée configurée — choisis l'appareil multicanal (agrégat) dans le contrôle Clic")
+                .into_response()
+        }
+    };
+
+    // 3. Rendu du clic
+    let bars = (sig_code(&b.sig) / 10).max(1) as u64;
+    let click_smf = render::generate_click_smf(b.tempo.max(1) as u16, bars, total_beats, cfg.accent, cfg.sound);
+    let click_wav = match render::render_wav(&click_smf, sf_path, duration_sec, 127) {
+        Ok(c) => c,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Rendu clic : {}", e)).into_response()
+        }
+    };
+
+    // 4. Fichiers temporaires + lecture double canaux
+    let dir = std::env::temp_dir().join("chordj_rendered");
+    let _ = std::fs::create_dir_all(&dir);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let main_name = format!("dual_{}_main.wav", ts);
+    let click_name = format!("dual_{}_click.wav", ts);
+    let _ = std::fs::write(dir.join(&main_name), &main_wav);
+    let _ = std::fs::write(dir.join(&click_name), &click_wav);
+    let gain = (cfg.volume as f32 / 100.0) * 1.0;
+    match click::play_dual(
+        dir.join(&main_name).to_str().unwrap_or(""),
+        dir.join(&click_name).to_str().unwrap_or(""),
+        &out_device,
+        gain,
+    ) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "ok": true, "mode": "channels", "duration_sec": duration_sec })),
+        ).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────
@@ -1242,6 +1355,7 @@ async fn main() {
         .route("/click", get(get_click).post(post_click))
         .route("/navig-click-start", post(navig_click_start))
         .route("/navig-click-stop", post(navig_click_stop))
+        .route("/navig-play", post(navig_play))
         .route("/save", post(grilles::save_grille))
         .route("/grilles", get(grilles::list_grilles))
         .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))

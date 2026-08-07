@@ -12,12 +12,13 @@
 // Il n'y a PAS de clic live (mode MIDI temps réel) — retiré car
 // désynchronisé (deux horloges audio indépendantes).
 
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::{Decoder, OutputStream, Sink};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 // Sons de clic disponibles (pour le rendu) :
@@ -157,6 +158,158 @@ pub fn stop_click() {
         s.stop();
         println!("   🛑 Clic séparé arrêté");
     }
+}
+
+// ─── Lecture DOUBLE canaux (main ch1-2 + clic ch3-4) ──────────────────────
+// Synchro ÉCHANTILLON-PARFAITE entre les deux sorties : UN SEUL flux cpal sur
+// un appareil MULTICANAL (ex : Agrégat CoreAudio = sortie intégrée + hub USB-C),
+// le main part sur les canaux 1-2, le clic sur les canaux 3-4. Une seule
+// horloge → aucun décalage possible, c'est la seule façon musicalement correcte
+// de sortir deux sons différents vers deux sorties physiques.
+
+// ─── Lecture DOUBLE canaux (main ch1-2 + clic ch3-4) ──────────────────────
+// Synchro ÉCHANTILLON-PARFAITE entre les deux sorties : UN SEUL flux cpal sur
+// un appareil MULTICANAL (ex : Agrégat CoreAudio = sortie intégrée + hub USB-C),
+// le main part sur les canaux 1-2, le clic sur les canaux 3-4. Une seule
+// horloge → aucun décalage possible, c'est la seule façon musicalement correcte
+// de sortir deux sons différents vers deux sorties physiques.
+
+/// Flag d'arrêt partagé : le stream cpal n'est pas Send, il vit dans le
+/// thread feeder ; l'arrêt passe donc par ce flag (le feeder drop le stream).
+static DUAL_STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+fn dual_stop_flag() -> &'static Arc<AtomicBool> {
+    DUAL_STOP.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+/// cpal::Stream est marqué !Send par conservatisme, mais il est en pratique
+/// portable entre threads pour ALSA/WASAPI/CoreAudio (le thread de callback
+/// est interne à cpal ; le drop sur un autre thread est pris en charge).
+struct SendStream(#[allow(dead_code)] cpal::Stream);
+unsafe impl Send for SendStream {}
+
+/// Lit un WAV 16-bit en Vec<i16> (tous canaux entrelacés).
+fn read_wav_i16(path: &str) -> Result<(Vec<i16>, u16, u32), String> {
+    let mut r = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let spec = r.spec();
+    let samples: Vec<i16> = r.samples::<i16>().collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    Ok((samples, spec.channels, spec.sample_rate))
+}
+
+/// Joue main (canaux 1-2) + clic (canaux 3-4) sur l'appareil `device_name`
+/// (doit avoir ≥ 4 canaux de sortie). Le clic est atténué par `click_gain`.
+pub fn play_dual(
+    main_path: &str,
+    click_path: &str,
+    device_name: &str,
+    click_gain: f32,
+) -> Result<(), String> {
+    // Arrêter un éventuel lecteur précédent
+    stop_dual();
+
+    let device = find_device(device_name)
+        .ok_or_else(|| format!("Sortie « {} » introuvable", device_name))?;
+    let default_cfg = device.default_output_config().map_err(|e| e.to_string())?;
+    let channels = default_cfg.channels();
+    if channels < 4 {
+        return Err(format!(
+            "La sortie « {} » n'a que {} canaux. Il faut un appareil MULTICANAL (≥ 4 canaux) : sur Mac, crée un Agrégat dans Configuration Audio-MIDI (sortie intégrée + hub USB-C) et choisis-le comme sortie du clic.",
+            device_name, channels
+        ));
+    }
+
+    let (main_s, main_ch, main_sr) = read_wav_i16(main_path)?;
+    let (click_s, click_ch, click_sr) = read_wav_i16(click_path)?;
+    if main_sr != click_sr {
+        return Err(format!("Fréquences différentes : main {} Hz / clic {} Hz", main_sr, click_sr));
+    }
+    let sr = default_cfg.sample_rate().0;
+    if sr != main_sr {
+        // Le device a une fréquence différente : on joue quand même (cpal
+        // convertit) mais on prévient d'un léger changement de pitch possible.
+        eprintln!("   ⚠️ Clic : device {} Hz vs WAV {} Hz", sr, main_sr);
+    }
+
+    let stop = dual_stop_flag().clone();
+    stop.store(false, Ordering::Relaxed);
+    let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let ring_cb = ring.clone();
+    let err_cb = |e| eprintln!("   ⚠️ Dual : erreur audio : {}", e);
+    let config: cpal::StreamConfig = default_cfg.into();
+    let ch = channels.max(1) as usize;
+
+    let stream = device
+        .build_output_stream(
+            &config,
+            move |data: &mut [f32], _| {
+                let mut r = ring_cb.lock().unwrap();
+                for frame in data.chunks_mut(ch) {
+                    for out in frame.iter_mut() {
+                        *out = r.pop_front().unwrap_or(0.0);
+                    }
+                }
+            },
+            err_cb,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    stream.play().map_err(|e| e.to_string())?;
+
+    println!("   🎧 Lecture double canaux sur « {} » ({} ch) — main 1-2, clic 3-4", device_name, channels);
+
+    // Thread alimenteur : possède le stream (via SendStream), interleave
+    // main (ch1-2) + clic (ch3-4, gain), et lâche le stream à la fin.
+    let stream = SendStream(stream);
+    let ring_feed = ring.clone();
+    std::thread::spawn(move || {
+        let _stream = stream; // vit ici jusqu'à la fin de la lecture
+        let mch = main_ch.max(1) as usize;
+        let cch = click_ch.max(1) as usize;
+        let max_frames = (main_s.len() / mch).max(click_s.len() / cch);
+        let mut i = 0usize;
+        while i < max_frames && !stop.load(Ordering::Relaxed) {
+            // Backpressure : garder ~200 ms d'avance max
+            let frames_ready = {
+                let r = ring_feed.lock().unwrap();
+                r.len() / ch
+            };
+            if frames_ready > (sr / 5) as usize {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            let ml = main_s.get(i * mch).copied().unwrap_or(0) as f32 / 32768.0;
+            let mr = main_s.get(i * mch + 1).copied().unwrap_or(0) as f32 / 32768.0;
+            let cl = click_s.get(i * cch).copied().unwrap_or(0) as f32 / 32768.0 * click_gain;
+            let cr = click_s.get(i * cch + 1).copied().unwrap_or(0) as f32 / 32768.0 * click_gain;
+            let mut frame = vec![ml, mr, cl, cr];
+            frame.resize(ch, 0.0);
+            let mut r = ring_feed.lock().unwrap();
+            for s in frame {
+                r.push_back(s);
+            }
+            i += 1;
+        }
+        // Fin de lecture : laisser le ring se vider puis fermer
+        loop {
+            let remaining = {
+                let r = ring_feed.lock().unwrap();
+                r.len()
+            };
+            if remaining == 0 || stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // drop(_stream) ici → coupure audio
+        println!("   ✅ Lecture double canaux terminée");
+    });
+
+    Ok(())
+}
+
+/// Arrête la lecture double canaux en cours (le feeder drop le stream).
+pub fn stop_dual() {
+    dual_stop_flag().store(true, Ordering::Relaxed);
+    println!("   🛑 Lecture double canaux : arrêt demandé");
 }
 
 // ─── Énumération des devices de sortie (pour le frontend) ──────────────────
