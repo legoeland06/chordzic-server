@@ -202,14 +202,20 @@ fn click_audio_thread(rx: Receiver<Msg>, state: Arc<ClickState>) {
     let mut last_enabled = state.enabled.load(Ordering::Relaxed);
 
     loop {
-        // 1. Traiter les messages disponibles. Polling serré (2 ms) quand
-        //    des ticks attendent (moins de gigue), large (15 ms) sinon.
-        let poll = if pending.is_empty() {
-            Duration::from_millis(15)
-        } else {
-            Duration::from_millis(2)
+        // 1. Attendre le prochain message OU le prochain tick à jouer.
+        //    Le timeout est borné par le tick le plus proche → réveil PRÉCIS
+        //    à l'échéance (gigue < 1 ms), au lieu d'un polling lâche qui
+        //    faisait varier l'instant de lecture du clic de ±15 ms.
+        let delay = Duration::from_millis(state.delay_ms.load(Ordering::Relaxed).max(0) as u64);
+        let timeout = match pending.front() {
+            Some(&(_, at)) => {
+                let until = at + delay;
+                let t = until.saturating_duration_since(Instant::now());
+                t.min(Duration::from_millis(15))
+            }
+            None => Duration::from_millis(15),
         };
-        let msg = rx.recv_timeout(poll);
+        let msg = rx.recv_timeout(timeout);
         match msg {
             Ok(Msg::Tick { accent, at }) => pending.push_back((accent, at)),
             Ok(Msg::Ctrl(CtrlMsg::SetEnabled(v))) => {
@@ -238,7 +244,6 @@ fn click_audio_thread(rx: Receiver<Msg>, state: Arc<ClickState>) {
         }
 
         // 3. Jouer les ticks arrivés à échéance
-        let delay = Duration::from_millis(state.delay_ms.load(Ordering::Relaxed).max(0) as u64);
         if let Some(a) = audio.as_mut() {
             loop {
                 let due = match pending.front() {

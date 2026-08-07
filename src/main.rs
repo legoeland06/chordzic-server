@@ -821,9 +821,9 @@ async fn render_wav(
             // Clic intégré au rendu (mode Navig) : le clic est rendu à part
             // (SMF woodblock) puis MÉLANGÉ au WAV principal → synchro
             // échantillon-parfaite par construction (même tempo, même passe).
-            if b.click_in_render
-                && s.click.state.enabled.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            // Le flag click_in_render suffit (la checkbox « Dans le rendu »
+            // EST l'intention) — indépendant du toggle live.
+            if b.click_in_render {
                 let click_vol = s.click.state.volume.load(std::sync::atomic::Ordering::Relaxed);
                 let click_accent = s.click.state.accent.load(std::sync::atomic::Ordering::Relaxed);
                 let bars = (sig_code(&b.sig) / 10).max(1) as u64;
