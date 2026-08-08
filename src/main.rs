@@ -36,7 +36,7 @@ mod walking;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -1373,6 +1373,27 @@ async fn main() {
         (StatusCode::OK, axum::Json(data))
     }
 
+    /// Sert un fichier sample (~/samples/drums/<name>) au navigateur — utilisé
+    /// par la boucle sample du mode Navig (lecture Web Audio côté client).
+    async fn sample_file(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
+        // Sécurité : nom de fichier simple uniquement (pas de chemin)
+        if name.contains('/') || name.contains("\\") || name.contains("..") {
+            return (StatusCode::BAD_REQUEST, "nom de fichier invalide").into_response();
+        }
+        let dir = samples::drum_dir();
+        match std::fs::read(std::path::Path::new(&dir).join(&name)) {
+            Ok(data) => {
+                let typ = if name.to_ascii_lowercase().ends_with(".wav") {
+                    "audio/wav"
+                } else {
+                    "application/octet-stream"
+                };
+                (StatusCode::OK, [(header::CONTENT_TYPE, typ)], data).into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, "sample introuvable").into_response(),
+        }
+    }
+
     let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
 
     // ── Construction du routeur ───────────────────────────────────
@@ -1388,6 +1409,7 @@ async fn main() {
         .route("/render-notes", post(render_notes))
         .route("/note", post(note))
         .route("/samples-list", get(samples_list))
+        .route("/sample-file/:name", get(sample_file))
         .route("/rendered/:file", get(serve_rendered))
         .route("/audio-devices", get(audio_devices))
         .route("/click", get(get_click).post(post_click))
