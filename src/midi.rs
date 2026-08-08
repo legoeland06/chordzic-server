@@ -17,7 +17,7 @@
 ///   à 100 BPM pour une résolution en 16ème de note ~= 30ms min).
 use midir::{MidiOutput, MidiOutputConnection};
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use crate::patterns::{sc, DRUM_HH, DRUM_HH_OPEN, DRUM_KICK, DRUM_RIDE, DRUM_RIM, DRUM_SNARE, HH_8TH, HH_BEAT, PAT_BOSSA, PAT_JAZZ, PAT_ONEDROP, PAT_POP, PAT_REGGAE};
@@ -81,10 +81,6 @@ pub struct Live {
     pub walking: AtomicBool,              // Walking bass activée/désactivée
     pub master_vol: AtomicU8,             // Master volume global (0-127)
     pub use432: AtomicBool,               // Accordage 432Hz au lieu de 440Hz
-    pub loop_offset: AtomicI32,           // Décalage en ms pour la boucle WAV drums
-    pub use_loops: AtomicBool,            // Boucle WAV drums activée
-    pub loop_name: Mutex<String>,         // Nom du fichier de boucle WAV courant
-    pub loop_volume: AtomicU8,            // Volume de la boucle WAV (0-127)
 }
 
 // ─── Note MIDI ──────────────────────────────────────────────────────────
@@ -830,10 +826,6 @@ mod tests {
             walking: AtomicBool::new(false),
             master_vol: AtomicU8::new(127),
             use432: AtomicBool::new(false),
-            loop_offset: AtomicI32::new(0),
-            use_loops: AtomicBool::new(false),
-            loop_name: Mutex::new(String::new()),
-            loop_volume: AtomicU8::new(80),
         }
     }
 

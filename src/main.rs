@@ -22,7 +22,6 @@
 /// - `midi`     : communication MIDI live + génération de notes
 /// - `patterns` : constantes et identifiants des patterns drums
 /// - `render`   : génération SMF + rendu WAV batch
-/// - `samples`  : gestion des boucles WAV drums (rodio)
 /// - `walking`  : génération de walking bass
 /// - `grilles`  : sauvegarde/chargement des grilles en JSON
 mod click;
@@ -373,10 +372,6 @@ struct Cfg {
     walking: Option<bool>,
     master_vol: Option<u8>,
     use432: Option<bool>,
-    loop_offset: Option<i32>,
-    use_loops: Option<bool>,
-    loop_name: Option<String>,
-    loop_volume: Option<u8>,
 }
 
 // ─── Valeurs par défaut pour serde ──────────────────────────────────────
@@ -477,17 +472,6 @@ async fn play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoRes
     if let Some(link) = link {
         let h2 = link.handle;
 
-        // Lancer la boucle WAV (si active) AVANT la séquence MIDI
-        let tempo_now = lv.tempo.load(std::sync::atomic::Ordering::Relaxed);
-        let loop_active = lv.use_loops.load(std::sync::atomic::Ordering::Relaxed);
-        if loop_active {
-            let lname = lv.loop_name.lock().unwrap().clone();
-            let name_opt = if lname.is_empty() { None } else { Some(lname.as_str()) };
-            let lvol = lv.loop_volume.load(std::sync::atomic::Ordering::Relaxed);
-            samples::set_volume(lvol);
-            samples::play_loop(tempo_now, name_opt, lv.loop_offset.load(std::sync::atomic::Ordering::Relaxed));
-        }
-
         // Séquence d'accords ou notes immédiates ?
         if !ev.is_empty() {
             let sq = ev.to_vec();
@@ -548,7 +532,6 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
     }
     if let Some(t) = b.tempo {
         lv.tempo.store(t, std::sync::atomic::Ordering::Relaxed);
-        samples::set_current_tempo(t);
     }
     if let Some(ref sg) = b.sig {
         lv.sig.store(sig_code(sg), std::sync::atomic::Ordering::Relaxed);
@@ -580,23 +563,6 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
         }
     }
 
-    // Boucle WAV drums
-    if let Some(off) = b.loop_offset {
-        lv.loop_offset.store(off, std::sync::atomic::Ordering::Relaxed);
-        samples::update_offset(off);
-    }
-    if let Some(lo) = b.use_loops {
-        lv.use_loops.store(lo, std::sync::atomic::Ordering::Relaxed);
-        samples::set_use_loops(lo);
-    }
-    if let Some(ref n) = b.loop_name {
-        *lv.loop_name.lock().unwrap() = n.clone();
-    }
-    if let Some(lv2) = b.loop_volume {
-        lv.loop_volume.store(lv2, std::sync::atomic::Ordering::Relaxed);
-        samples::set_volume(lv2);
-    }
-
     Json(Rsp {
         status: "ok".into(),
     })
@@ -605,7 +571,6 @@ async fn conf(State(s): State<AppState>, Json(b): Json<Cfg>) -> impl IntoRespons
 /// POST /stop — Arrête la lecture live.
 async fn stop(State(s): State<AppState>) -> impl IntoResponse {
     s.live.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    samples::stop_loop();
     let link = s.midi.lock().unwrap().clone();
     if let Some(link) = link {
         if let Ok(mut c) = link.handle.lock() {
@@ -1317,10 +1282,9 @@ async fn main() {
 
     // Initialisation MIDI
     let midi = Arc::new(Mutex::new(init_midi().map(|(handle, port)| MidiLink { handle, port })));
-    samples::init();
 
     use patterns::PAT_ROCK;
-    use std::sync::atomic::{AtomicI32, AtomicU16, AtomicU8};
+    use std::sync::atomic::{AtomicU16, AtomicU8};
     use std::sync::Mutex;
 
     let state = AppState {
@@ -1341,10 +1305,6 @@ async fn main() {
             walking: AtomicBool::new(false),
             master_vol: AtomicU8::new(127),
             use432: AtomicBool::new(false),
-            loop_offset: AtomicI32::new(0),
-            use_loops: AtomicBool::new(false),
-            loop_name: Mutex::new(String::new()),
-            loop_volume: AtomicU8::new(80),
         }),
         click: Arc::new(click::ClickState {
             volume: std::sync::atomic::AtomicU8::new(
