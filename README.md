@@ -1,67 +1,112 @@
-# chords-server-rs
+# chords-server-rs — Backend de chordZIC V2
 
-Backend MIDI pour chordJAVA v2 — serveur HTTP Axum qui convertit des requêtes JSON en messages MIDI vers FluidSynth.
+Serveur HTTP **Rust / Axum** qui convertit des requêtes JSON en messages **MIDI** vers
+**FluidSynth** (lecture temps réel) et produit des rendus **WAV** hors-ligne.
+
+C'est le moteur de **chordZIC V2** : un séquenceur de grilles d'accords web avec
+piano rolls, pistes drums, boucles d'échantillons et export audio.
+
+- Frontend : [chordzic-frontend](https://github.com/legoeland06/chordzic-frontend)
+- Écoute sur **http://localhost:4000** par défaut.
+
+---
+
+## Fonctionnalités
+
+- **Lecture MIDI temps réel** multi-pistes : Lead, Bass, Nappes, Drums, Accent
+- **6 patterns batterie** : Rock, Reggae, Jazz, Pop, Bossa, OneDrop
+- **Walking Bass** : chromatique, dominante, diatonique
+- **Pompe skank** : Lead en staccato sur les contretemps 8ème
+- **Accent 2&4** : piano Bright Acoustic sur les temps 2 et 4 (désactivé sur les accords courts)
+- **A = 432 Hz** : pitch bend MIDI sur les canaux mélodiques
+- **Master volume** : appliqué à toutes les vélocités
+- **Pistes drums** : les notes des pistes drums sont jouées sur le canal 9 (kit GM standard)
+- **Silences réels** : `4:_`, `2:_`, `1:_` coupent tout (accords, nappes, drums) mais le timing avance
+- **Rendu WAV hors-ligne** : morceau complet, par pistes, ou notes isolées
+- **Échantillons (samples)** : liste, fichier, boucle alignée sur la grille (recadrage tempo/signature côté extraction)
+- **Grilles** : sauvegarde / liste / suppression côté serveur (JSON)
+- **Métronome** : click paramétrable + démarrage/arrêt en mode navigation
+- **Frontend embarqué** (feature `standalone`) : le serveur sert l'application React complète
+
+---
 
 ## Compilation
 
 ```bash
-cargo build --release
+# Mode développement (sert static/index.html sur /)
+cargo build
+
+# Binaire standalone avec le frontend React embarqué (recommandé)
+cargo build --release --features standalone
 ```
 
-## Dépendances
+Prérequis : Rust ≥ 1.97 (edition 2021), FluidSynth installé avec une SoundFont
+(ex. `MuseScore_General_Full.sf3`).
 
-- Rust edition 2021
-- `axum` 0.7 — serveur HTTP
-- `midir` 0.9 — sortie MIDI
-- `tokio` 1 — async runtime
-- `serde` / `serde_json` — JSON
-- `tower-http` — CORS
+## Lancement
+
+```bash
+# Depuis le dossier du binaire
+./chords-server-rs
+# puis ouvrir http://localhost:4000
+```
+
+⚠️ **MIDI** : par défaut, le serveur **auto-détecte** le port FluidSynth (mode
+recommandé). Pour forcer un index : `MIDI_PORT=N ./chords-server-rs`.
+Ne pas définir `MIDI_PORT` sur un index invalide → serveur muet.
 
 ## Routes API
 
-### `GET /`
-Page statique (index.html dans `static/`).
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| GET | `/` | Page (frontend embarqué en standalone, sinon `static/index.html`) |
+| POST | `/play` | Lance la lecture d'une séquence d'accords (tempo, signature, pattern, tracks…) |
+| POST | `/config` | Paramètres en temps réel |
+| POST | `/stop` | Arrête la lecture |
+| POST | `/note` | Note MIDI immédiate (canal, note, vélocité) |
+| POST | `/render-wav` | Rendu WAV du morceau complet |
+| POST | `/render-tracks` | Rendu WAV par piste |
+| POST | `/render-notes` | Rendu WAV de notes isolées |
+| GET | `/samples-list` | Liste des échantillons disponibles |
+| GET | `/sample-file/:name` | Fichier d'un échantillon |
+| GET | `/rendered/:file` | Fichier de rendu généré |
+| GET | `/audio-devices` | Périphériques audio disponibles |
+| GET/POST | `/click` | Configuration / état du métronome |
+| POST | `/navig-click-start` / `/navig-click-stop` | Métronome en mode navigation |
+| POST | `/navig-play` | Lecture en mode navigation |
+| POST | `/save` | Sauvegarde une grille |
+| GET | `/grilles` | Liste des grilles sauvegardées |
+| DELETE | `/grilles/:name` | Supprime une grille |
 
-### `POST /play`
-Lance la lecture d'une séquence d'accords.
+## Tracks MIDI par défaut
 
-**Body :**
-```json
-{
-  "sequence": [{"notes": ["C4","E4","G4","B4"], "beats": 4}],
-  "tempo": 120,
-  "sig": "4/4",
-  "pattern": "rock",
-  "walking": false,
-  "loop_enabled": false,
-  "tracks": [
-    {"channel": 0, "program": 51, "volume": 15, "mute": false}
-  ]
-}
-```
-
-### `POST /config`
-Configure les paramètres en temps réel.
-
-### `POST /stop`
-Arrête la lecture en cours.
-
-## MIDI Tracks
-
-| Index | Canal | Label | Program défaut |
-|-------|-------|-------|----------------|
+| Index | Canal | Label | Program par défaut |
+|-------|-------|-------|--------------------|
 | 0 | 0 | Lead | 51 (Synth Strings) |
 | 1 | 2 | Bass | 33 (Acoustic Bass) |
 | 2 | 3 | Nappes | 48 (String Ensemble) |
 | 3 | 9 | Drums | 1 (Standard Kit) |
 | 4 | 4 | Accent | 2 (Bright Acoustic Piano) |
 
-## Fonctionnalités intégrées
+## Modules sources
 
-- **6 patterns batterie** : Rock, Reggae, Jazz, Pop, Bossa, OneDrop
-- **Walking Bass** : chromatique, dominante, diatonique
-- **Pompe Skank** : Lead en staccato sur contretemps 8ème
-- **Accent 2&4** : Piano Bright Acoustic sur temps 2 et 4
-- **A=432Hz** : Pitch bend MIDI sur canaux 0,2,3,4
-- **Master Volume** : appliqué à toutes les vélocités
-- **Multi-threading** : lecture isolée dans un thread séparé
+- `main.rs` — serveur Axum, routes, orchestration
+- `midi.rs` — sortie MIDI (midir), FluidSynth
+- `patterns.rs` — patterns batterie
+- `walking.rs` — walking bass
+- `render.rs` — rendu WAV hors-ligne (hound + synthèse)
+- `samples.rs` — échantillons, recadrage sur la grille
+- `click.rs` — métronome
+- `dsp.rs` — traitement audio
+- `grilles.rs` — persistance des grilles
+
+## Dépendances principales
+
+`axum` 0.7 · `tokio` 1 · `serde`/`serde_json` · `tower-http` (CORS) · `midir` 0.9 ·
+`rodio` 0.18 · `cpal` 0.15 · `hound` 3.5 · `rust-embed` (standalone) · `mime_guess`
+
+---
+
+## Développement
+
+**Eric BRUNEAU** — vibe coding Deepseek (legoeland)
