@@ -11,6 +11,18 @@ piano rolls, pistes drums, boucles d'échantillons et export audio.
 
 ---
 
+## Aperçu
+
+En mode **standalone**, le serveur embarque le frontend complet :
+
+![Liste des pistes en mode Live](screenshots/controlPanel_trackListe_modeLive.png)
+*Contrôle et liste des pistes (mode Live — MIDI vers FluidSynth)*
+
+![Grille d'accords en mode Live](screenshots/grille_accords_texte_modeLive.png)
+*Grille d'accords en saisie texte (mode Live)*
+
+---
+
 ## Fonctionnalités
 
 - **Lecture MIDI temps réel** multi-pistes : Lead, Bass, Nappes, Drums, Accent
