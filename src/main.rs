@@ -242,6 +242,10 @@ struct AppState {
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
     soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
     click: Arc<click::ClickState>, // Config du clic (mode rendu uniquement)
+    /// Derniers WAV rendus pour la lecture SÉPARÉE (main, clic) + durée totale :
+    /// un scrub (start_at) relance la lecture depuis l'offset SANS re-rendre
+    /// (FluidSynth ≈ 3 s — le clic lane doit être instantané comme en MIDI).
+    rendered_dual: Arc<Mutex<Option<(String, String, f64)>>>,
 }
 
 /// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
@@ -1518,6 +1522,45 @@ fn start_sec_from_beats(start_at: Option<f64>, tempo: u32) -> f64 {
 /// MULTICANAL (agrégat CoreAudio) → UNE seule horloge, synchro
 /// échantillon-parfaite entre les deux sorties physiques.
 async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoResponse {
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
+    };
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à jouer").into_response();
+    }
+
+    // ── Scrub (start_at) : relance INSTANTANÉE depuis l'offset ──
+    // L'utilisateur a déplacé la tête de lecture pendant la lecture. On
+    // réutilise le rendu déjà fait (fichiers + durée en cache) → pas de
+    // FluidSynth : le clic lane saute aussitôt, comme en lecture MIDI.
+    // (Le rendu complet ≈ 3 s : re-rendre à chaque clic donnait l'impression
+    // que « la lecture continue » sans jamais sauter.)
+    let start_sec = start_sec_from_beats(b.start_at, b.tempo);
+    if start_sec > 0.0 {
+        let cache = s.rendered_dual.lock().unwrap().clone();
+        if let Some((mp, cp, dur)) = cache {
+            if std::path::Path::new(&mp).exists() && std::path::Path::new(&cp).exists() {
+                let cfg = click::load(&s.click);
+                if let Some(d) = cfg.out_device.filter(|d| !d.is_empty()) {
+                    match click::play_dual(&mp, &cp, &d, s.click.clone(), start_sec) {
+                        Ok(()) => {
+                            return (StatusCode::OK, axum::Json(serde_json::json!({
+                                "ok": true,
+                                "mode": "channels",
+                                "duration_sec": (dur - start_sec).max(0.0),
+                            }))).into_response();
+                        }
+                        Err(_) => { /* repli : rendu complet ci-dessous (rare) */ }
+                    }
+                }
+            }
+        }
+    }
+
     // 1. Rendu du WAV principal (sans clic)
     let ev: &[ChordEv] = if !b.seq.is_empty() {
         &b.seq
@@ -1609,10 +1652,8 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     //    MULTICANAL (≥ 4 canaux — agrégat Mac / multi ALSA), sinon REPLI
     //    automatique : clic MÉLANGÉ au son principal (synchro parfaite
     //    quand même — un seul WAV). Plus jamais d'erreur bloquante.
-    //    start_sec : l'utilisateur a déplacé la tête de lecture (scrub) →
-    //    les deux WAV démarrent à cet offset (alignés), le repli mixé est
-    //    tronqué au même offset.
-    let start_sec = start_sec_from_beats(b.start_at, b.tempo);
+    //    start_sec : les deux WAV démarrent à cet offset (alignés), le
+    //    repli mixé est tronqué au même offset.
     let dir = std::env::temp_dir().join("chordj_rendered");
     let _ = std::fs::create_dir_all(&dir);
     let ts = std::time::SystemTime::now()
@@ -1623,6 +1664,13 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     let click_name = format!("dual_{}_click.wav", ts);
     let _ = std::fs::write(dir.join(&main_name), &main_wav);
     let _ = std::fs::write(dir.join(&click_name), &click_wav);
+    // Mettre en cache ce rendu : les prochains scrubs (start_at) le
+    // réutiliseront sans re-rendre (relance instantanée, comme le MIDI).
+    {
+        let mp = dir.join(&main_name).to_str().unwrap_or("").to_string();
+        let cp = dir.join(&click_name).to_str().unwrap_or("").to_string();
+        *s.rendered_dual.lock().unwrap() = Some((mp, cp, duration_sec));
+    }
     let gain = (cfg.volume as f32 / 100.0) * 1.0;
     let main_path = dir.join(&main_name).to_str().unwrap_or("").to_string();
     let click_path = dir.join(&click_name).to_str().unwrap_or("").to_string();
@@ -1731,6 +1779,7 @@ async fn main() {
                 std::env::var("CLICK_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
             ),
         }),
+        rendered_dual: Arc::new(Mutex::new(None)),
     };
 
     async fn samples_list() -> impl IntoResponse {
