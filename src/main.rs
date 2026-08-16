@@ -357,6 +357,10 @@ struct PlayReq {
     custom_channels: Vec<u8>,         // Canaux en mode PianoRoll (même vides) — les autres canaux jouent le mode classique
     #[serde(default)]
     start_at: Option<f64>,            // Position de départ (beats) pour la lecture MIDI
+    #[serde(default)]
+    loop_start: Option<f64>,          // Locator gauche (beats) — intervalle de boucle [L, R[
+    #[serde(default)]
+    loop_end: Option<f64>,            // Locator droit (beats) — intervalle de boucle [L, R[
 }
 
 /// Réponse standardisée du serveur.
@@ -1266,6 +1270,11 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
             let start_at = b.start_at.unwrap_or(0.0);
             // Durée totale en beats (pour le clic métronome MIDI)
             let total_beats = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max);
+            // Intervalle de boucle (locators [L, R[ en beats) : le repeat
+            // boucle [L, R[ au lieu du morceau complet. Invalide → complet.
+            let loop_start = b.loop_start.unwrap_or(0.0);
+            let loop_end = b.loop_end.unwrap_or(0.0);
+            let loop_end = if loop_end > loop_start + 0.01 { loop_end } else { total_beats };
             midi_play_custom(
                 link.handle.clone(),
                 all_notes.clone(),
@@ -1279,6 +1288,8 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
                 total_beats,
                 b.master_vol,
                 b.loop_enabled.unwrap_or(false),
+                loop_start,
+                loop_end,
             );
             drop(guard);
             let dur = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max)
@@ -1324,6 +1335,8 @@ fn midi_play_custom(
     total_beats: f64,
     master_vol: u8,
     loop_playback: bool,
+    loop_start: f64,
+    loop_end: f64,
 ) {
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
@@ -1404,20 +1417,23 @@ fn midi_play_custom(
         // s'accumulaient). Horloge UNIQUE (start.elapsed()) → clic et notes
         // parfaitement synchrones, même en boucle et après un scrub.
         let tempo_ms = 60_000.0 / tempo.max(1) as f64;
-        let total_ms = total_beats * tempo_ms; // période d'une passe (boucle)
+        // Intervalle de boucle (locators [L, R[ en beats) : le repeat boucle
+        // [L, R[ au lieu du morceau complet. Sans intervalle valide :
+        // boucle complète (loop_start = 0, loop_end = total_beats).
+        let loop_end = if loop_end > loop_start + 0.01 { loop_end } else { total_beats };
+        let loop_len_ms = (loop_end - loop_start).max(0.0) * tempo_ms; // durée d'un cycle
         // Durée de la passe 0 (depuis start_at) : après un scrub, la 1re
-        // passe est plus courte que le morceau complet ; les cycles suivants
-        // durent total_ms (morceau complet) — même référentiel que le WAV.
-        let pass0_len_ms = (total_ms - start_at * tempo_ms).max(0.0);
-        // En BOUCLE, TOUTES les notes sont gardées (les passes suivantes
-        // repartent du début) ; sans boucle, on ignore celles avant start_at.
-        let mut sorted: Vec<_> = if loop_playback {
-            notes.into_iter().collect()
-        } else {
-            notes.into_iter()
-                .filter(|n| n.start_time + n.duration > start_at)
-                .collect()
-        };
+        // passe est plus courte que l'intervalle ; les cycles suivants
+        // durent loop_len_ms — même référentiel que le WAV.
+        let pass0_len_ms = ((loop_end - start_at).max(0.0)) * tempo_ms;
+        // En BOUCLE, TOUTES les notes de l'intervalle sont gardées (les
+        // passes suivantes repartent de L) ; sans boucle, on ignore celles
+        // avant start_at. Les notes après le locator droit ne sont jamais
+        // jouées.
+        let mut sorted: Vec<_> = notes.into_iter()
+            .filter(|n| n.start_time < loop_end)
+            .filter(|n| loop_playback || n.start_time + n.duration > start_at)
+            .collect();
         sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
         // Clic : sortie et hauteurs (FluidSynth si dispo, sinon repli).
         let bars = (sig_code_v / 10).max(1) as u64;
@@ -1463,28 +1479,33 @@ fn midi_play_custom(
             }};
         }
         // Planifie le note-on d'une note pour sa passe courante (skip les
-        // passes où la note est entièrement hors passe).
+        // passes où la note est entièrement hors passe ; une note avant le
+        // locator gauche n'est plus jouée après la passe 0).
         macro_rules! plan_note {
             ($i:expr) => {{
                 let mut done = false;
                 while !done {
                     let n = &sorted[$i];
                     let pass = note_pass[$i];
-                    let (target_ms, end_ms) = note_loop_window(pass, n.start_time, start_at, tempo_ms, total_ms);
-                    let dur_eff = if loop_playback {
-                        (end_ms - target_ms - 2.0).min(note_dur[$i] as f64).max(0.0)
+                    if pass >= 1 && n.start_time < loop_start {
+                        done = true; // hors intervalle : plus rien à jouer
                     } else {
-                        note_dur[$i] as f64
-                    };
-                    if dur_eff <= 0.0 {
-                        if !loop_playback {
-                            done = true; // plus rien à jouer pour cette note
+                        let (target_ms, end_ms) = note_loop_window(pass, n.start_time, start_at, loop_start, loop_end, tempo_ms);
+                        let dur_eff = if loop_playback {
+                            (end_ms - target_ms - 2.0).min(note_dur[$i] as f64).max(0.0)
                         } else {
-                            note_pass[$i] += 1; // note hors passe → suivante
+                            note_dur[$i] as f64
+                        };
+                        if dur_eff <= 0.0 {
+                            if !loop_playback {
+                                done = true; // plus rien à jouer pour cette note
+                            } else {
+                                note_pass[$i] += 1; // note hors passe → suivante
+                            }
+                        } else {
+                            push_ev!(target_ms, Ev::NoteOn($i));
+                            done = true;
                         }
-                    } else {
-                        push_ev!(target_ms, Ev::NoteOn($i));
-                        done = true;
                     }
                 }
             }};
@@ -1502,16 +1523,17 @@ fn midi_play_custom(
                 if !loop_playback && b > total_int {
                     // fin de lecture : plus de clic
                 } else {
-                    // Wrap de fin de morceau (boucle) : retour au début. Le
-                    // beat "total_beats" n'est PAS joué (il coïnciderait
-                    // avec le beat 0 du cycle suivant → double clic).
-                    if loop_playback && b as f64 >= total_beats {
-                        b = 0;
+                    // Wrap de fin d'intervalle (boucle) : retour au locator
+                    // gauche. Le beat "loop_end" n'est PAS joué (il
+                    // coïnciderait avec le beat L du cycle suivant → double
+                    // clic).
+                    if loop_playback && b as f64 >= loop_end {
+                        b = loop_start.floor() as u64;
                         cycle += 1;
-                        offset_ms = pass0_len_ms + (cycle - 1) as f64 * total_ms;
+                        offset_ms = pass0_len_ms + (cycle - 1) as f64 * loop_len_ms;
                     }
                     let shift_ms = click.delay_ms.load(Ordering::Relaxed) as f64;
-                    let beat_in_cycle = if cycle == 0 { b as f64 - start_at } else { b as f64 };
+                    let beat_in_cycle = if cycle == 0 { b as f64 - start_at } else { b as f64 - loop_start };
                     let target_ms = (offset_ms + beat_in_cycle * tempo_ms + shift_ms).max(0.0);
                     push_ev!(target_ms, Ev::ClickOn);
                 }
@@ -1542,7 +1564,7 @@ fn midi_play_custom(
                 match kind {
                     Ev::NoteOn(i) => {
                         let n = &sorted[i];
-                        let (target_ms, end_ms) = note_loop_window(note_pass[i], n.start_time, start_at, tempo_ms, total_ms);
+                        let (target_ms, end_ms) = note_loop_window(note_pass[i], n.start_time, start_at, loop_start, loop_end, tempo_ms);
                         let dur_eff = if loop_playback {
                             (end_ms - target_ms - 2.0).min(note_dur[i] as f64).max(0.0)
                         } else {
@@ -1624,19 +1646,29 @@ fn start_sec_from_beats(start_at: Option<f64>, tempo: u32) -> f64 {
 
 /// Fenêtre temporelle (ms) d'une note à la passe `pass` d'une lecture MIDI
 /// en BOUCLE : renvoie (cible du note-on, fin de passe pour le note-off).
-/// Passe 0 = depuis start_at (fin = pass0_len) ; passes ≥ 1 = morceau
-/// complet (chaque cycle dure total_ms, le 1er commence à la fin de la
-/// passe 0 — après un scrub, la boucle reboucle dès la fin du restant,
-/// comme la lecture WAV). Sans boucle, seule la passe 0 est jouée.
-fn note_loop_window(pass: u64, start_time: f64, start_at: f64, tempo_ms: f64, total_ms: f64) -> (f64, f64) {
-    let pass0_len = (total_ms - start_at * tempo_ms).max(0.0);
-    let offset = if pass == 0 { 0.0 } else { pass0_len + (pass - 1) as f64 * total_ms };
+/// La boucle couvre l'intervalle [loop_start, loop_end[ (locators) — par
+/// défaut [0, total_beats[ = morceau complet. Passe 0 = depuis start_at
+/// (fin = pass0_len) ; passes ≥ 1 = intervalle complet (chaque cycle dure
+/// loop_len, le 1er commence à la fin de la passe 0 — après un scrub, la
+/// boucle reboucle dès la fin du restant, comme la lecture WAV). Sans
+/// boucle, seule la passe 0 est jouée.
+fn note_loop_window(
+    pass: u64,
+    start_time: f64,
+    start_at: f64,
+    loop_start: f64,
+    loop_end: f64,
+    tempo_ms: f64,
+) -> (f64, f64) {
+    let loop_len = (loop_end - loop_start).max(0.0) * tempo_ms;
+    let pass0_len = (loop_end - start_at).max(0.0) * tempo_ms;
+    let offset = if pass == 0 { 0.0 } else { pass0_len + (pass - 1) as f64 * loop_len };
     let within = if pass == 0 {
         (start_time - start_at).max(0.0) * tempo_ms
     } else {
-        start_time * tempo_ms
+        (start_time - loop_start) * tempo_ms
     };
-    let end = offset + if pass == 0 { pass0_len } else { total_ms };
+    let end = offset + if pass == 0 { pass0_len } else { loop_len };
     (offset + within, end)
 }
 
@@ -1664,13 +1696,26 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     // que « la lecture continue » sans jamais sauter.)
     let start_sec = start_sec_from_beats(b.start_at, b.tempo);
     let loop_playback = b.loop_enabled.unwrap_or(false);
+    // Intervalle de boucle (locators [L, R[ en beats) → secondes. Si
+    // l'intervalle est invalide ou absent : boucle complète (0 → fin).
+    let (loop_start_sec, loop_end_sec) = if loop_playback {
+        let ls = b.loop_start.unwrap_or(0.0);
+        let le = b.loop_end.unwrap_or(0.0);
+        if le > ls + 0.01 {
+            (ls * 60.0 / b.tempo.max(1) as f64, le * 60.0 / b.tempo.max(1) as f64)
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0)
+    };
     if start_sec > 0.0 {
         let cache = s.rendered_dual.lock().unwrap().clone();
         if let Some((mp, cp, dur)) = cache {
             if std::path::Path::new(&mp).exists() && std::path::Path::new(&cp).exists() {
                 let cfg = click::load(&s.click);
                 if let Some(d) = cfg.out_device.filter(|d| !d.is_empty()) {
-                    match click::play_dual(&mp, &cp, &d, s.click.clone(), start_sec, loop_playback) {
+                    match click::play_dual(&mp, &cp, &d, s.click.clone(), start_sec, loop_playback, loop_start_sec, loop_end_sec) {
                         Ok(()) => {
                             return (StatusCode::OK, axum::Json(serde_json::json!({
                                 "ok": true,
@@ -1805,7 +1850,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     // REPLI automatique : clic MÉLANGÉ au son principal (synchro parfaite).
     // Le décalage/volume du clic sont lus EN DIRECT dans l'état partagé
     // (réglables pendant la lecture).
-    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone(), start_sec, loop_playback) {
+    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone(), start_sec, loop_playback, loop_start_sec, loop_end_sec) {
         Ok(()) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({
@@ -2054,51 +2099,75 @@ mod tests {
 
     /// Boucle MIDI : fenêtre temporelle (cible du note-on, fin de passe pour
     /// le note-off) d'une note à la passe `pass` — passe 0 = depuis start_at
-    /// (durée = pass0_len), passes suivantes = morceau complet (total_ms).
+    /// (durée = pass0_len), passes suivantes = morceau complet (loop_len).
     #[test]
     fn note_loop_window_repetitions() {
         let tempo_ms = 500.0; // 120 BPM
-        let total_ms = 8.0 * 500.0; // 8 temps
+        // Morceau de 8 temps, locators par défaut [0, 8[
+        let (loop_start, loop_end) = (0.0, 8.0);
         // Passe 0 avec start_at : décalage depuis start_at, fin = pass0_len
-        let (t, e) = note_loop_window(0, 2.0, 1.0, tempo_ms, total_ms);
+        let (t, e) = note_loop_window(0, 2.0, 1.0, loop_start, loop_end, tempo_ms);
         assert!((t - 500.0).abs() < 1e-9);
         assert!((e - 3500.0).abs() < 1e-9); // 8 temps − 1 temps de start_at
         // Passe 0 sans start_at : la note à son temps, fin = morceau complet
-        let (t, e) = note_loop_window(0, 2.0, 0.0, tempo_ms, total_ms);
+        let (t, e) = note_loop_window(0, 2.0, 0.0, loop_start, loop_end, tempo_ms);
         assert!((t - 1000.0).abs() < 1e-9);
         assert!((e - 4000.0).abs() < 1e-9);
         // Passe 1 (sans start_at) : un tour complet + le temps de la note
-        let (t, e) = note_loop_window(1, 2.0, 0.0, tempo_ms, total_ms);
+        let (t, e) = note_loop_window(1, 2.0, 0.0, loop_start, loop_end, tempo_ms);
         assert!((t - (4000.0 + 1000.0)).abs() < 1e-9);
         assert!((e - 8000.0).abs() < 1e-9);
         // Passe 2 : deux tours + le temps de la note
-        let (t, _) = note_loop_window(2, 2.0, 0.0, tempo_ms, total_ms);
+        let (t, _) = note_loop_window(2, 2.0, 0.0, loop_start, loop_end, tempo_ms);
         assert!((t - (8000.0 + 1000.0)).abs() < 1e-9);
         // Note avant start_at → passe 0 sautée ; la passe 1 commence à la
         // FIN de la passe 0 (3000 ms), pas à un tour complet (ancien bug :
         // 4250 → la boucle attendait la fin du morceau entier).
-        let (t, e) = note_loop_window(1, 0.5, 2.0, tempo_ms, total_ms);
+        let (t, e) = note_loop_window(1, 0.5, 2.0, loop_start, loop_end, tempo_ms);
         assert!((t - (3000.0 + 250.0)).abs() < 1e-9);
         assert!((e - 7000.0).abs() < 1e-9);
     }
 
     /// Scrub + boucle : après un déplacement de tête, la passe 0 est plus
-    /// courte que le morceau complet, les cycles suivants durent total_ms —
+    /// courte que le morceau complet, les cycles suivants durent loop_len —
     /// le clic et les notes partagent ce référentiel (synchro au repeat).
     #[test]
     fn note_loop_window_scrub_puis_boucle() {
         let tempo_ms = 500.0;
-        let total_ms = 32.0 * tempo_ms; // 32 temps
+        let (loop_start, loop_end) = (0.0, 32.0); // 32 temps
         // Passe 0 depuis le beat 24 : note à 24 → immédiate, fin de passe 4000
-        let (t, e) = note_loop_window(0, 24.0, 24.0, tempo_ms, total_ms);
+        let (t, e) = note_loop_window(0, 24.0, 24.0, loop_start, loop_end, tempo_ms);
         assert!((t - 0.0).abs() < 1e-9);
         assert!((e - 4000.0).abs() < 1e-9);
         // Sa passe 1 : 4000 (fin de passe 0) + 24×500 = 16000, fin 20000
-        let (t, e) = note_loop_window(1, 24.0, 24.0, tempo_ms, total_ms);
+        let (t, e) = note_loop_window(1, 24.0, 24.0, loop_start, loop_end, tempo_ms);
         assert!((t - 16000.0).abs() < 1e-9);
         assert!((e - 20000.0).abs() < 1e-9);
         // Note du début (2) : jamais en passe 0, passe 1 = 4000 + 1000
-        let (t, _) = note_loop_window(1, 2.0, 24.0, tempo_ms, total_ms);
+        let (t, _) = note_loop_window(1, 2.0, 24.0, loop_start, loop_end, tempo_ms);
         assert!((t - 5000.0).abs() < 1e-9);
+    }
+
+    /// Locators [L, R[ : la boucle couvre l'intervalle au lieu du morceau
+    /// complet — passe 0 depuis start_at jusqu'à R, puis cycles [L, R[.
+    #[test]
+    fn note_loop_window_intervalle_locators() {
+        let tempo_ms = 500.0;
+        // Locators [8, 16[, scrub à 12 : passe 0 = 12..16 (2000 ms), puis
+        // cycles [8, 16[ (4000 ms).
+        let (t, e) = note_loop_window(0, 12.0, 12.0, 8.0, 16.0, tempo_ms);
+        assert!((t - 0.0).abs() < 1e-9);
+        assert!((e - 2000.0).abs() < 1e-9);
+        // Passe 1 : 2000 (fin passe 0) + (12−8)×500 = 4000 ; fin 2000+4000
+        let (t, e) = note_loop_window(1, 12.0, 12.0, 8.0, 16.0, tempo_ms);
+        assert!((t - 4000.0).abs() < 1e-9);
+        assert!((e - 6000.0).abs() < 1e-9);
+        // Passe 2 : 2000 + 4000 + (12−8)×500 = 8000
+        let (t, _) = note_loop_window(2, 12.0, 12.0, 8.0, 16.0, tempo_ms);
+        assert!((t - 8000.0).abs() < 1e-9);
+        // Note du début de l'intervalle (9) : jamais en passe 0 (avant
+        // start_at 12), passe 1 = 2000 + (9−8)×500 = 2500
+        let (t, _) = note_loop_window(1, 9.0, 12.0, 8.0, 16.0, tempo_ms);
+        assert!((t - 2500.0).abs() < 1e-9);
     }
 }

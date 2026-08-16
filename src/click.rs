@@ -243,14 +243,27 @@ fn playback_start_frame(start_sec: f64, sample_rate: u32) -> usize {
     (start_sec * sample_rate as f64).round() as usize
 }
 
-/// Frame suivante à jouer — gère la BOUCLE (repeat) : quand le buffer est
-/// fini, on repart au début (frame 0) si loop_playback, sinon None (fin).
-fn next_frame(i: usize, max_frames: usize, loop_playback: bool) -> Option<usize> {
-    if i < max_frames {
+/// Frame suivante à jouer — gère la BOUCLE (repeat) : quand la position
+/// atteint la fin (loop_end_frame), on repart à loop_start_frame si la
+/// boucle est activée, sinon None (fin). Sans intervalle (loop_start=0,
+/// loop_end=max_frames), le comportement est l'ancien : retour au début (0).
+fn next_frame(
+    i: usize,
+    max_frames: usize,
+    loop_start_frame: usize,
+    loop_end_frame: usize,
+    loop_playback: bool,
+) -> Option<usize> {
+    if i < loop_end_frame {
         return Some(i);
     }
-    if loop_playback && max_frames > 0 {
-        return Some(0);
+    if loop_playback {
+        if loop_end_frame > loop_start_frame && loop_start_frame < max_frames {
+            return Some(loop_start_frame); // boucle sur l'intervalle [L, R[
+        }
+        if max_frames > 0 {
+            return Some(0); // ancien comportement : boucle complète
+        }
     }
     None
 }
@@ -259,7 +272,8 @@ fn next_frame(i: usize, max_frames: usize, loop_playback: bool) -> Option<usize>
 /// (doit avoir ≥ 4 canaux de sortie). Le clic est atténué par `click_gain`.
 /// `start_sec` : offset de départ en secondes (les deux WAV démarrent à cet
 /// offset, alignés) — 0 = depuis le début.
-/// `loop_playback` : repeat — à la fin du buffer, on repart au début (0).
+/// `loop_playback` : repeat — à la fin (ou à loop_end_sec), on repart à
+/// loop_start_sec (ou 0 si pas d'intervalle).
 pub fn play_dual(
     main_path: &str,
     click_path: &str,
@@ -267,6 +281,8 @@ pub fn play_dual(
     state: Arc<ClickState>,
     start_sec: f64,
     loop_playback: bool,
+    loop_start_sec: f64,
+    loop_end_sec: f64,
 ) -> Result<(), String> {
     // Arrêter un éventuel lecteur précédent
     stop_dual();
@@ -343,11 +359,20 @@ pub fn play_dual(
         let cch = click_ch.max(1) as usize;
         let max_frames = (main_s.len() / mch).max(click_s.len() / cch);
         let sr_us = sr.max(1) as usize;
+        // Intervalle de boucle (locators) en frames device : la lecture
+        // boucle [loop_start, loop_end[ au lieu de tout le buffer.
+        let loop_start_frame = (loop_start_sec * sr as f64).round() as usize;
+        let loop_end_frame = if loop_end_sec > 0.0 {
+            ((loop_end_sec * sr as f64).round() as usize).min(max_frames)
+        } else {
+            max_frames
+        };
+        let loop_start_frame = loop_start_frame.min(loop_end_frame.saturating_sub(1));
         let mut i = playback_start_frame(start_sec, sr).min(max_frames);
         loop {
-            // Frame courante — la boucle (repeat) repart au début quand le
-            // buffer est fini (jamais de fin pour la lecture en boucle).
-            let frame = match next_frame(i, max_frames, loop_playback) {
+            // Frame courante — la boucle (repeat) repart au début (ou au
+            // locator gauche) quand la fin (ou le locator droit) est atteinte.
+            let frame = match next_frame(i, max_frames, loop_start_frame, loop_end_frame, loop_playback) {
                 Some(f) => f,
                 None => break,
             };
@@ -501,11 +526,25 @@ mod tests {
     /// Boucle (repeat) : la lecture repart au début quand le buffer est fini.
     #[test]
     fn next_frame_loop_repart_a_zero() {
-        assert_eq!(next_frame(0, 100, false), Some(0));
-        assert_eq!(next_frame(99, 100, false), Some(99));
-        assert_eq!(next_frame(100, 100, false), None, "fin sans boucle → stop");
-        assert_eq!(next_frame(100, 100, true), Some(0), "fin avec boucle → retour au début");
-        assert_eq!(next_frame(101, 100, true), Some(0), "au-delà de la fin → retour au début");
-        assert_eq!(next_frame(0, 0, true), None, "buffer vide → rien");
+        assert_eq!(next_frame(0, 100, 0, 100, false), Some(0));
+        assert_eq!(next_frame(99, 100, 0, 100, false), Some(99));
+        assert_eq!(next_frame(100, 100, 0, 100, false), None, "fin sans boucle → stop");
+        assert_eq!(next_frame(100, 100, 0, 100, true), Some(0), "fin avec boucle → retour au début");
+        assert_eq!(next_frame(101, 100, 0, 100, true), Some(0), "au-delà de la fin → retour au début");
+        assert_eq!(next_frame(0, 0, 0, 0, true), None, "buffer vide → rien");
+    }
+
+    /// Boucle sur un INTERVALLE (locators [L, R[) : la lecture repart à L
+    /// quand elle atteint R, même si le buffer continue après.
+    #[test]
+    fn next_frame_loop_intervalle_locators() {
+        // Intervalle [100, 200[ dans un buffer de 300 frames
+        assert_eq!(next_frame(50, 300, 100, 200, true), Some(50), "avant L → joué (passe 0)");
+        assert_eq!(next_frame(199, 300, 100, 200, true), Some(199));
+        assert_eq!(next_frame(200, 300, 100, 200, true), Some(100), "R atteint → retour à L");
+        assert_eq!(next_frame(250, 300, 100, 200, true), Some(100), "au-delà de R → retour à L");
+        assert_eq!(next_frame(200, 300, 100, 200, false), None, "sans boucle → fin à R");
+        // Intervalle invalide (L ≥ R) → comportement boucle complète
+        assert_eq!(next_frame(250, 300, 250, 100, true), Some(0));
     }
 }
