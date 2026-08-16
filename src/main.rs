@@ -755,12 +755,18 @@ async fn render_wav(
         // scalée par le volume de la piste (le mute est filtré plus bas
         // dans generate_smf_from_custom)
         for cn in &b.custom_notes {
-            let vol = rcfg.tracks.iter()
-                .find(|t| t.channel == cn.channel)
-                .map_or(127, |t| t.volume) as u32;
+            let t = rcfg.tracks.iter().find(|t| t.channel == cn.channel);
+            // Piste mutée ou absente → silencieuse (logique métier : mute partout)
+            if t.map_or(true, |t| t.mute) {
+                continue;
+            }
+            // Piste percussion hors canal 9 → redirigée vers le 9 (le kit)
+            let is_drum = t.map_or(false, |t| t.drums);
+            let out_ch = if is_drum && cn.channel != 9 { 9 } else { cn.channel };
+            let vol = t.map_or(127, |t| t.volume) as u32;
             let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
             merged.push(render::CustomNote {
-                channel: cn.channel,
+                channel: out_ch,
                 start_time: cn.start_time,
                 pitch: cn.pitch,
                 duration: cn.duration,
@@ -929,12 +935,18 @@ async fn render_tracks(
             .filter(|n| !custom_channels.contains(&n.channel))
             .collect();
         for cn in &b.custom_notes {
-            let vol = rcfg.tracks.iter()
-                .find(|t| t.channel == cn.channel)
-                .map_or(127, |t| t.volume) as u32;
+            let t = rcfg.tracks.iter().find(|t| t.channel == cn.channel);
+            // Piste mutée ou absente → silencieuse (logique métier : mute partout)
+            if t.map_or(true, |t| t.mute) {
+                continue;
+            }
+            // Piste percussion hors canal 9 → redirigée vers le 9 (le kit)
+            let is_drum = t.map_or(false, |t| t.drums);
+            let out_ch = if is_drum && cn.channel != 9 { 9 } else { cn.channel };
+            let vol = t.map_or(127, |t| t.volume) as u32;
             let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
             merged.push(render::CustomNote {
-                channel: cn.channel,
+                channel: out_ch,
                 start_time: cn.start_time,
                 pitch: cn.pitch,
                 duration: cn.duration,
@@ -1199,12 +1211,18 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
             .filter(|n| !custom_channels.contains(&n.channel))
             .collect();
         for cn in &b.custom_notes {
-            let vol = rcfg.tracks.iter()
-                .find(|t| t.channel == cn.channel)
-                .map_or(127, |t| t.volume) as u32;
+            let t = rcfg.tracks.iter().find(|t| t.channel == cn.channel);
+            // Piste mutée ou absente → silencieuse (logique métier : mute partout)
+            if t.map_or(true, |t| t.mute) {
+                continue;
+            }
+            // Piste percussion hors canal 9 → redirigée vers le 9 (le kit)
+            let is_drum = t.map_or(false, |t| t.drums);
+            let out_ch = if is_drum && cn.channel != 9 { 9 } else { cn.channel };
+            let vol = t.map_or(127, |t| t.volume) as u32;
             let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
             merged.push(render::CustomNote {
-                channel: cn.channel,
+                channel: out_ch,
                 start_time: cn.start_time,
                 pitch: cn.pitch,
                 duration: cn.duration,
@@ -1476,12 +1494,18 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
             .filter(|n| !custom_channels.contains(&n.channel))
             .collect();
         for cn in &b.custom_notes {
-            let vol = rcfg.tracks.iter()
-                .find(|t| t.channel == cn.channel)
-                .map_or(127, |t| t.volume) as u32;
+            let t = rcfg.tracks.iter().find(|t| t.channel == cn.channel);
+            // Piste mutée ou absente → silencieuse (logique métier : mute partout)
+            if t.map_or(true, |t| t.mute) {
+                continue;
+            }
+            // Piste percussion hors canal 9 → redirigée vers le 9 (le kit)
+            let is_drum = t.map_or(false, |t| t.drums);
+            let out_ch = if is_drum && cn.channel != 9 { 9 } else { cn.channel };
+            let vol = t.map_or(127, |t| t.volume) as u32;
             let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
             merged.push(render::CustomNote {
-                channel: cn.channel,
+                channel: out_ch,
                 start_time: cn.start_time,
                 pitch: cn.pitch,
                 duration: cn.duration,
