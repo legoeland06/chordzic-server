@@ -1166,7 +1166,7 @@ async fn post_click(State(s): State<AppState>, Json(b): Json<ClickReq>) -> impl 
         *st.out_device.lock().unwrap() = d2;
     }
     if let Some(v) = b.delay_ms {
-        st.delay_ms.store(v.max(0).min(500), std::sync::atomic::Ordering::Relaxed);
+        st.delay_ms.store(v.clamp(-200, 200), std::sync::atomic::Ordering::Relaxed);
     }
     (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
 }
@@ -1429,18 +1429,22 @@ fn midi_play_custom(
                 // cohérente quel que soit le tempo (75 ms à 120 BPM,
                 // 150 ms à 60 BPM). Avant : 150 ms fixes.
                 let dur_ms = (0.15 * tempo_ms) as u64;
-                // ⚠️ HORLOGE ABSOLUE (bug corrigé) : la cible du prochain
-                // clic avance d'UN tempo à chaque beat, le sleep est le RESTE
-                // à dormir. L'ancien code dormait un délai absolu APRÈS la
-                // durée de note → l'intervalle entre clics augmentait à
-                // chaque beat (métronome qui ralentit et dérive).
-                let mut next_click_ms = ((b as f64 - start_at) * tempo_ms).max(0.0);
+                // ⚠️ HORLOGE ABSOLUE (bug corrigé) : la cible du clic est
+                // recalculée à chaque beat (b × tempo + décalage), le sleep
+                // est le RESTE à dormir. L'ancien code dormait un délai
+                // absolu APRÈS la durée de note → l'intervalle entre clics
+                // augmentait à chaque beat (métronome qui ralentit et dérive).
                 loop {
                     if b > total {
                         return;
                     }
+                    // Décalage du clic lu EN DIRECT (comme le volume) :
+                    // positif → retarde le clic, négatif → l'avance —
+                    // compensation de latence à l'oreille, sans relancer.
+                    let shift_ms = ck.delay_ms.load(Ordering::Relaxed) as f64;
+                    let target_ms = (((b as f64 - start_at) * tempo_ms) + shift_ms).max(0.0);
                     let now_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let delay_ms = (next_click_ms - now_ms).max(0.0) as u64;
+                    let delay_ms = (target_ms - now_ms).max(0.0) as u64;
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     if g2.load(Ordering::Relaxed) != gen {
                         return; // lecture invalidée (stop/relance)
@@ -1449,7 +1453,6 @@ fn midi_play_custom(
                     let vol = ck.volume.load(Ordering::Relaxed);
                     if vol == 0 {
                         b += 1;
-                        next_click_ms += tempo_ms;
                         continue;
                     }
                     let acc = ck.accent.load(Ordering::Relaxed) && b % bars == 0;
@@ -1465,7 +1468,6 @@ fn midi_play_custom(
                         no_mv(&mut c, cch, pitch, 0, 127);
                     }
                     b += 1;
-                    next_click_ms += tempo_ms;
                 }
             }));
         }
@@ -1821,24 +1823,26 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     /// Simule l'horloge du clic métronome MIDI (nouvelle version) : la cible
-    /// du prochain clic avance d'UN tempo à chaque beat → intervalles stables,
-    /// quelle que soit la durée de note inline (l'ancien code dérivait).
+    /// est recalculée à chaque beat (b × tempo + décalage) → intervalles
+    /// stables, le décalage décale le 1ᵉʳ clic sans casser le tempo.
     #[test]
     fn clic_metronome_intervalles_stables() {
         let tempo_ms = 500.0; // 120 BPM
         let note_dur = 150.0; // durée de note inline (ms)
         let start_at = 0.0f64;
+        let shift_ms = 30.0; // décalage du clic
         let mut b = start_at.ceil() as u64;
-        let mut next = ((b as f64 - start_at) * tempo_ms).max(0.0);
         let mut elapsed = 0.0f64;
         let mut onsets = Vec::new();
         for _ in 0..10 {
-            let delay = (next - elapsed).max(0.0);
-            elapsed += delay;
+            let target = (((b as f64 - start_at) * tempo_ms) + shift_ms).max(0.0);
+            elapsed += (target - elapsed).max(0.0);
             onsets.push(elapsed); // note ON
             elapsed += note_dur; // note OFF + overhead
-            next += tempo_ms;
+            b += 1;
         }
+        // 1ᵉʳ clic décalé de shift_ms ; ensuite intervalles = tempo_ms
+        assert!((onsets[0] - shift_ms).abs() < 1e-9, "1ᵉʳ clic non décalé");
         for w in onsets.windows(2) {
             let iv = w[1] - w[0];
             assert!((iv - tempo_ms).abs() < 1e-9, "intervalle {iv} != {tempo_ms}");
