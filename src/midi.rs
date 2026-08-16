@@ -231,6 +231,23 @@ pub fn list_ports() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Ouvre une connexion vers le premier port dont le nom contient `substr`
+/// (ex. "fluid" → le métronome GM du serveur). Retourne None si absent.
+pub fn open_by_name(substr: &str) -> Option<MidiHandle> {
+    let mo = MidiOutput::new("chords-server-rs").ok()?;
+    let p = mo.ports();
+    for (i, x) in p.iter().enumerate() {
+        if let Ok(n) = mo.port_name(x) {
+            if n.to_lowercase().contains(&substr.to_lowercase()) {
+                return mo.connect(&p[i], "chords-server-rs")
+                    .ok()
+                    .map(|c| (Arc::new(Mutex::new(c))));
+            }
+        }
+    }
+    None
+}
+
 /// Envoie un message MIDI brut sur la connexion.
 /// Affiche une erreur (non bloquante) si l'envoi échoue.
 pub fn snd(c: &mut MidiOutputConnection, m: &[u8]) {

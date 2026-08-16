@@ -1285,6 +1285,16 @@ fn midi_play_custom(
 ) {
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
+        // ── Logique métier du clic ──
+        // Le clic est le MÉTRONOME du serveur : il sort par FLUID SYNTH
+        // (connexion MIDI séparée, son GM fiable 33/34), JAMAIS par
+        // l'instrument du morceau (le Roland) — le Roland ne reçoit que les
+        // notes, le clic reste indépendant et contrôlable en direct.
+        // Repli si FluidSynth absent : canal libre du port principal.
+        let fluid = midi::open_by_name("fluid");
+        let used: std::collections::HashSet<u8> = tracks.iter().map(|t| t.channel).collect();
+        let click_chan = (0u8..16).find(|c| *c != 9 && !used.contains(c)).unwrap_or(9);
+        let click_pitch = if click_chan == 9 { 77u8 } else { 60u8 };
         // 1. Setup : reset + program changes + sends d'effets
         {
             let mut c = handle.lock().unwrap();
@@ -1310,12 +1320,29 @@ fn midi_play_custom(
                     cc(&mut c, ch, 93, t.fx.chorus as u8);
                 }
             }
-            // Program change des sons mélodiques du clic (canal 15)
-            match click.sound.load(Ordering::Relaxed) {
-                click::SOUND_WOODBLOCK => pc(&mut c, 15, 115),
-                click::SOUND_AGOGO => pc(&mut c, 15, 114),
-                click::SOUND_TAIKO => pc(&mut c, 15, 116),
-                _ => {}
+            // Program change de l'instrument de percussion du clic —
+            // uniquement en REPLI (port principal) : FluidSynth utilise
+            // le canal 9 drums GM natif, aucun réglage nécessaire.
+            if fluid.is_none() && click_chan != 9 {
+                match click.sound.load(Ordering::Relaxed) {
+                    click::SOUND_WOODBLOCK => pc(&mut c, click_chan, 115),
+                    click::SOUND_AGOGO => pc(&mut c, click_chan, 114),
+                    click::SOUND_TAIKO => pc(&mut c, click_chan, 116),
+                    _ => pc(&mut c, click_chan, 115), // métronome → woodblock
+                }
+            }
+        }
+        // Clic sur FluidSynth : sons mélodiques → program change canal 15
+        if let Some(f) = &fluid {
+            let snd = click.sound.load(Ordering::Relaxed);
+            if snd != click::SOUND_GM_METRONOME {
+                let mut fc = f.lock().unwrap();
+                match snd {
+                    click::SOUND_WOODBLOCK => pc(&mut fc, 15, 115),
+                    click::SOUND_AGOGO => pc(&mut fc, 15, 114),
+                    click::SOUND_TAIKO => pc(&mut fc, 15, 116),
+                    _ => {}
+                }
             }
         }
         // 2. Notes programmées (note-on → durée → note-off)
@@ -1329,30 +1356,41 @@ fn midi_play_custom(
         let mut handles = Vec::new();
         // 1b. Clic métronome MIDI — temps réel, volume/mute lus à CHAQUE
         // beat (le bouton 🔇 mute → volume 0 → vélocité 0 → silence immédiat).
+        // Sortie : FluidSynth si dispo (métronome GM), sinon port principal.
         {
-            let h = handle.clone();
             let g2 = gen_ref.clone();
             let ck = click.clone();
             let tempo_ms = 60_000.0 / tempo.max(1) as f64;
             let bars = (sig_code_v / 10).max(1) as u64;
             let total = total_beats.ceil() as u64;
-            let sound = click.sound.load(Ordering::Relaxed);
-            let (cch, pitch_acc, pitch_norm) = match sound {
-                click::SOUND_WOODBLOCK => (15u8, 72u8, 72u8),
-                click::SOUND_AGOGO => (15u8, 74u8, 74u8),
-                click::SOUND_TAIKO => (15u8, 55u8, 55u8),
-                _ => (9u8, 34u8, 33u8), // métronome GM : cloche/clic
+            let (clk, cch, pitch_acc, pitch_norm) = match &fluid {
+                Some(f) => match click.sound.load(Ordering::Relaxed) {
+                    click::SOUND_WOODBLOCK => (f.clone(), 15u8, 72u8, 72u8),
+                    click::SOUND_AGOGO => (f.clone(), 15u8, 74u8, 74u8),
+                    click::SOUND_TAIKO => (f.clone(), 15u8, 55u8, 55u8),
+                    _ => (f.clone(), 9u8, 34u8, 33u8), // métronome GM
+                },
+                None => (handle.clone(), click_chan, click_pitch, click_pitch), // repli
             };
             handles.push(std::thread::spawn(move || {
                 let mut b = start_at.ceil() as u64;
                 let dur_ms = 150u64;
+                let mut note_active = false;
                 loop {
                     if b > total {
+                        if note_active {
+                            let mut c = clk.lock().unwrap();
+                            no_mv(&mut c, cch, pitch_acc, 0, 127);
+                        }
                         return;
                     }
                     let delay_ms = (((b as f64 - start_at) * tempo_ms).max(0.0)) as u64;
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     if g2.load(Ordering::Relaxed) != gen {
+                        if note_active {
+                            let mut c = clk.lock().unwrap();
+                            no_mv(&mut c, cch, pitch_acc, 0, 127);
+                        }
                         return; // lecture invalidée (stop/relance)
                     }
                     // Volume lu EN DIRECT → mute/volume instantanés
@@ -1365,14 +1403,16 @@ fn midi_play_custom(
                     let vel = (vol as f32 / 100.0 * if acc { 127.0 } else { 120.0 }).round() as u8;
                     let pitch = if acc { pitch_acc } else { pitch_norm };
                     {
-                        let mut c = h.lock().unwrap();
+                        let mut c = clk.lock().unwrap();
                         no_mv(&mut c, cch, pitch, vel, 127);
                     }
+                    note_active = true;
                     std::thread::sleep(std::time::Duration::from_millis(dur_ms));
                     {
-                        let mut c = h.lock().unwrap();
+                        let mut c = clk.lock().unwrap();
                         no_mv(&mut c, cch, pitch, 0, 127);
                     }
+                    note_active = false;
                     b += 1;
                 }
             }));
