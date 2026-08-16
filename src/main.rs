@@ -1399,10 +1399,15 @@ fn midi_play_custom(
         let tempo_ms = 60_000.0 / tempo.max(1) as f64;
         let total_ms = total_beats * tempo_ms; // période d'une passe (boucle)
         let total = notes.len();
-        let mut sorted: Vec<_> = notes
-            .into_iter()
-            .filter(|n| n.start_time + n.duration > start_at)
-            .collect();
+        // En BOUCLE, TOUTES les notes sont gardées (les passes suivantes
+        // repartent du début) ; sans boucle, on ignore celles avant start_at.
+        let mut sorted: Vec<_> = if loop_playback {
+            notes.into_iter().collect()
+        } else {
+            notes.into_iter()
+                .filter(|n| n.start_time + n.duration > start_at)
+                .collect()
+        };
         sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
         let mut handles = Vec::new();
         // 1b. Clic métronome MIDI — temps réel, volume/mute lus à CHAQUE
