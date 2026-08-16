@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 use patterns::pat;
 use midi::{
-    apply_tracks, init_midi, note_midi, play_seq, play_notes, rch, pb, ChordEv, Live, LiveTrack,
+    apply_tracks, init_midi, note_midi, play_seq, play_notes, rch, pb, cc, pc, no_mv, ChordEv, Live, LiveTrack,
     MidiHandle, TrackCfg as MidiTrackCfg,
 };
 
@@ -235,6 +235,10 @@ struct AppState {
     /// Arc<Mutex<…>> pour permettre la RECONNEXION automatique depuis les
     /// handlers (la connexion meurt si FluidSynth redémarre).
     midi: Arc<Mutex<Option<MidiLink>>>,
+    /// Génération de lecture MIDI (mode Navig) : chaque play incrémente,
+    /// chaque thread vérifie que SA génération est toujours la courante avant
+    /// de jouer → un stop/relance invalide proprement les anciennes lectures.
+    midi_gen: Arc<std::sync::atomic::AtomicU64>,
     live: Arc<Live>,            // État live mutable partagé entre threads HTTP et audio
     soundfont: Option<String>,  // Chemin vers la SoundFont (pour render-wav)
     click: Arc<click::ClickState>, // Config du clic (mode rendu uniquement)
@@ -347,6 +351,8 @@ struct PlayReq {
     custom_notes: Vec<CustomNote>,    // Notes personnalisées du PianoRoll (optionnel)
     #[serde(default)]
     custom_channels: Vec<u8>,         // Canaux en mode PianoRoll (même vides) — les autres canaux jouent le mode classique
+    #[serde(default)]
+    start_at: Option<f64>,            // Position de départ (beats) pour la lecture MIDI
 }
 
 /// Réponse standardisée du serveur.
@@ -609,16 +615,18 @@ fn render_inputs(b: &PlayReq) -> (Vec<Vec<u8>>, Vec<f64>, render::RenderCfg) {
             volume: tc.volume.unwrap_or(100),
             mute: tc.mute.unwrap_or(false),
             drums: tc.drums.unwrap_or(false),
+            bank_msb: tc.bank_msb.unwrap_or(0),
+            bank_lsb: tc.bank_lsb.unwrap_or(0),
             fx: tc.effects.unwrap_or_default(),
         }).collect()
     } else {
         // Anciens clients / API directe : 5 rôles par défaut avec flags simples
         vec![
-            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps, fx: Default::default(), drums: false },
-            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass, fx: Default::default(), drums: false },
-            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes, fx: Default::default(), drums: false },
-            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums, fx: Default::default(), drums: false },
-            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 0, program: b.inst_val, volume: 60, mute: !b.arps, bank_msb: 0, bank_lsb: 0, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 2, program: 33, volume: 70, mute: !b.bass, bank_msb: 0, bank_lsb: 0, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 3, program: 48, volume: 60, mute: !b.nappes, bank_msb: 0, bank_lsb: 0, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 9, program: 1, volume: 90, mute: !b.drums, bank_msb: 0, bank_lsb: 0, fx: Default::default(), drums: false },
+            render::TrackCfg { channel: 4, program: 2, volume: 50, mute: false, bank_msb: 0, bank_lsb: 0, fx: Default::default(), drums: false },
         ]
     };
 
@@ -665,14 +673,16 @@ struct NoteReq {
 }
 
 async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoResponse {
-    let (prog, is_drum) = {
+    let (prog, is_drum, bank_msb, bank_lsb) = {
         let tracks = s.live.tracks.lock().unwrap();
         match tracks.iter().find(|t| t.channel == b.channel) {
             Some(t) => (
                 Some(t.program.load(std::sync::atomic::Ordering::Relaxed)),
                 t.drums.load(std::sync::atomic::Ordering::Relaxed),
+                t.bank_msb.load(std::sync::atomic::Ordering::Relaxed),
+                t.bank_lsb.load(std::sync::atomic::Ordering::Relaxed),
             ),
-            None => (None, false),
+            None => (None, false, 0, 0),
         }
     };
     let ch = b.channel;
@@ -684,9 +694,14 @@ async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoRes
         // — le kit sonne quel que soit le canal de saisie de la piste.
         let out_ch = if is_drum && ch != 9 { 9 } else { ch };
         if let Some(p) = prog {
-            // Program change (sauf drums : kit fixe)
             if out_ch != 9 {
+                // Program change (instrument)
                 midi_send(&s, &[0xC0 | out_ch, p as u8]);
+            } else if bank_msb != 0 || bank_lsb != 0 {
+                // Kit drums alternatif (banque choisie) : bank select + program
+                midi_send(&s, &[0xB0 | 9, 0, bank_msb]);
+                midi_send(&s, &[0xB0 | 9, 32, bank_lsb]);
+                midi_send(&s, &[0xC0 | 9, p as u8]);
             }
         }
         // Note On → Note Off après `dur` ms. Si l'envoi échoue
@@ -1030,9 +1045,46 @@ async fn serve_rendered(axum::extract::Path(file): axum::extract::Path<String>) 
 // ─── Piste de clic : endpoints ──────────────────────────────────────────
 
 /// GET /audio-devices — liste les sorties audio disponibles (cpal).
-async fn audio_devices() -> impl IntoResponse {
+async fn audio_devices(State(s): State<AppState>) -> impl IntoResponse {
     let devs = click::list_output_devices();
-    (StatusCode::OK, axum::Json(serde_json::json!({ "devices": devs })))
+    let current = s.click.out_device.lock().unwrap().clone();
+    (StatusCode::OK, axum::Json(serde_json::json!({ "devices": devs, "current": current })))
+}
+
+/// POST /audio-device — change la sortie audio globale (vide = défaut système).
+#[derive(serde::Deserialize)]
+struct AudioDeviceReq {
+    #[serde(default)]
+    device: String,
+}
+
+async fn audio_device(State(s): State<AppState>, Json(b): Json<AudioDeviceReq>) -> impl IntoResponse {
+    let d = if b.device.is_empty() { None } else { Some(b.device) };
+    *s.click.out_device.lock().unwrap() = d;
+    (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+}
+
+/// GET /midi-ports — liste les ports MIDI de sortie + le port courant.
+async fn midi_ports(State(s): State<AppState>) -> impl IntoResponse {
+    let ports = midi::list_ports();
+    let current = s.midi.lock().unwrap().as_ref().map(|l| l.port.clone()).unwrap_or_default();
+    (StatusCode::OK, axum::Json(serde_json::json!({ "ports": ports, "current": current })))
+}
+
+/// POST /midi-port — rebranche la sortie MIDI sur un port (par index).
+#[derive(serde::Deserialize)]
+struct MidiPortReq {
+    index: usize,
+}
+
+async fn midi_port(State(s): State<AppState>, Json(b): Json<MidiPortReq>) -> impl IntoResponse {
+    match midi::connect_port(b.index) {
+        Some((handle, port)) => {
+            *s.midi.lock().unwrap() = Some(MidiLink { handle, port: port.clone() });
+            (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true, "port": port }))).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "Index de port MIDI invalide").into_response(),
+    }
 }
 
 /// GET /click — config de la piste de clic (mode Navig).
@@ -1118,6 +1170,241 @@ async fn navig_click_stop() -> impl IntoResponse {
     click::stop_click();
     click::stop_dual();
     (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+}
+
+/// POST /navig-play-midi — lecture MIDI temps réel (mode Navig) : toutes les
+/// pistes (grille + notes personnalisées du PianoRoll) jouées sur le port MIDI
+/// courant (ex. Roland), comme le mode Live mais avec le contenu du Navig.
+async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoResponse {
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
+    };
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à jouer").into_response();
+    }
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+    let all_notes: Vec<render::CustomNote> = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
+        let custom_channels: std::collections::HashSet<u8> = b.custom_channels
+            .iter()
+            .copied()
+            .chain(b.custom_notes.iter().map(|n| n.channel))
+            .collect();
+        let classic = render::generate_notes(&notes_arrays, &beats, &rcfg);
+        let mut merged: Vec<render::CustomNote> = classic
+            .into_iter()
+            .filter(|n| !custom_channels.contains(&n.channel))
+            .collect();
+        for cn in &b.custom_notes {
+            let vol = rcfg.tracks.iter()
+                .find(|t| t.channel == cn.channel)
+                .map_or(127, |t| t.volume) as u32;
+            let v = ((cn.velocity as u32 * vol) / 127).clamp(0, 127) as u8;
+            merged.push(render::CustomNote {
+                channel: cn.channel,
+                start_time: cn.start_time,
+                pitch: cn.pitch,
+                duration: cn.duration,
+                velocity: v,
+            });
+        }
+        merged
+    } else {
+        render::generate_notes(&notes_arrays, &beats, &rcfg)
+    };
+    if all_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Aucune note à jouer").into_response();
+    }
+
+    let midi = s.midi.clone();
+    let guard = midi.lock().unwrap();
+    match guard.as_ref() {
+        Some(link) => {
+            // Nouvelle génération de lecture : invalide les threads précédents
+            let gen = s.midi_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let start_at = b.start_at.unwrap_or(0.0);
+            // Durée totale en beats (pour le clic métronome MIDI)
+            let total_beats = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max);
+            midi_play_custom(
+                link.handle.clone(),
+                all_notes.clone(),
+                rcfg.tracks.to_vec(),
+                b.tempo,
+                start_at,
+                gen,
+                s.midi_gen.clone(),
+                s.click.clone(),
+                sig_code(&b.sig),
+                total_beats,
+            );
+            drop(guard);
+            let dur = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max)
+                * 60.0 / b.tempo.max(1) as f64;
+            (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true, "notes": all_notes.len(), "duration_sec": dur.round() }))).into_response()
+        }
+        None => (StatusCode::INTERNAL_SERVER_ERROR, "Aucun port MIDI connecté").into_response(),
+    }
+}
+
+/// POST /navig-stop-midi — arrête la lecture MIDI en cours : invalide la
+/// génération courante (les threads en attente s'arrêtent) + coupe le son
+/// (CC120 All Sound Off + CC123 All Notes Off + CC121 Reset Controllers).
+async fn navig_stop_midi(State(s): State<AppState>) -> impl IntoResponse {
+    s.midi_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for ch in 0..16u8 {
+        // All Sound Off — coupe même les notes avec réverb/delay qui prolongent
+        midi_send(&s, &[0xB0 | ch, 120, 0]);
+        // All Notes Off
+        midi_send(&s, &[0xB0 | ch, 123, 0]);
+        // Reset All Controllers
+        midi_send(&s, &[0xB0 | ch, 121, 0]);
+    }
+    (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+}
+
+/// Joue des notes (mode Navig) en MIDI temps réel sur la connexion donnée :
+/// reset + program changes des pistes (avec sends FX), puis note-on/off
+/// programmés au bon timing (start_time/duration en beats, tempo).
+/// `start_at` : position de départ en beats (les notes antérieures sont ignorées).
+/// `gen`/`gen_ref` : génération de lecture — un thread ne joue que si SA
+/// génération est toujours la courante (stop/relance → invalidation propre).
+fn midi_play_custom(
+    handle: midi::MidiHandle,
+    notes: Vec<render::CustomNote>,
+    tracks: Vec<render::TrackCfg>,
+    tempo: u32,
+    start_at: f64,
+    gen: u64,
+    gen_ref: Arc<std::sync::atomic::AtomicU64>,
+    click: Arc<click::ClickState>,
+    sig_code_v: u16,
+    total_beats: f64,
+) {
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        // 1. Setup : reset + program changes + sends d'effets
+        {
+            let mut c = handle.lock().unwrap();
+            rch(&mut c);
+            for t in &tracks {
+                if t.mute {
+                    continue;
+                }
+                let ch = t.channel;
+                if t.drums && ch != 9 {
+                    continue; // piste percussion → redirigée vers le canal 9
+                }
+                if ch == 9 {
+                    // Kit drums : bank select si un kit alternatif est choisi
+                    if t.bank_msb != 0 || t.bank_lsb != 0 {
+                        cc(&mut c, 9, 0, t.bank_msb);
+                        cc(&mut c, 9, 32, t.bank_lsb);
+                    }
+                    pc(&mut c, 9, t.program as u8);
+                } else {
+                    pc(&mut c, ch, t.program as u8);
+                    cc(&mut c, ch, 91, t.fx.reverb as u8);
+                    cc(&mut c, ch, 93, t.fx.chorus as u8);
+                }
+            }
+            // Program change des sons mélodiques du clic (canal 15)
+            match click.sound.load(Ordering::Relaxed) {
+                click::SOUND_WOODBLOCK => pc(&mut c, 15, 115),
+                click::SOUND_AGOGO => pc(&mut c, 15, 114),
+                click::SOUND_TAIKO => pc(&mut c, 15, 116),
+                _ => {}
+            }
+        }
+        // 2. Notes programmées (note-on → durée → note-off)
+        let tempo_ms = 60_000.0 / tempo.max(1) as f64;
+        let total = notes.len();
+        let mut sorted: Vec<_> = notes
+            .into_iter()
+            .filter(|n| n.start_time + n.duration > start_at)
+            .collect();
+        sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
+        let mut handles = Vec::new();
+        // 1b. Clic métronome MIDI — temps réel, volume/mute lus à CHAQUE
+        // beat (le bouton 🔇 mute → volume 0 → vélocité 0 → silence immédiat).
+        {
+            let h = handle.clone();
+            let g2 = gen_ref.clone();
+            let ck = click.clone();
+            let tempo_ms = 60_000.0 / tempo.max(1) as f64;
+            let bars = (sig_code_v / 10).max(1) as u64;
+            let total = total_beats.ceil() as u64;
+            let sound = click.sound.load(Ordering::Relaxed);
+            let (cch, pitch_acc, pitch_norm) = match sound {
+                click::SOUND_WOODBLOCK => (15u8, 72u8, 72u8),
+                click::SOUND_AGOGO => (15u8, 74u8, 74u8),
+                click::SOUND_TAIKO => (15u8, 55u8, 55u8),
+                _ => (9u8, 34u8, 33u8), // métronome GM : cloche/clic
+            };
+            handles.push(std::thread::spawn(move || {
+                let mut b = start_at.ceil() as u64;
+                let dur_ms = 150u64;
+                loop {
+                    if b > total {
+                        return;
+                    }
+                    let delay_ms = (((b as f64 - start_at) * tempo_ms).max(0.0)) as u64;
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    if g2.load(Ordering::Relaxed) != gen {
+                        return; // lecture invalidée (stop/relance)
+                    }
+                    // Volume lu EN DIRECT → mute/volume instantanés
+                    let vol = ck.volume.load(Ordering::Relaxed);
+                    if vol == 0 {
+                        b += 1;
+                        continue;
+                    }
+                    let acc = ck.accent.load(Ordering::Relaxed) && b % bars == 0;
+                    let vel = (vol as f32 / 100.0 * if acc { 127.0 } else { 120.0 }).round() as u8;
+                    let pitch = if acc { pitch_acc } else { pitch_norm };
+                    {
+                        let mut c = h.lock().unwrap();
+                        no_mv(&mut c, cch, pitch, vel, 127);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(dur_ms));
+                    {
+                        let mut c = h.lock().unwrap();
+                        no_mv(&mut c, cch, pitch, 0, 127);
+                    }
+                    b += 1;
+                }
+            }));
+        }
+        for n in sorted {
+            let h = handle.clone();
+            let g2 = gen_ref.clone();
+            let delay_ms = (((n.start_time - start_at) * tempo_ms).max(0.0)) as u64;
+            let dur_ms = ((n.duration * tempo_ms).max(60.0)) as u64;
+            let is_drum = tracks.iter().any(|t| t.channel == n.channel && t.drums);
+            let out_ch = if is_drum && n.channel != 9 { 9 } else { n.channel };
+            handles.push(std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                if g2.load(Ordering::Relaxed) != gen {
+                    return; // cette lecture a été invalidée (stop/relance)
+                }
+                {
+                    let mut c = h.lock().unwrap();
+                    no_mv(&mut c, out_ch, n.pitch, n.velocity, 127);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(dur_ms));
+                {
+                    let mut c = h.lock().unwrap();
+                    no_mv(&mut c, out_ch, n.pitch, 0, 127);
+                }
+            }));
+        }
+        for th in handles {
+            let _ = th.join();
+        }
+        println!("🎹 Lecture MIDI Navig terminée : {} notes", total);
+    });
 }
 
 /// POST /navig-play — lecture SERVEUR du rendu en double canaux :
@@ -1289,6 +1576,7 @@ async fn main() {
 
     let state = AppState {
         midi,
+        midi_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         soundfont,
         live: Arc::new(Live {
             tracks: Mutex::new(vec![
@@ -1372,10 +1660,15 @@ async fn main() {
         .route("/sample-file/:name", get(sample_file))
         .route("/rendered/:file", get(serve_rendered))
         .route("/audio-devices", get(audio_devices))
+        .route("/audio-device", post(audio_device))
+        .route("/midi-ports", get(midi_ports))
+        .route("/midi-port", post(midi_port))
         .route("/click", get(get_click).post(post_click))
         .route("/navig-click-start", post(navig_click_start))
         .route("/navig-click-stop", post(navig_click_stop))
         .route("/navig-play", post(navig_play))
+        .route("/navig-play-midi", post(navig_play_midi))
+        .route("/navig-stop-midi", post(navig_stop_midi))
         .route("/save", post(grilles::save_grille))
         .route("/grilles", get(grilles::list_grilles))
         .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))

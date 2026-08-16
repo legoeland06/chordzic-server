@@ -47,6 +47,9 @@ pub struct LiveTrack {
     /// Piste percussion (kit drums) sur un canal ≠ 9 : programmée via la
     /// banque percussion GM2 (bank select 128) + kit Standard (program 0).
     pub drums: AtomicBool,
+    /// Bank select drums (CC0 MSB / CC32 LSB) — kits alternatifs (ex. Roland).
+    pub bank_msb: AtomicU8,
+    pub bank_lsb: AtomicU8,
 }
 
 impl LiveTrack {
@@ -59,6 +62,8 @@ impl LiveTrack {
             fx_reverb: AtomicU8::new(0),
             fx_chorus: AtomicU8::new(0),
             drums: AtomicBool::new(false),
+            bank_msb: AtomicU8::new(0),
+            bank_lsb: AtomicU8::new(0),
         }
     }
 }
@@ -199,13 +204,32 @@ pub fn init_midi() -> Option<(MidiHandle, String)> {
         eprintln!("Port MIDI {} invalide ({} ports disponibles)", i, p.len());
         return None;
     }
-    let name = mo.port_name(&p[i]).unwrap_or_default();
-    println!("✅ Connecté à MIDI : {}", name);
-    mo.connect(&p[i], "chords-server-rs").ok()
-        .map(|c| (Arc::new(Mutex::new(c)), name))
+    connect_port(i)
 }
 
 // ─── Helpers MIDI ──────────────────────────────────────────────────────
+
+/// Connecte la sortie MIDI sur un port par son index.
+/// Retourne (handle, nom du port). None si l'index est invalide.
+pub fn connect_port(index: usize) -> Option<(MidiHandle, String)> {
+    let mo = MidiOutput::new("chords-server-rs").ok()?;
+    let p = mo.ports();
+    if index >= p.len() {
+        return None;
+    }
+    let name = mo.port_name(&p[index]).unwrap_or_default();
+    println!("✅ Connecté à MIDI : {}", name);
+    mo.connect(&p[index], "chords-server-rs")
+        .ok()
+        .map(|c| (Arc::new(Mutex::new(c)), name))
+}
+
+/// Liste les noms des ports MIDI disponibles (dans l'ordre des index).
+pub fn list_ports() -> Vec<String> {
+    MidiOutput::new("chords-server-rs")
+        .map(|mo| mo.ports().iter().filter_map(|x| mo.port_name(x).ok()).collect())
+        .unwrap_or_default()
+}
 
 /// Envoie un message MIDI brut sur la connexion.
 /// Affiche une erreur (non bloquante) si l'envoi échoue.
@@ -444,8 +468,15 @@ fn setup_tracks(c: &mut MidiOutputConnection, tracks: &[LiveTrack]) {
             // drums natif reçoit ses notes — voir play_seq / note).
             continue;
         } else if ch == 9 {
-            // Drums : program 1 = Standard Kit (toujours)
-            pc(c, ch, 1);
+            // Drums : bank select si un kit alternatif est choisi, sinon
+            // program 1 = Standard Kit
+            let msb = t.bank_msb.load(Ordering::Relaxed);
+            let lsb = t.bank_lsb.load(Ordering::Relaxed);
+            if msb != 0 || lsb != 0 {
+                cc(c, ch, 0, msb);
+                cc(c, ch, 32, lsb);
+            }
+            pc(c, ch, t.program.load(Ordering::Relaxed) as u8);
         } else {
             pc(c, ch, t.program.load(Ordering::Relaxed) as u8);
         }
@@ -473,6 +504,8 @@ pub fn apply_tracks(lc: &Live, cfg: &[TrackCfg]) {
                 if let Some(v) = tc.volume { t.volume.store(v, Ordering::Relaxed); }
                 if let Some(m) = tc.mute { t.mute.store(m, Ordering::Relaxed); }
                 if let Some(d) = tc.drums { t.drums.store(d, Ordering::Relaxed); }
+                if let Some(b) = tc.bank_msb { t.bank_msb.store(b, Ordering::Relaxed); }
+                if let Some(b) = tc.bank_lsb { t.bank_lsb.store(b, Ordering::Relaxed); }
                 if let Some(fx) = tc.effects {
                     t.fx_reverb.store(fx.reverb, Ordering::Relaxed);
                     t.fx_chorus.store(fx.chorus, Ordering::Relaxed);
@@ -792,6 +825,9 @@ pub struct TrackCfg {
     pub mute: Option<bool>,         // Nouvel état mute (None = ne pas changer)
     /// Piste percussion (kit drums) sur un canal ≠ 9 (None = ne pas changer).
     pub drums: Option<bool>,
+    /// Bank select drums (CC0 MSB / CC32 LSB) — kits alternatifs (ex. Roland).
+    pub bank_msb: Option<u8>,
+    pub bank_lsb: Option<u8>,
     /// Effets (reverb/chorus appliqués en live via CC MIDI 91/93).
     pub effects: Option<crate::dsp::Fx>,
 }

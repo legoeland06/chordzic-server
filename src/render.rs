@@ -89,6 +89,9 @@ pub struct TrackCfg {
     /// Piste percussion (kit drums) sur un canal ≠ 9 : programmée via la
     /// banque percussion GM2 (bank select 128) + kit Standard (program 0).
     pub drums: bool,
+    /// Bank select drums (CC0 MSB / CC32 LSB) — kits alternatifs (ex. Roland).
+    pub bank_msb: u8,
+    pub bank_lsb: u8,
     pub fx: crate::dsp::Fx,  // Effets par piste (reverb/chorus/delay/drive)
 }
 
@@ -97,11 +100,11 @@ impl Default for RenderCfg {
         Self {
             tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
             tracks: vec![
-                TrackCfg { channel: 0, program: 51, volume: 60, mute: false, drums: false, fx: Default::default() },
-                TrackCfg { channel: 2, program: 33, volume: 70, mute: false, drums: false, fx: Default::default() },
-                TrackCfg { channel: 3, program: 48, volume: 60, mute: false, drums: false, fx: Default::default() },
-                TrackCfg { channel: 9, program: 1, volume: 90, mute: false, drums: false, fx: Default::default() },
-                TrackCfg { channel: 4, program: 2, volume: 50, mute: false, drums: false, fx: Default::default() },
+                TrackCfg { channel: 0, program: 51, volume: 60, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: 2, program: 33, volume: 70, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: 3, program: 48, volume: 60, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: 9, program: 1, volume: 90, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: 4, program: 2, volume: 50, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
             ],
         }
     }
@@ -835,9 +838,9 @@ pub fn generate_click_smf(tempo: u16, beats_per_bar: u64, total_beats: f64, acce
 
     // Piste synthétique pour le program change des sons mélodiques
     let tracks: Vec<TrackCfg> = match sound {
-        1 => vec![TrackCfg { channel: 15, program: 115, volume: 127, mute: false, drums: false, fx: Default::default() }],
-        2 => vec![TrackCfg { channel: 15, program: 114, volume: 127, mute: false, drums: false, fx: Default::default() }],
-        3 => vec![TrackCfg { channel: 15, program: 116, volume: 127, mute: false, drums: false, fx: Default::default() }],
+        1 => vec![TrackCfg { channel: 15, program: 115, volume: 127, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() }],
+        2 => vec![TrackCfg { channel: 15, program: 114, volume: 127, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() }],
+        3 => vec![TrackCfg { channel: 15, program: 116, volume: 127, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() }],
         _ => vec![], // métronome GM : kit drums natif, pas de program change
     };
     generate_smf_from_custom(&notes, &tracks, tempo)
