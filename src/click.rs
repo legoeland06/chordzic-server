@@ -243,16 +243,30 @@ fn playback_start_frame(start_sec: f64, sample_rate: u32) -> usize {
     (start_sec * sample_rate as f64).round() as usize
 }
 
+/// Frame suivante à jouer — gère la BOUCLE (repeat) : quand le buffer est
+/// fini, on repart au début (frame 0) si loop_playback, sinon None (fin).
+fn next_frame(i: usize, max_frames: usize, loop_playback: bool) -> Option<usize> {
+    if i < max_frames {
+        return Some(i);
+    }
+    if loop_playback && max_frames > 0 {
+        return Some(0);
+    }
+    None
+}
+
 /// Joue main (canaux 1-2) + clic (canaux 3-4) sur l'appareil `device_name`
 /// (doit avoir ≥ 4 canaux de sortie). Le clic est atténué par `click_gain`.
 /// `start_sec` : offset de départ en secondes (les deux WAV démarrent à cet
 /// offset, alignés) — 0 = depuis le début.
+/// `loop_playback` : repeat — à la fin du buffer, on repart au début (0).
 pub fn play_dual(
     main_path: &str,
     click_path: &str,
     device_name: &str,
     state: Arc<ClickState>,
     start_sec: f64,
+    loop_playback: bool,
 ) -> Result<(), String> {
     // Arrêter un éventuel lecteur précédent
     stop_dual();
@@ -330,7 +344,17 @@ pub fn play_dual(
         let max_frames = (main_s.len() / mch).max(click_s.len() / cch);
         let sr_us = sr.max(1) as usize;
         let mut i = playback_start_frame(start_sec, sr).min(max_frames);
-        while i < max_frames && !stop.load(Ordering::Relaxed) {
+        loop {
+            // Frame courante — la boucle (repeat) repart au début quand le
+            // buffer est fini (jamais de fin pour la lecture en boucle).
+            let frame = match next_frame(i, max_frames, loop_playback) {
+                Some(f) => f,
+                None => break,
+            };
+            i = frame;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             // Compensation de latence LUE EN DIRECT dans l'état partagé :
             // modifier delay_ms/volume PENDANT la lecture décale le clic
             // immédiatement (calage à l'oreille sans relancer).
@@ -472,5 +496,16 @@ mod tests {
         assert_eq!(playback_start_frame(1.0, 44100), 44100);
         assert_eq!(playback_start_frame(1.5, 48000), 72000);
         assert_eq!(playback_start_frame(2.0, 22050), 44100);
+    }
+
+    /// Boucle (repeat) : la lecture repart au début quand le buffer est fini.
+    #[test]
+    fn next_frame_loop_repart_a_zero() {
+        assert_eq!(next_frame(0, 100, false), Some(0));
+        assert_eq!(next_frame(99, 100, false), Some(99));
+        assert_eq!(next_frame(100, 100, false), None, "fin sans boucle → stop");
+        assert_eq!(next_frame(100, 100, true), Some(0), "fin avec boucle → retour au début");
+        assert_eq!(next_frame(101, 100, true), Some(0), "au-delà de la fin → retour au début");
+        assert_eq!(next_frame(0, 0, true), None, "buffer vide → rien");
     }
 }

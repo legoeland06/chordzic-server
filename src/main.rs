@@ -1278,6 +1278,7 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
                 sig_code(&b.sig),
                 total_beats,
                 b.master_vol,
+                b.loop_enabled.unwrap_or(false),
             );
             drop(guard);
             let dur = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max)
@@ -1322,6 +1323,7 @@ fn midi_play_custom(
     sig_code_v: u16,
     total_beats: f64,
     master_vol: u8,
+    loop_playback: bool,
 ) {
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
@@ -1395,6 +1397,7 @@ fn midi_play_custom(
         }
         // 2. Notes programmées (note-on → durée → note-off)
         let tempo_ms = 60_000.0 / tempo.max(1) as f64;
+        let total_ms = total_beats * tempo_ms; // période d'une passe (boucle)
         let total = notes.len();
         let mut sorted: Vec<_> = notes
             .into_iter()
@@ -1439,7 +1442,9 @@ fn midi_play_custom(
                 // absolu APRÈS la durée de note → l'intervalle entre clics
                 // augmentait à chaque beat (métronome qui ralentit et dérive).
                 loop {
-                    if b > total {
+                    // BOUCLE (repeat) : le clic continue au-delà de la fin
+                    // du morceau (les accents retombent sur chaque mesure).
+                    if !loop_playback && b > total {
                         return;
                     }
                     // Décalage du clic lu EN DIRECT (comme le volume) :
@@ -1478,26 +1483,40 @@ fn midi_play_custom(
         for n in sorted {
             let h = handle.clone();
             let g2 = gen_ref.clone();
-            let delay_ms = (((n.start_time - start_at) * tempo_ms).max(0.0)) as u64;
             let dur_ms = ((n.duration * tempo_ms).max(60.0)) as u64;
             let is_drum = tracks.iter().any(|t| t.channel == n.channel && t.drums);
             let out_ch = if is_drum && n.channel != 9 { 9 } else { n.channel };
             handles.push(std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                if g2.load(Ordering::Relaxed) != gen {
-                    return; // cette lecture a été invalidée (stop/relance)
-                }
-                {
-                    let mut c = h.lock().unwrap();
-                    // Master volume appliqué aux notes (comme le live play_seq
-                    // et les rendus WAV). Avant : dur à 127 → le slider master
-                    // n'avait aucun effet en lecture MIDI Navig.
-                    no_mv(&mut c, out_ch, n.pitch, n.velocity, master_vol);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(dur_ms));
-                {
-                    let mut c = h.lock().unwrap();
-                    no_mv(&mut c, out_ch, n.pitch, 0, 127);
+                // BOUCLE (repeat) : chaque note est rejouée à chaque passe
+                // (une passe = total_beats × tempo). Passe 0 depuis start_at,
+                // passes suivantes depuis le début. Horloge ABSOLUE : la
+                // cible est recalculée à chaque passe, le sleep est le RESTE.
+                let mut pass: u64 = if n.start_time + n.duration > start_at { 0 } else { 1 };
+                let start = std::time::Instant::now();
+                loop {
+                    let target_ms = note_loop_target_ms(pass, n.start_time, start_at, tempo_ms, total_ms);
+                    let now_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let delay_ms = (target_ms - now_ms).max(0.0) as u64;
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    if g2.load(Ordering::Relaxed) != gen {
+                        return; // cette lecture a été invalidée (stop/relance)
+                    }
+                    {
+                        let mut c = h.lock().unwrap();
+                        // Master volume appliqué aux notes (comme le live
+                        // play_seq et les rendus WAV). Avant : dur à 127 → le
+                        // slider master n'avait aucun effet en lecture MIDI Navig.
+                        no_mv(&mut c, out_ch, n.pitch, n.velocity, master_vol);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(dur_ms));
+                    {
+                        let mut c = h.lock().unwrap();
+                        no_mv(&mut c, out_ch, n.pitch, 0, 127);
+                    }
+                    if !loop_playback {
+                        return;
+                    }
+                    pass += 1;
                 }
             }));
         }
@@ -1515,6 +1534,19 @@ fn start_sec_from_beats(start_at: Option<f64>, tempo: u32) -> f64 {
         Some(ba) if ba > 0.0 => (ba * 60.0) / tempo.max(1) as f64,
         _ => 0.0,
     }
+}
+
+/// Cible temporelle (ms depuis le start du thread) d'une note à la passe
+/// `pass` d'une lecture MIDI en BOUCLE : passe 0 = depuis start_at (notes
+/// avant start_at sautées), passes suivantes = depuis le début du morceau
+/// (un tour complet = total_ms). Sans boucle, seule la passe 0 est jouée.
+fn note_loop_target_ms(pass: u64, start_time: f64, start_at: f64, tempo_ms: f64, total_ms: f64) -> f64 {
+    let within = if pass == 0 {
+        (start_time - start_at).max(0.0) * tempo_ms
+    } else {
+        start_time * tempo_ms
+    };
+    pass as f64 * total_ms + within
 }
 
 /// POST /navig-play — lecture SERVEUR du rendu en double canaux :
@@ -1540,13 +1572,14 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     // (Le rendu complet ≈ 3 s : re-rendre à chaque clic donnait l'impression
     // que « la lecture continue » sans jamais sauter.)
     let start_sec = start_sec_from_beats(b.start_at, b.tempo);
+    let loop_playback = b.loop_enabled.unwrap_or(false);
     if start_sec > 0.0 {
         let cache = s.rendered_dual.lock().unwrap().clone();
         if let Some((mp, cp, dur)) = cache {
             if std::path::Path::new(&mp).exists() && std::path::Path::new(&cp).exists() {
                 let cfg = click::load(&s.click);
                 if let Some(d) = cfg.out_device.filter(|d| !d.is_empty()) {
-                    match click::play_dual(&mp, &cp, &d, s.click.clone(), start_sec) {
+                    match click::play_dual(&mp, &cp, &d, s.click.clone(), start_sec, loop_playback) {
                         Ok(()) => {
                             return (StatusCode::OK, axum::Json(serde_json::json!({
                                 "ok": true,
@@ -1681,7 +1714,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     // REPLI automatique : clic MÉLANGÉ au son principal (synchro parfaite).
     // Le décalage/volume du clic sont lus EN DIRECT dans l'état partagé
     // (réglables pendant la lecture).
-    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone(), start_sec) {
+    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone(), start_sec, loop_playback) {
         Ok(()) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({
@@ -1926,5 +1959,24 @@ mod tests {
         assert_eq!(start_sec_from_beats(Some(4.0), 120), 2.0);
         assert_eq!(start_sec_from_beats(Some(1.0), 60), 1.0);
         assert!((start_sec_from_beats(Some(2.5), 123) - 1.219512195).abs() < 1e-6);
+    }
+
+    /// Boucle MIDI : cible temporelle (ms depuis le start du thread) d'une
+    /// note à la passe `pass` — passe 0 = depuis start_at, passes suivantes
+    /// = depuis le début du morceau (total_ms par passe).
+    #[test]
+    fn note_loop_target_ms_repetitions() {
+        let tempo_ms = 500.0; // 120 BPM
+        let total_ms = 8.0 * 500.0; // 8 temps
+        // Passe 0 avec start_at : décalage depuis start_at
+        assert!((note_loop_target_ms(0, 2.0, 1.0, tempo_ms, total_ms) - 500.0).abs() < 1e-9);
+        // Passe 0 sans start_at : la note à son temps
+        assert!((note_loop_target_ms(0, 2.0, 0.0, tempo_ms, total_ms) - 1000.0).abs() < 1e-9);
+        // Passe 1 : un tour complet + le temps de la note
+        assert!((note_loop_target_ms(1, 2.0, 0.0, tempo_ms, total_ms) - (4000.0 + 1000.0)).abs() < 1e-9);
+        // Passe 2 : deux tours + le temps de la note
+        assert!((note_loop_target_ms(2, 2.0, 0.0, tempo_ms, total_ms) - (8000.0 + 1000.0)).abs() < 1e-9);
+        // Note avant start_at → passe 0 sautée, première occurrence passe 1
+        assert!((note_loop_target_ms(1, 0.5, 2.0, tempo_ms, total_ms) - (4000.0 + 250.0)).abs() < 1e-9);
     }
 }
