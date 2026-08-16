@@ -1504,6 +1504,15 @@ fn midi_play_custom(
     });
 }
 
+/// Convertit start_at (beats) → secondes pour navig-play : offset de lecture
+/// du rendu WAV (main + clic) quand l'utilisateur déplace la tête de lecture.
+fn start_sec_from_beats(start_at: Option<f64>, tempo: u32) -> f64 {
+    match start_at {
+        Some(ba) if ba > 0.0 => (ba * 60.0) / tempo.max(1) as f64,
+        _ => 0.0,
+    }
+}
+
 /// POST /navig-play — lecture SERVEUR du rendu en double canaux :
 /// le WAV principal (canaux 1-2) + le clic (canaux 3-4) sur un appareil
 /// MULTICANAL (agrégat CoreAudio) → UNE seule horloge, synchro
@@ -1600,6 +1609,10 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     //    MULTICANAL (≥ 4 canaux — agrégat Mac / multi ALSA), sinon REPLI
     //    automatique : clic MÉLANGÉ au son principal (synchro parfaite
     //    quand même — un seul WAV). Plus jamais d'erreur bloquante.
+    //    start_sec : l'utilisateur a déplacé la tête de lecture (scrub) →
+    //    les deux WAV démarrent à cet offset (alignés), le repli mixé est
+    //    tronqué au même offset.
+    let start_sec = start_sec_from_beats(b.start_at, b.tempo);
     let dir = std::env::temp_dir().join("chordj_rendered");
     let _ = std::fs::create_dir_all(&dir);
     let ts = std::time::SystemTime::now()
@@ -1619,13 +1632,13 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
     // REPLI automatique : clic MÉLANGÉ au son principal (synchro parfaite).
     // Le décalage/volume du clic sont lus EN DIRECT dans l'état partagé
     // (réglables pendant la lecture).
-    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone()) {
+    match click::play_dual(&main_path, &click_path, &out_device, s.click.clone(), start_sec) {
         Ok(()) => (
             StatusCode::OK,
             axum::Json(serde_json::json!({
                 "ok": true,
                 "mode": "channels",
-                "duration_sec": duration_sec,
+                "duration_sec": (duration_sec - start_sec).max(0.0),
             })),
         ).into_response(),
         Err(e) => {
@@ -1636,6 +1649,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
                     return (StatusCode::INTERNAL_SERVER_ERROR, format!("Mix : {}", me)).into_response()
                 }
             };
+            let mixed = render::slice_wav_from(&mixed, start_sec);
             let mixed_name = format!("dual_{}_mixed.wav", ts);
             let _ = std::fs::write(dir.join(&mixed_name), &mixed);
             eprintln!("   ℹ️ Clic : repli MIXÉ (sortie « {} » : {})", out_device, e);
@@ -1651,7 +1665,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
                         "ok": true,
                         "mode": "mixed_fallback",
                         "reason": format!("Sortie « {} » non multicanal → clic mélangé au son principal (synchro parfaite)", out_device),
-                        "duration_sec": duration_sec,
+                        "duration_sec": (duration_sec - start_sec).max(0.0),
                     })),
                 ).into_response(),
                 Err(e2) => (StatusCode::BAD_REQUEST, e2).into_response(),
@@ -1822,6 +1836,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Simule l'horloge du clic métronome MIDI (nouvelle version) : la cible
     /// est recalculée à chaque beat (b × tempo + décalage) → intervalles
     /// stables, le décalage décale le 1ᵉʳ clic sans casser le tempo.
@@ -1847,5 +1863,16 @@ mod tests {
             let iv = w[1] - w[0];
             assert!((iv - tempo_ms).abs() < 1e-9, "intervalle {iv} != {tempo_ms}");
         }
+    }
+
+    /// Conversion start_at (beats) → secondes pour navig-play (offset de
+    /// lecture du rendu WAV, main + clic alignés).
+    #[test]
+    fn start_sec_from_beats_conversion() {
+        assert_eq!(start_sec_from_beats(None, 120), 0.0);
+        assert_eq!(start_sec_from_beats(Some(0.0), 120), 0.0);
+        assert_eq!(start_sec_from_beats(Some(4.0), 120), 2.0);
+        assert_eq!(start_sec_from_beats(Some(1.0), 60), 1.0);
+        assert!((start_sec_from_beats(Some(2.5), 123) - 1.219512195).abs() < 1e-6);
     }
 }

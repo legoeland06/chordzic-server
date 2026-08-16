@@ -232,13 +232,27 @@ fn resample_i16(samples: &[i16], channels: u16, in_rate: u32, out_rate: u32) -> 
     out
 }
 
+/// Frame de départ de la lecture (offset en secondes × fréquence device).
+/// Utilisé par play_dual pour démarrer main + clic à la position demandée
+/// (scrub en mode séparé) : les deux WAV commencent au même offset → ils
+/// restent échantillon-alignés.
+fn playback_start_frame(start_sec: f64, sample_rate: u32) -> usize {
+    if start_sec <= 0.0 {
+        return 0;
+    }
+    (start_sec * sample_rate as f64).round() as usize
+}
+
 /// Joue main (canaux 1-2) + clic (canaux 3-4) sur l'appareil `device_name`
 /// (doit avoir ≥ 4 canaux de sortie). Le clic est atténué par `click_gain`.
+/// `start_sec` : offset de départ en secondes (les deux WAV démarrent à cet
+/// offset, alignés) — 0 = depuis le début.
 pub fn play_dual(
     main_path: &str,
     click_path: &str,
     device_name: &str,
     state: Arc<ClickState>,
+    start_sec: f64,
 ) -> Result<(), String> {
     // Arrêter un éventuel lecteur précédent
     stop_dual();
@@ -315,7 +329,7 @@ pub fn play_dual(
         let cch = click_ch.max(1) as usize;
         let max_frames = (main_s.len() / mch).max(click_s.len() / cch);
         let sr_us = sr.max(1) as usize;
-        let mut i = 0usize;
+        let mut i = playback_start_frame(start_sec, sr).min(max_frames);
         while i < max_frames && !stop.load(Ordering::Relaxed) {
             // Compensation de latence LUE EN DIRECT dans l'état partagé :
             // modifier delay_ms/volume PENDANT la lecture décale le clic
@@ -448,5 +462,15 @@ mod tests {
         let cst_up = resample_i16(&cst, 1, 44100, 48000);
         assert_eq!(cst_up.len(), 1088);
         assert!(cst_up.iter().all(|&s| s == 1234));
+    }
+
+    /// Frame de départ de la lecture (offset en secondes × fréquence device).
+    #[test]
+    fn playback_start_frame_offsets() {
+        assert_eq!(playback_start_frame(0.0, 44100), 0);
+        assert_eq!(playback_start_frame(-3.0, 44100), 0, "négatif → 0");
+        assert_eq!(playback_start_frame(1.0, 44100), 44100);
+        assert_eq!(playback_start_frame(1.5, 48000), 72000);
+        assert_eq!(playback_start_frame(2.0, 22050), 44100);
     }
 }

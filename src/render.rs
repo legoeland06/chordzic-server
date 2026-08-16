@@ -691,6 +691,38 @@ pub struct RenderedTrack {
     pub wav: Vec<u8>,
 }
 
+/// Retire le début d'un WAV (offset en secondes) — utilisé par le repli
+/// mixé de navig-play pour démarrer la lecture à la position demandée
+/// (le clic reste mélangé, les accents de mesure restent à leur place).
+pub fn slice_wav_from(wav: &[u8], start_sec: f64) -> Vec<u8> {
+    if start_sec <= 0.0 {
+        return wav.to_vec();
+    }
+    use hound::WavReader;
+    let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
+        return wav.to_vec();
+    };
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
+    let ch = spec.channels.max(1) as usize;
+    let start = ((start_sec * spec.sample_rate as f64) as usize) * ch;
+    if start >= samples.len() {
+        return wav.to_vec(); // garde-fou : offset au-delà de la durée
+    }
+    let mut out = Vec::new();
+    if let Ok(mut w) = hound::WavWriter::new(std::io::Cursor::new(&mut out), spec) {
+        for &s in &samples[start..] {
+            let _ = w.write_sample(s);
+        }
+        let _ = w.finalize();
+    }
+    if out.is_empty() {
+        wav.to_vec()
+    } else {
+        out
+    }
+}
+
 /// Construit la liste des pistes à rendre : pistes actives (non mutées) +
 /// piste drums par défaut si des notes canal 9 existent sans piste native
 /// (piste drums sur canal ≠ 9 supprimée → les notes redirigées vers le 9
@@ -1076,5 +1108,34 @@ mod tests {
         };
         let list3 = render_tracks_list(&cfg2, &notes);
         assert_eq!(list3.iter().filter(|t| t.channel == CH_DRUMS).count(), 1);
+    }
+
+    /// slice_wav_from retire le début d'un WAV (offset en secondes) —
+    /// utilisé par le repli mixé de navig-play pour démarrer à la position.
+    #[test]
+    fn slice_wav_from_coupe_le_debut() {
+        let spec = hound::WavSpec {
+            channels: 1, sample_rate: 1000, bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for i in 0..1000 {
+                w.write_sample(i as i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        // offset 0 → identique
+        assert_eq!(slice_wav_from(&buf, 0.0).len(), buf.len());
+        // offset 0,25 s (250 éch @1000 Hz) → 750 échantillons restants
+        let sliced = slice_wav_from(&buf, 0.25);
+        let mut r = hound::WavReader::new(std::io::Cursor::new(&sliced)).unwrap();
+        let s: Vec<i16> = r.samples::<i16>().filter_map(|x| x.ok()).collect();
+        assert_eq!(s.len(), 750, "250 échantillons retirés");
+        assert_eq!(s[0], 250, "le premier échantillon = index 250 d'origine");
+        assert_eq!(s[749], 999, "le dernier échantillon = index 999 d'origine");
+        // offset au-delà de la durée → inchangé (garde-fou)
+        assert_eq!(slice_wav_from(&buf, 99.0).len(), buf.len());
     }
 }
