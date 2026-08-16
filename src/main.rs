@@ -1552,6 +1552,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
                                 "ok": true,
                                 "mode": "channels",
                                 "duration_sec": (dur - start_sec).max(0.0),
+                                "total_duration_sec": dur,
                             }))).into_response();
                         }
                         Err(_) => { /* repli : rendu complet ci-dessous (rare) */ }
@@ -1687,6 +1688,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
                 "ok": true,
                 "mode": "channels",
                 "duration_sec": (duration_sec - start_sec).max(0.0),
+                "total_duration_sec": duration_sec,
             })),
         ).into_response(),
         Err(e) => {
@@ -1714,6 +1716,7 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
                         "mode": "mixed_fallback",
                         "reason": format!("Sortie « {} » non multicanal → clic mélangé au son principal (synchro parfaite)", out_device),
                         "duration_sec": (duration_sec - start_sec).max(0.0),
+                        "total_duration_sec": duration_sec,
                     })),
                 ).into_response(),
                 Err(e2) => (StatusCode::BAD_REQUEST, e2).into_response(),
