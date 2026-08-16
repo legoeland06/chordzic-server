@@ -27,6 +27,19 @@ use crate::walking::{is_minor as is_minor_chord, generate_walking_bass as walkin
 /// triolets). 288 = 2^5 × 3^2, divisible par 18 et 24.
 const TICKS_PER_BEAT: u32 = 288;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+static RENDER_TAG: AtomicU64 = AtomicU64::new(0);
+
+/// Tag UNIQUE par appel de rendu — évite la course sur les fichiers
+/// temporaires quand deux rendus se chevauchent (scrubs rapides en mode
+/// séparé, render-tracks + render-wav simultanés…). Avant : noms fixes
+/// /tmp/chordj_render.mid|.wav → le premier appel supprimait les fichiers
+/// pendant que le second les lisait (« No such file or directory »).
+fn next_render_tag() -> String {
+    let n = RENDER_TAG.fetch_add(1, Ordering::Relaxed);
+    format!("chordj_render_{}_{}", std::process::id(), n)
+}
+
 // ─── Helpers SMF ───────────────────────────────────────────────────────
 
 /// Écrit un entier en VLQ (Variable Length Quantity) — format MIDI standard
@@ -622,14 +635,17 @@ fn trim_to_duration(wav: &[u8], expected_sec: f64) -> Vec<u8> {
 /// (sans gain master ni fade : traitement du mix fait par l'appelant).
 ///
 /// # Pipeline
-/// 1. Écrit le SMF dans `/tmp/chordj_render.mid`
+/// 1. Écrit le SMF dans un fichier temporaire UNIQUE (`chordj_render_<pid>_<n>.mid`)
 /// 2. Appelle `fluidsynth -F <wav> -T wav -g 1.0 -n -i <soundfont> <mid>`
 /// 3. Lit le WAV produit
 /// 4. Nettoie les fichiers temporaires
 /// 5. Tronque le WAV à la durée exacte
 pub fn render_wav_raw(smf: &[u8], soundfont: &str, duration_sec: f64) -> Result<Vec<u8>, String> {
-    let mid_path = std::env::temp_dir().join("chordj_render.mid");
-    let wav_path = std::env::temp_dir().join("chordj_render.wav");
+    // Noms UNIQUES par appel : deux rendus simultanés ne se marchent plus
+    // dessus (avant : /tmp/chordj_render.mid|.wav partagés → « No such file »).
+    let tag = next_render_tag();
+    let mid_path = std::env::temp_dir().join(format!("{}.mid", tag));
+    let wav_path = std::env::temp_dir().join(format!("{}.wav", tag));
 
     // Étape 1 : écrire le SMF temporaire
     std::fs::write(&mid_path, smf).map_err(|e| format!("Impossible d'écrire le MIDI temporaire : {}", e))?;
@@ -1108,6 +1124,21 @@ mod tests {
         };
         let list3 = render_tracks_list(&cfg2, &notes);
         assert_eq!(list3.iter().filter(|t| t.channel == CH_DRUMS).count(), 1);
+    }
+
+    /// Les noms de fichiers temporaires de rendu doivent être UNIQUES par
+    /// appel : deux rendus simultanés (ex. scrubs rapides en mode séparé)
+    /// partageaient /tmp/chordj_render.mid|.wav → l'un supprimait les
+    /// fichiers pendant que l'autre les lisait (« No such file or directory »).
+    #[test]
+    fn render_temp_tag_est_unique() {
+        let a = next_render_tag();
+        let b = next_render_tag();
+        assert_ne!(a, b, "deux tags consécutifs doivent différer");
+        let c = next_render_tag();
+        assert_ne!(b, c);
+        // Le tag contient le PID et un numéro → fichiers distincts
+        assert!(a.starts_with("chordj_render_"));
     }
 
     /// slice_wav_from retire le début d'un WAV (offset en secondes) —
