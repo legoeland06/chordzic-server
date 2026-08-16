@@ -1395,10 +1395,20 @@ fn midi_play_custom(
                 }
             }
         }
-        // 2. Notes programmées (note-on → durée → note-off)
+        // 2. Notes programmées + clic — SCHEDULER MONO-THREAD
+        // Une lecture = UN thread + une min-heap d'événements (note-on/off +
+        // clic). Avant : 1 thread PAR NOTE → les grilles énormes (4000+
+        // notes) créaient des milliers de threads → limite système atteinte
+        // → spawn en échec (Resource temporarily unavailable) → notes et
+        // clic absents (surtout au repeat : les lectures non stoppées
+        // s'accumulaient). Horloge UNIQUE (start.elapsed()) → clic et notes
+        // parfaitement synchrones, même en boucle et après un scrub.
         let tempo_ms = 60_000.0 / tempo.max(1) as f64;
         let total_ms = total_beats * tempo_ms; // période d'une passe (boucle)
-        let total = notes.len();
+        // Durée de la passe 0 (depuis start_at) : après un scrub, la 1re
+        // passe est plus courte que le morceau complet ; les cycles suivants
+        // durent total_ms (morceau complet) — même référentiel que le WAV.
+        let pass0_len_ms = (total_ms - start_at * tempo_ms).max(0.0);
         // En BOUCLE, TOUTES les notes sont gardées (les passes suivantes
         // repartent du début) ; sans boucle, on ignore celles avant start_at.
         let mut sorted: Vec<_> = if loop_playback {
@@ -1409,126 +1419,197 @@ fn midi_play_custom(
                 .collect()
         };
         sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
-        let mut handles = Vec::new();
-        // 1b. Clic métronome MIDI — temps réel, volume/mute lus à CHAQUE
-        // beat (le bouton 🔇 mute → volume 0 → vélocité 0 → silence immédiat).
-        // Sortie : FluidSynth si dispo (métronome GM), sinon port principal.
-        {
-            let g2 = gen_ref.clone();
-            let ck = click.clone();
-            let tempo_ms = 60_000.0 / tempo.max(1) as f64;
-            let bars = (sig_code_v / 10).max(1) as u64;
-            let total = total_beats.ceil() as u64;
-            let (clk, cch, pitch_acc, pitch_norm) = match &fluid {
-                Some(f) => match click.sound.load(Ordering::Relaxed) {
-                    click::SOUND_WOODBLOCK => (f.clone(), 15u8, 72u8, 72u8),
-                    click::SOUND_AGOGO => (f.clone(), 15u8, 74u8, 74u8),
-                    click::SOUND_TAIKO => (f.clone(), 15u8, 55u8, 55u8),
-                    _ => (f.clone(), 9u8, 34u8, 33u8), // métronome GM
-                },
-                None => {
-                    if click_chan == 9 {
-                        (handle.clone(), 9u8, 34u8, 33u8) // métronome GM natif
-                    } else {
-                        (handle.clone(), click_chan, click_pitch, click_pitch) // repli
-                    }
+        // Clic : sortie et hauteurs (FluidSynth si dispo, sinon repli).
+        let bars = (sig_code_v / 10).max(1) as u64;
+        let total_int = total_beats.ceil() as u64;
+        let (clk, cch, pitch_acc, pitch_norm) = match &fluid {
+            Some(f) => match click.sound.load(Ordering::Relaxed) {
+                click::SOUND_WOODBLOCK => (f.clone(), 15u8, 72u8, 72u8),
+                click::SOUND_AGOGO => (f.clone(), 15u8, 74u8, 74u8),
+                click::SOUND_TAIKO => (f.clone(), 15u8, 55u8, 55u8),
+                _ => (f.clone(), 9u8, 34u8, 33u8), // métronome GM
+            },
+            None => {
+                if click_chan == 9 {
+                    (handle.clone(), 9u8, 34u8, 33u8) // métronome GM natif
+                } else {
+                    (handle.clone(), click_chan, click_pitch, click_pitch) // repli
                 }
-            };
-            handles.push(std::thread::spawn(move || {
-                let start = std::time::Instant::now();
-                let mut b = start_at.ceil() as u64;
-                // Durée du clic en BEATS (0,15 — comme le rendu WAV) :
-                // cohérente quel que soit le tempo (75 ms à 120 BPM,
-                // 150 ms à 60 BPM). Avant : 150 ms fixes.
-                let dur_ms = (0.15 * tempo_ms) as u64;
-                // ⚠️ HORLOGE ABSOLUE (bug corrigé) : la cible du clic est
-                // recalculée à chaque beat (b × tempo + décalage), le sleep
-                // est le RESTE à dormir. L'ancien code dormait un délai
-                // absolu APRÈS la durée de note → l'intervalle entre clics
-                // augmentait à chaque beat (métronome qui ralentit et dérive).
-                loop {
-                    // BOUCLE (repeat) : le clic continue au-delà de la fin
-                    // du morceau (les accents retombent sur chaque mesure).
-                    if !loop_playback && b > total {
-                        return;
-                    }
-                    // Décalage du clic lu EN DIRECT (comme le volume) :
-                    // positif → retarde le clic, négatif → l'avance —
-                    // compensation de latence à l'oreille, sans relancer.
-                    let shift_ms = ck.delay_ms.load(Ordering::Relaxed) as f64;
-                    let target_ms = (((b as f64 - start_at) * tempo_ms) + shift_ms).max(0.0);
-                    let now_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let delay_ms = (target_ms - now_ms).max(0.0) as u64;
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    if g2.load(Ordering::Relaxed) != gen {
-                        return; // lecture invalidée (stop/relance)
-                    }
-                    // Volume lu EN DIRECT → mute/volume instantanés
-                    let vol = ck.volume.load(Ordering::Relaxed);
-                    if vol == 0 {
-                        b += 1;
-                        continue;
-                    }
-                    let acc = ck.accent.load(Ordering::Relaxed) && b % bars == 0;
-                    let vel = (vol as f32 / 100.0 * if acc { 127.0 } else { 120.0 }).round() as u8;
-                    let pitch = if acc { pitch_acc } else { pitch_norm };
-                    {
-                        let mut c = clk.lock().unwrap();
-                        no_mv(&mut c, cch, pitch, vel, 127);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(dur_ms));
-                    {
-                        let mut c = clk.lock().unwrap();
-                        no_mv(&mut c, cch, pitch, 0, 127);
-                    }
-                    b += 1;
-                }
-            }));
-        }
-        for n in sorted {
-            let h = handle.clone();
-            let g2 = gen_ref.clone();
-            let dur_ms = ((n.duration * tempo_ms).max(60.0)) as u64;
+            }
+        };
+        // État par note : canal de sortie, durée brute, passe courante.
+        let note_out: Vec<u8> = sorted.iter().map(|n| {
             let is_drum = tracks.iter().any(|t| t.channel == n.channel && t.drums);
-            let out_ch = if is_drum && n.channel != 9 { 9 } else { n.channel };
-            handles.push(std::thread::spawn(move || {
-                // BOUCLE (repeat) : chaque note est rejouée à chaque passe
-                // (une passe = total_beats × tempo). Passe 0 depuis start_at,
-                // passes suivantes depuis le début. Horloge ABSOLUE : la
-                // cible est recalculée à chaque passe, le sleep est le RESTE.
-                let mut pass: u64 = if n.start_time + n.duration > start_at { 0 } else { 1 };
-                let start = std::time::Instant::now();
-                loop {
-                    let target_ms = note_loop_target_ms(pass, n.start_time, start_at, tempo_ms, total_ms);
-                    let now_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let delay_ms = (target_ms - now_ms).max(0.0) as u64;
-                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                    if g2.load(Ordering::Relaxed) != gen {
-                        return; // cette lecture a été invalidée (stop/relance)
+            if is_drum && n.channel != 9 { 9 } else { n.channel }
+        }).collect();
+        let note_dur: Vec<u64> = sorted.iter()
+            .map(|n| ((n.duration * tempo_ms).max(60.0)) as u64)
+            .collect();
+        let mut note_pass: Vec<u64> = sorted.iter()
+            .map(|n| if n.start_time + n.duration > start_at { 0 } else { 1 })
+            .collect();
+
+        // Min-heap d'événements : (temps en µs, séquence, événement).
+        // BinaryHeap = max-heap → on stocke l'opposé du temps.
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+        enum Ev { NoteOn(usize), NoteOff(usize), ClickOn, ClickOff }
+        let mut heap: std::collections::BinaryHeap<(i64, u64, Ev)> = std::collections::BinaryHeap::new();
+        let mut seq: u64 = 0;
+        macro_rules! push_ev {
+            ($t_ms:expr, $ev:expr) => {{
+                seq += 1;
+                let t_us = (($t_ms) * 1000.0).round() as i64;
+                heap.push((-t_us, seq, $ev));
+            }};
+        }
+        // Planifie le note-on d'une note pour sa passe courante (skip les
+        // passes où la note est entièrement hors passe).
+        macro_rules! plan_note {
+            ($i:expr) => {{
+                let mut done = false;
+                while !done {
+                    let n = &sorted[$i];
+                    let pass = note_pass[$i];
+                    let (target_ms, end_ms) = note_loop_window(pass, n.start_time, start_at, tempo_ms, total_ms);
+                    let dur_eff = if loop_playback {
+                        (end_ms - target_ms - 2.0).min(note_dur[$i] as f64).max(0.0)
+                    } else {
+                        note_dur[$i] as f64
+                    };
+                    if dur_eff <= 0.0 {
+                        if !loop_playback {
+                            done = true; // plus rien à jouer pour cette note
+                        } else {
+                            note_pass[$i] += 1; // note hors passe → suivante
+                        }
+                    } else {
+                        push_ev!(target_ms, Ev::NoteOn($i));
+                        done = true;
                     }
-                    {
-                        let mut c = h.lock().unwrap();
-                        // Master volume appliqué aux notes (comme le live
-                        // play_seq et les rendus WAV). Avant : dur à 127 → le
-                        // slider master n'avait aucun effet en lecture MIDI Navig.
-                        no_mv(&mut c, out_ch, n.pitch, n.velocity, master_vol);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(dur_ms));
-                    {
-                        let mut c = h.lock().unwrap();
-                        no_mv(&mut c, out_ch, n.pitch, 0, 127);
-                    }
-                    if !loop_playback {
-                        return;
-                    }
-                    pass += 1;
                 }
-            }));
+            }};
         }
-        for th in handles {
-            let _ = th.join();
+        // État du clic : beat courant, cycle (passe) courant, offset du cycle.
+        let mut b: u64 = start_at.ceil() as u64;
+        let mut cycle: u64 = 0;
+        let mut offset_ms = 0.0f64;
+        let mut last_click_pitch: u8 = pitch_norm;
+        let dur_click_ms = (0.15 * tempo_ms) as u64;
+        // Planifie le prochain clic (b déjà avancé par l'appelant si besoin).
+        // Le décalage est lu à la planification (comme l'ancien code).
+        macro_rules! plan_click {
+            () => {{
+                if !loop_playback && b > total_int {
+                    // fin de lecture : plus de clic
+                } else {
+                    // Wrap de fin de morceau (boucle) : retour au début. Le
+                    // beat "total_beats" n'est PAS joué (il coïnciderait
+                    // avec le beat 0 du cycle suivant → double clic).
+                    if loop_playback && b as f64 >= total_beats {
+                        b = 0;
+                        cycle += 1;
+                        offset_ms = pass0_len_ms + (cycle - 1) as f64 * total_ms;
+                    }
+                    let shift_ms = click.delay_ms.load(Ordering::Relaxed) as f64;
+                    let beat_in_cycle = if cycle == 0 { b as f64 - start_at } else { b as f64 };
+                    let target_ms = (offset_ms + beat_in_cycle * tempo_ms + shift_ms).max(0.0);
+                    push_ev!(target_ms, Ev::ClickOn);
+                }
+            }};
         }
-        println!("🎹 Lecture MIDI Navig terminée : {} notes", total);
+
+        let start = std::time::Instant::now();
+        let now_ms = || start.elapsed().as_secs_f64() * 1000.0;
+        // Initialisation : premiers note-on + premier clic.
+        for i in 0..sorted.len() {
+            plan_note!(i);
+        }
+        plan_click!();
+
+        // Boucle d'horloge : joue les événements dus, dort jusqu'au suivant.
+        loop {
+            if gen_ref.load(Ordering::Relaxed) != gen {
+                return; // lecture invalidée (stop/relance)
+            }
+            let now = now_ms();
+            // Joue tous les événements dont l'heure est arrivée (tolérance 0,5 ms).
+            while let Some((neg_t_us, _, kind)) = heap.peek().copied() {
+                let t_ms = (-neg_t_us) as f64 / 1000.0;
+                if t_ms > now + 0.5 {
+                    break;
+                }
+                heap.pop();
+                match kind {
+                    Ev::NoteOn(i) => {
+                        let n = &sorted[i];
+                        let (target_ms, end_ms) = note_loop_window(note_pass[i], n.start_time, start_at, tempo_ms, total_ms);
+                        let dur_eff = if loop_playback {
+                            (end_ms - target_ms - 2.0).min(note_dur[i] as f64).max(0.0)
+                        } else {
+                            note_dur[i] as f64
+                        };
+                        {
+                            let mut c = handle.lock().unwrap();
+                            no_mv(&mut c, note_out[i], n.pitch, n.velocity, master_vol);
+                        }
+                        push_ev!(t_ms + dur_eff, Ev::NoteOff(i));
+                    }
+                    Ev::NoteOff(i) => {
+                        let n = &sorted[i];
+                        {
+                            let mut c = handle.lock().unwrap();
+                            no_mv(&mut c, note_out[i], n.pitch, 0, 127);
+                        }
+                        if loop_playback {
+                            note_pass[i] += 1;
+                            plan_note!(i);
+                        }
+                    }
+                    Ev::ClickOn => {
+                        let vol = click.volume.load(Ordering::Relaxed);
+                        if vol == 0 {
+                            // Muté : pas de note-on ; le prochain clic suit
+                            // directement (pas de note-off orphelin).
+                            b += 1;
+                            plan_click!();
+                        } else {
+                            // Accent : beat LOCAL du cycle (0 = début du
+                            // morceau) — les accents restent sur les débuts
+                            // de mesure à CHAQUE cycle.
+                            let acc = click.accent.load(Ordering::Relaxed) && b % bars == 0;
+                            let vel = (vol as f32 / 100.0 * if acc { 127.0 } else { 120.0 }).round() as u8;
+                            let pitch = if acc { pitch_acc } else { pitch_norm };
+                            last_click_pitch = pitch;
+                            {
+                                let mut c = clk.lock().unwrap();
+                                no_mv(&mut c, cch, pitch, vel, 127);
+                            }
+                            push_ev!(t_ms + dur_click_ms as f64, Ev::ClickOff);
+                        }
+                    }
+                    Ev::ClickOff => {
+                        {
+                            let mut c = clk.lock().unwrap();
+                            no_mv(&mut c, cch, last_click_pitch, 0, 127);
+                        }
+                        b += 1;
+                        plan_click!();
+                    }
+                }
+            }
+            // Fin de lecture (non bouclée) : plus aucun événement → terminé.
+            if heap.is_empty() && !loop_playback {
+                break;
+            }
+            // Sommeil : jusqu'au prochain événement, plafonné à 5 ms
+            // (réactivité du stop/relance).
+            let next_t = heap.peek().map(|&(neg, _, _)| (-neg) as f64 / 1000.0).unwrap_or(now + 5.0);
+            let sleep_ms = ((next_t - now).clamp(0.0, 5.0)) as u64;
+            if sleep_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            }
+        }
+        println!("🎹 Lecture MIDI Navig terminée : {} notes", sorted.len());
     });
 }
 
@@ -1541,17 +1622,22 @@ fn start_sec_from_beats(start_at: Option<f64>, tempo: u32) -> f64 {
     }
 }
 
-/// Cible temporelle (ms depuis le start du thread) d'une note à la passe
-/// `pass` d'une lecture MIDI en BOUCLE : passe 0 = depuis start_at (notes
-/// avant start_at sautées), passes suivantes = depuis le début du morceau
-/// (un tour complet = total_ms). Sans boucle, seule la passe 0 est jouée.
-fn note_loop_target_ms(pass: u64, start_time: f64, start_at: f64, tempo_ms: f64, total_ms: f64) -> f64 {
+/// Fenêtre temporelle (ms) d'une note à la passe `pass` d'une lecture MIDI
+/// en BOUCLE : renvoie (cible du note-on, fin de passe pour le note-off).
+/// Passe 0 = depuis start_at (fin = pass0_len) ; passes ≥ 1 = morceau
+/// complet (chaque cycle dure total_ms, le 1er commence à la fin de la
+/// passe 0 — après un scrub, la boucle reboucle dès la fin du restant,
+/// comme la lecture WAV). Sans boucle, seule la passe 0 est jouée.
+fn note_loop_window(pass: u64, start_time: f64, start_at: f64, tempo_ms: f64, total_ms: f64) -> (f64, f64) {
+    let pass0_len = (total_ms - start_at * tempo_ms).max(0.0);
+    let offset = if pass == 0 { 0.0 } else { pass0_len + (pass - 1) as f64 * total_ms };
     let within = if pass == 0 {
         (start_time - start_at).max(0.0) * tempo_ms
     } else {
         start_time * tempo_ms
     };
-    pass as f64 * total_ms + within
+    let end = offset + if pass == 0 { pass0_len } else { total_ms };
+    (offset + within, end)
 }
 
 /// POST /navig-play — lecture SERVEUR du rendu en double canaux :
@@ -1966,22 +2052,53 @@ mod tests {
         assert!((start_sec_from_beats(Some(2.5), 123) - 1.219512195).abs() < 1e-6);
     }
 
-    /// Boucle MIDI : cible temporelle (ms depuis le start du thread) d'une
-    /// note à la passe `pass` — passe 0 = depuis start_at, passes suivantes
-    /// = depuis le début du morceau (total_ms par passe).
+    /// Boucle MIDI : fenêtre temporelle (cible du note-on, fin de passe pour
+    /// le note-off) d'une note à la passe `pass` — passe 0 = depuis start_at
+    /// (durée = pass0_len), passes suivantes = morceau complet (total_ms).
     #[test]
-    fn note_loop_target_ms_repetitions() {
+    fn note_loop_window_repetitions() {
         let tempo_ms = 500.0; // 120 BPM
         let total_ms = 8.0 * 500.0; // 8 temps
-        // Passe 0 avec start_at : décalage depuis start_at
-        assert!((note_loop_target_ms(0, 2.0, 1.0, tempo_ms, total_ms) - 500.0).abs() < 1e-9);
-        // Passe 0 sans start_at : la note à son temps
-        assert!((note_loop_target_ms(0, 2.0, 0.0, tempo_ms, total_ms) - 1000.0).abs() < 1e-9);
-        // Passe 1 : un tour complet + le temps de la note
-        assert!((note_loop_target_ms(1, 2.0, 0.0, tempo_ms, total_ms) - (4000.0 + 1000.0)).abs() < 1e-9);
+        // Passe 0 avec start_at : décalage depuis start_at, fin = pass0_len
+        let (t, e) = note_loop_window(0, 2.0, 1.0, tempo_ms, total_ms);
+        assert!((t - 500.0).abs() < 1e-9);
+        assert!((e - 3500.0).abs() < 1e-9); // 8 temps − 1 temps de start_at
+        // Passe 0 sans start_at : la note à son temps, fin = morceau complet
+        let (t, e) = note_loop_window(0, 2.0, 0.0, tempo_ms, total_ms);
+        assert!((t - 1000.0).abs() < 1e-9);
+        assert!((e - 4000.0).abs() < 1e-9);
+        // Passe 1 (sans start_at) : un tour complet + le temps de la note
+        let (t, e) = note_loop_window(1, 2.0, 0.0, tempo_ms, total_ms);
+        assert!((t - (4000.0 + 1000.0)).abs() < 1e-9);
+        assert!((e - 8000.0).abs() < 1e-9);
         // Passe 2 : deux tours + le temps de la note
-        assert!((note_loop_target_ms(2, 2.0, 0.0, tempo_ms, total_ms) - (8000.0 + 1000.0)).abs() < 1e-9);
-        // Note avant start_at → passe 0 sautée, première occurrence passe 1
-        assert!((note_loop_target_ms(1, 0.5, 2.0, tempo_ms, total_ms) - (4000.0 + 250.0)).abs() < 1e-9);
+        let (t, _) = note_loop_window(2, 2.0, 0.0, tempo_ms, total_ms);
+        assert!((t - (8000.0 + 1000.0)).abs() < 1e-9);
+        // Note avant start_at → passe 0 sautée ; la passe 1 commence à la
+        // FIN de la passe 0 (3000 ms), pas à un tour complet (ancien bug :
+        // 4250 → la boucle attendait la fin du morceau entier).
+        let (t, e) = note_loop_window(1, 0.5, 2.0, tempo_ms, total_ms);
+        assert!((t - (3000.0 + 250.0)).abs() < 1e-9);
+        assert!((e - 7000.0).abs() < 1e-9);
+    }
+
+    /// Scrub + boucle : après un déplacement de tête, la passe 0 est plus
+    /// courte que le morceau complet, les cycles suivants durent total_ms —
+    /// le clic et les notes partagent ce référentiel (synchro au repeat).
+    #[test]
+    fn note_loop_window_scrub_puis_boucle() {
+        let tempo_ms = 500.0;
+        let total_ms = 32.0 * tempo_ms; // 32 temps
+        // Passe 0 depuis le beat 24 : note à 24 → immédiate, fin de passe 4000
+        let (t, e) = note_loop_window(0, 24.0, 24.0, tempo_ms, total_ms);
+        assert!((t - 0.0).abs() < 1e-9);
+        assert!((e - 4000.0).abs() < 1e-9);
+        // Sa passe 1 : 4000 (fin de passe 0) + 24×500 = 16000, fin 20000
+        let (t, e) = note_loop_window(1, 24.0, 24.0, tempo_ms, total_ms);
+        assert!((t - 16000.0).abs() < 1e-9);
+        assert!((e - 20000.0).abs() < 1e-9);
+        // Note du début (2) : jamais en passe 0, passe 1 = 4000 + 1000
+        let (t, _) = note_loop_window(1, 2.0, 24.0, tempo_ms, total_ms);
+        assert!((t - 5000.0).abs() < 1e-9);
     }
 }
