@@ -202,6 +202,36 @@ fn read_wav_i16(path: &str) -> Result<(Vec<i16>, u16, u32), String> {
     Ok((samples, spec.channels, spec.sample_rate))
 }
 
+/// Resampling linéaire i16 (toutes fréquences) — utilisé par play_dual pour
+/// aligner les WAV (44,1 kHz) sur la fréquence du device (ex. 48 kHz) avant
+/// lecture : cpal ne convertit PAS, un 1:1 jouerait le contenu trop vite
+/// (tempo + pitch faussés de 48000/44100 ≈ 1,088×).
+fn resample_i16(samples: &[i16], channels: u16, in_rate: u32, out_rate: u32) -> Vec<i16> {
+    if in_rate == out_rate || samples.is_empty() {
+        return samples.to_vec();
+    }
+    let ch = channels.max(1) as usize;
+    let frames_in = samples.len() / ch;
+    if frames_in == 0 {
+        return samples.to_vec();
+    }
+    let frames_out = (frames_in as f64 * out_rate as f64 / in_rate as f64).round() as usize;
+    let mut out = Vec::with_capacity(frames_out * ch);
+    for f in 0..frames_out {
+        let pos = f as f64 * in_rate as f64 / out_rate as f64;
+        let i0 = pos.floor() as usize;
+        let frac = pos - i0 as f64;
+        let i1 = (i0 + 1).min(frames_in - 1);
+        for c in 0..ch {
+            let s0 = samples[i0 * ch + c] as f64;
+            let s1 = samples[i1 * ch + c] as f64;
+            let v = (s0 + (s1 - s0) * frac).round().clamp(-32768.0, 32767.0) as i16;
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Joue main (canaux 1-2) + clic (canaux 3-4) sur l'appareil `device_name`
 /// (doit avoir ≥ 4 canaux de sortie). Le clic est atténué par `click_gain`.
 pub fn play_dual(
@@ -226,11 +256,23 @@ pub fn play_dual(
         return Err(format!("Fréquences différentes : main {} Hz / clic {} Hz", main_sr, click_sr));
     }
     let sr = default_cfg.sample_rate().0;
-    if sr != main_sr {
-        // Le device a une fréquence différente : on joue quand même (cpal
-        // convertit) mais on prévient d'un léger changement de pitch possible.
-        eprintln!("   ⚠️ Clic : device {} Hz vs WAV {} Hz", sr, main_sr);
-    }
+    // ⚠️ RESAMPLING explicite vers la fréquence du device : cpal NE convertit
+    // PAS (le commentaire « cpal convertit » était faux) — sans ça, un WAV
+    // 44,1 kHz joué sur un device 48 kHz sort à 1,088× (tempo ET pitch
+    // faussés). Bug corrigé : les deux WAV sont alignés sur `sr` avant
+    // lecture, le délai/volume live restent calculés en frames device.
+    let main_s = if sr == main_sr {
+        main_s
+    } else {
+        eprintln!("   ℹ️ Clic : resampling main {} Hz → {} Hz (device)", main_sr, sr);
+        resample_i16(&main_s, main_ch, main_sr, sr)
+    };
+    let click_s = if sr == click_sr {
+        click_s
+    } else {
+        eprintln!("   ℹ️ Clic : resampling clic {} Hz → {} Hz (device)", click_sr, sr);
+        resample_i16(&click_s, click_ch, click_sr, sr)
+    };
 
     let stop = dual_stop_flag().clone();
     stop.store(false, Ordering::Relaxed);
@@ -387,5 +429,24 @@ pub fn load(state: &ClickState) -> ClickConfig {
         in_render: state.in_render.load(Ordering::Relaxed),
         out_device: state.out_device.lock().unwrap().clone(),
         delay_ms: state.delay_ms.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resample_conserve_longueur_et_valeurs() {
+        let src: Vec<i16> = (0..4410).map(|i| (i % 100) as i16).collect();
+        let up = resample_i16(&src, 1, 44100, 88200);
+        assert_eq!(up.len(), 8820, "upsampling 2× → 2× de frames");
+        let down = resample_i16(&src, 1, 44100, 22050);
+        assert_eq!(down.len(), 2205, "downsampling /2 → moitié de frames");
+        // Constante → constante (aucune distorsion)
+        let cst = vec![1234i16; 1000];
+        let cst_up = resample_i16(&cst, 1, 44100, 48000);
+        assert_eq!(cst_up.len(), 1088);
+        assert!(cst_up.iter().all(|&s| s == 1234));
     }
 }

@@ -519,17 +519,12 @@ pub fn generate_notes(
 
 // ─── Render WAV ──────────────────────────────────────────────────────
 
-/// Normalise un WAV au pic cible (-1 dBFS) puis applique le master volume.
+/// Normalise un WAV au pic cible (-6 dBFS) puis applique le master volume.
 ///
-/// Le rendu FluidSynth utilise les vélocités des pistes (souvent faibles,
-/// ex: lead 15/127) → le WAV brut sort très bas. Cette fonction amplifie
-/// le WAV pour que le pic atteigne ~0.89×32768 (-1 dB), puis scale par
-/// `master_vol/127`. La normalisation au pic garantit l'absence de
-/// clipping (le gain ne dépasse jamais le ratio pic-cible).
-/// Applique le volume master comme gain linéaire (pas de normalisation au pic).
-/// Le gain Fluidsynth -g 0.5 + les vélocités modérées donnent un mix brut
-/// doux (pic ~0.14) ; on compense par un gain fixe ×3 (niveau plein ~-4 dBFS
-/// sans écraser les différences de volume entre pistes ni les mutes).
+/// MÊME règle que `render_wav_mixed` et `render-tracks` (normalisation au
+/// pic 0,5 puis master/127) : le niveau d'un rendu ne dépend plus du chemin
+/// emprunté (FX on/off) ni du nombre de pistes. Avant : gain fixe ×3 — les
+/// rendus simple et par piste ne sonnaient pas au même niveau.
 fn apply_gain(wav: &[u8], master_vol: u8) -> Vec<u8> {
     use hound::WavReader;
     let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
@@ -539,13 +534,18 @@ fn apply_gain(wav: &[u8], master_vol: u8) -> Vec<u8> {
     let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
     if samples.is_empty() { return wav.to_vec(); }
 
-    let master = (master_vol as f64 / 127.0).clamp(0.0, 1.0);
-    let gain = master * 3.0;
+    // Pic du mix → normalisation à 0,5 (-6 dBFS), puis gain du master.
+    let mut pic = 0f32;
+    for &s in &samples {
+        pic = pic.max((s as f32).abs() / 32768.0);
+    }
+    let norm = if pic > 1e-6 { 0.5 / pic } else { 1.0 };
+    let gain = norm * (master_vol as f32 / 127.0);
 
     let mut out = Vec::new();
     if let Ok(mut w) = hound::WavWriter::new(std::io::Cursor::new(&mut out), spec) {
         for &s in &samples {
-            let v = (s as f64 * gain).round().clamp(-32768.0, 32767.0) as i16;
+            let v = (s as f32 * gain).round().clamp(-32768.0, 32767.0) as i16;
             let _ = w.write_sample(v);
         }
         let _ = w.finalize();
@@ -691,6 +691,23 @@ pub struct RenderedTrack {
     pub wav: Vec<u8>,
 }
 
+/// Construit la liste des pistes à rendre : pistes actives (non mutées) +
+/// piste drums par défaut si des notes canal 9 existent sans piste native
+/// (piste drums sur canal ≠ 9 supprimée → les notes redirigées vers le 9
+/// seraient perdues sinon, alors qu'elles jouent dans le rendu simple SMF
+/// et en MIDI).
+fn render_tracks_list(cfg: &RenderCfg, all_notes: &[CustomNote]) -> Vec<TrackCfg> {
+    let mut tracks: Vec<TrackCfg> = cfg.tracks.iter().filter(|t| !t.mute).cloned().collect();
+    let has_ch9 = tracks.iter().any(|t| t.channel == CH_DRUMS);
+    if !has_ch9 && all_notes.iter().any(|n| n.channel == CH_DRUMS) {
+        tracks.push(TrackCfg {
+            channel: CH_DRUMS, program: 1, volume: 127, mute: false,
+            drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default(),
+        });
+    }
+    tracks
+}
+
 /// Rendu « par piste » SANS mixage (bounce multitrack pour le mode PostProd).
 ///
 /// Chaque piste active est rendue séparément (SMF mono-piste → FluidSynth →
@@ -712,7 +729,8 @@ pub fn render_tracks_individual(
     let tempo = cfg.tempo.max(20) as u16;
 
     let mut out: Vec<RenderedTrack> = Vec::new();
-    for t in cfg.tracks.iter().filter(|t| !t.mute) {
+    let tracks = render_tracks_list(cfg, all_notes);
+    for t in &tracks {
         let notes: Vec<CustomNote> = all_notes
             .iter()
             .filter(|n| n.channel == t.channel)
@@ -989,4 +1007,74 @@ pub fn generate_smf_from_custom(
     buf.extend_from_slice(&track_data);
 
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// apply_gain normalise au pic ~0,5 (-6 dBFS) puis applique le master —
+    /// même règle que render_wav_mixed et render-tracks (niveaux unifiés).
+    #[test]
+    fn apply_gain_normalise_au_pic_puis_master() {
+        let spec = hound::WavSpec {
+            channels: 1, sample_rate: 44100, bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for i in 0..1000 {
+                let v = if i == 500 { (0.25 * 32767.0) as i16 } else { 100 };
+                w.write_sample(v).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let out = apply_gain(&buf, 127);
+        let mut r = hound::WavReader::new(std::io::Cursor::new(&out)).unwrap();
+        let s: Vec<i16> = r.samples::<i16>().filter_map(|x| x.ok()).collect();
+        let peak = s.iter().map(|&v| (v as f32).abs()).fold(0.0f32, f32::max);
+        // pic cible = 0.5 × 32767 ≈ 16383 (±1 arrondi)
+        assert!((peak - 16383.0).abs() <= 2.0, "peak {peak} != ~16383");
+    }
+
+    /// render_tracks_list ajoute une piste drums par défaut quand des notes
+    /// canal 9 existent sans piste native (sinon elles seraient perdues).
+    #[test]
+    fn render_tracks_synthetise_la_piste_drums_manquante() {
+        let cfg = RenderCfg {
+            tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
+            tracks: vec![TrackCfg {
+                channel: 5, program: 1, volume: 100, mute: false, drums: true,
+                bank_msb: 0, bank_lsb: 0, fx: Default::default(),
+            }],
+        };
+        let notes = vec![CustomNote {
+            channel: CH_DRUMS, start_time: 0.0, pitch: 36, duration: 0.25, velocity: 100,
+        }];
+        let list = render_tracks_list(&cfg, &notes);
+        assert!(list.iter().any(|t| t.channel == CH_DRUMS),
+            "une piste drums canal 9 doit être synthétisée");
+        // Sans notes canal 9 → pas de synthèse inutile
+        let empty: Vec<CustomNote> = vec![];
+        let list2 = render_tracks_list(&cfg, &empty);
+        assert!(!list2.iter().any(|t| t.channel == CH_DRUMS),
+            "pas de synthèse sans notes canal 9");
+        // Piste native canal 9 présente → rien d'ajouté
+        let cfg2 = RenderCfg {
+            tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
+            tracks: vec![
+                TrackCfg {
+                    channel: 5, program: 1, volume: 100, mute: false, drums: true,
+                    bank_msb: 0, bank_lsb: 0, fx: Default::default(),
+                },
+                TrackCfg {
+                    channel: 9, program: 1, volume: 100, mute: false, drums: false,
+                    bank_msb: 0, bank_lsb: 0, fx: Default::default(),
+                },
+            ],
+        };
+        let list3 = render_tracks_list(&cfg2, &notes);
+        assert_eq!(list3.iter().filter(|t| t.channel == CH_DRUMS).count(), 1);
+    }
 }

@@ -814,8 +814,24 @@ async fn render_wav(
             //    sortie choisie (POST /navig-click-start) pendant que le
             //    navigateur joue le main.
             let click_cfg = click::load(&s.click);
-            let mix_click = b.click_in_render || click_cfg.in_render;
-            let sep_click = b.click_separate || (click_cfg.out_device.is_some() && !click_cfg.in_render);
+            // Priorité aux flags EXPLICITES de la requête ; la config globale
+            // (ClickControl) ne sert que de défaut. Avant : OR → une requête
+            // click_in_render=true était ignorée si un out_device était posé
+            // (réponse « séparé » au lieu d'un WAV mixé).
+            let mix_click = if b.click_in_render {
+                true
+            } else if b.click_separate {
+                false
+            } else {
+                click_cfg.in_render
+            };
+            let sep_click = if b.click_separate {
+                true
+            } else if b.click_in_render {
+                false
+            } else {
+                click_cfg.out_device.is_some() && !click_cfg.in_render
+            };
             if mix_click || sep_click {
                 let bars = (sig_code(&b.sig) / 10).max(1) as u64;
                 let click_smf = render::generate_click_smf(
@@ -1257,6 +1273,7 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
                 s.click.clone(),
                 sig_code(&b.sig),
                 total_beats,
+                b.master_vol,
             );
             drop(guard);
             let dur = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max)
@@ -1300,6 +1317,7 @@ fn midi_play_custom(
     click: Arc<click::ClickState>,
     sig_code_v: u16,
     total_beats: f64,
+    master_vol: u8,
 ) {
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
@@ -1312,7 +1330,20 @@ fn midi_play_custom(
         let fluid = midi::open_by_name("fluid");
         let used: std::collections::HashSet<u8> = tracks.iter().map(|t| t.channel).collect();
         let click_chan = (0u8..16).find(|c| *c != 9 && !used.contains(c)).unwrap_or(9);
-        let click_pitch = if click_chan == 9 { 77u8 } else { 60u8 };
+        // Repli sans FluidSynth : mêmes hauteurs que le rendu WAV (72/74/55).
+        // Le métronome GM (33/34) n'existe que sur le canal drums : si un
+        // canal drums est libre → GM natif, sinon repli woodblock (le plus
+        // proche). Programme appliqué au setup ci-dessous.
+        let (click_pitch, click_prog) = if click_chan == 9 {
+            (34u8, 0u16) // canal drums libre → métronome GM
+        } else {
+            match click.sound.load(Ordering::Relaxed) {
+                click::SOUND_WOODBLOCK => (72u8, 115u16),
+                click::SOUND_AGOGO => (74u8, 114u16),
+                click::SOUND_TAIKO => (55u8, 116u16),
+                _ => (72u8, 115u16), // métronome GM → woodblock en repli
+            }
+        };
         // 1. Setup : reset + program changes + sends d'effets
         {
             let mut c = handle.lock().unwrap();
@@ -1342,12 +1373,7 @@ fn midi_play_custom(
             // uniquement en REPLI (port principal) : FluidSynth utilise
             // le canal 9 drums GM natif, aucun réglage nécessaire.
             if fluid.is_none() && click_chan != 9 {
-                match click.sound.load(Ordering::Relaxed) {
-                    click::SOUND_WOODBLOCK => pc(&mut c, click_chan, 115),
-                    click::SOUND_AGOGO => pc(&mut c, click_chan, 114),
-                    click::SOUND_TAIKO => pc(&mut c, click_chan, 116),
-                    _ => pc(&mut c, click_chan, 115), // métronome → woodblock
-                }
+                pc(&mut c, click_chan, click_prog as u8);
             }
         }
         // Clic sur FluidSynth : sons mélodiques → program change canal 15
@@ -1388,33 +1414,42 @@ fn midi_play_custom(
                     click::SOUND_TAIKO => (f.clone(), 15u8, 55u8, 55u8),
                     _ => (f.clone(), 9u8, 34u8, 33u8), // métronome GM
                 },
-                None => (handle.clone(), click_chan, click_pitch, click_pitch), // repli
+                None => {
+                    if click_chan == 9 {
+                        (handle.clone(), 9u8, 34u8, 33u8) // métronome GM natif
+                    } else {
+                        (handle.clone(), click_chan, click_pitch, click_pitch) // repli
+                    }
+                }
             };
             handles.push(std::thread::spawn(move || {
+                let start = std::time::Instant::now();
                 let mut b = start_at.ceil() as u64;
-                let dur_ms = 150u64;
-                let mut note_active = false;
+                // Durée du clic en BEATS (0,15 — comme le rendu WAV) :
+                // cohérente quel que soit le tempo (75 ms à 120 BPM,
+                // 150 ms à 60 BPM). Avant : 150 ms fixes.
+                let dur_ms = (0.15 * tempo_ms) as u64;
+                // ⚠️ HORLOGE ABSOLUE (bug corrigé) : la cible du prochain
+                // clic avance d'UN tempo à chaque beat, le sleep est le RESTE
+                // à dormir. L'ancien code dormait un délai absolu APRÈS la
+                // durée de note → l'intervalle entre clics augmentait à
+                // chaque beat (métronome qui ralentit et dérive).
+                let mut next_click_ms = ((b as f64 - start_at) * tempo_ms).max(0.0);
                 loop {
                     if b > total {
-                        if note_active {
-                            let mut c = clk.lock().unwrap();
-                            no_mv(&mut c, cch, pitch_acc, 0, 127);
-                        }
                         return;
                     }
-                    let delay_ms = (((b as f64 - start_at) * tempo_ms).max(0.0)) as u64;
+                    let now_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let delay_ms = (next_click_ms - now_ms).max(0.0) as u64;
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     if g2.load(Ordering::Relaxed) != gen {
-                        if note_active {
-                            let mut c = clk.lock().unwrap();
-                            no_mv(&mut c, cch, pitch_acc, 0, 127);
-                        }
                         return; // lecture invalidée (stop/relance)
                     }
                     // Volume lu EN DIRECT → mute/volume instantanés
                     let vol = ck.volume.load(Ordering::Relaxed);
                     if vol == 0 {
                         b += 1;
+                        next_click_ms += tempo_ms;
                         continue;
                     }
                     let acc = ck.accent.load(Ordering::Relaxed) && b % bars == 0;
@@ -1424,14 +1459,13 @@ fn midi_play_custom(
                         let mut c = clk.lock().unwrap();
                         no_mv(&mut c, cch, pitch, vel, 127);
                     }
-                    note_active = true;
                     std::thread::sleep(std::time::Duration::from_millis(dur_ms));
                     {
                         let mut c = clk.lock().unwrap();
                         no_mv(&mut c, cch, pitch, 0, 127);
                     }
-                    note_active = false;
                     b += 1;
+                    next_click_ms += tempo_ms;
                 }
             }));
         }
@@ -1449,7 +1483,10 @@ fn midi_play_custom(
                 }
                 {
                     let mut c = h.lock().unwrap();
-                    no_mv(&mut c, out_ch, n.pitch, n.velocity, 127);
+                    // Master volume appliqué aux notes (comme le live play_seq
+                    // et les rendus WAV). Avant : dur à 127 → le slider master
+                    // n'avait aucun effet en lecture MIDI Navig.
+                    no_mv(&mut c, out_ch, n.pitch, n.velocity, master_vol);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(dur_ms));
                 {
@@ -1779,4 +1816,32 @@ async fn main() {
         .await
         .unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    /// Simule l'horloge du clic métronome MIDI (nouvelle version) : la cible
+    /// du prochain clic avance d'UN tempo à chaque beat → intervalles stables,
+    /// quelle que soit la durée de note inline (l'ancien code dérivait).
+    #[test]
+    fn clic_metronome_intervalles_stables() {
+        let tempo_ms = 500.0; // 120 BPM
+        let note_dur = 150.0; // durée de note inline (ms)
+        let start_at = 0.0f64;
+        let mut b = start_at.ceil() as u64;
+        let mut next = ((b as f64 - start_at) * tempo_ms).max(0.0);
+        let mut elapsed = 0.0f64;
+        let mut onsets = Vec::new();
+        for _ in 0..10 {
+            let delay = (next - elapsed).max(0.0);
+            elapsed += delay;
+            onsets.push(elapsed); // note ON
+            elapsed += note_dur; // note OFF + overhead
+            next += tempo_ms;
+        }
+        for w in onsets.windows(2) {
+            let iv = w[1] - w[0];
+            assert!((iv - tempo_ms).abs() < 1e-9, "intervalle {iv} != {tempo_ms}");
+        }
+    }
 }

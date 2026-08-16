@@ -889,6 +889,7 @@ mod tests {
         apply_tracks(&lc, &[TrackCfg {
             channel: 5, program: Some(80), volume: Some(90), mute: Some(false),
             drums: None,
+            bank_msb: None, bank_lsb: None,
             effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
@@ -908,6 +909,7 @@ mod tests {
         apply_tracks(&lc, &[TrackCfg {
             channel: 2, program: Some(40), volume: Some(55), mute: Some(false),
             drums: None,
+            bank_msb: None, bank_lsb: None,
             effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
@@ -925,6 +927,7 @@ mod tests {
         apply_tracks(&lc, &[TrackCfg {
             channel: 0, program: Some(10), volume: None, mute: None,
             drums: None,
+            bank_msb: None, bank_lsb: None,
             effects: None,
         }]);
         let tracks = lc.tracks.lock().unwrap();
