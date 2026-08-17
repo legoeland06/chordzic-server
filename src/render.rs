@@ -1169,4 +1169,166 @@ mod tests {
         // offset au-delà de la durée → inchangé (garde-fou)
         assert_eq!(slice_wav_from(&buf, 99.0).len(), buf.len());
     }
+
+    // ── SMF du clic métronome (feature récente : clic temps réel / rendu) ──
+
+    /// Parse un SMF et renvoie les note-on : (canal, pitch, vélocité).
+    /// Mini-parseur suffisant pour les fichiers générés par le serveur
+    /// (gère delta-time VLQ, running status, meta events).
+    fn parse_smf_notes(smf: &[u8]) -> Vec<(u8, u8, u8)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        assert_eq!(&smf[i..i + 4], b"MThd", "header SMF attendu");
+        i += 4;
+        let hlen = u32::from_be_bytes(smf[i..i + 4].try_into().unwrap()) as usize;
+        i += 4 + hlen;
+        while i + 4 <= smf.len() {
+            assert_eq!(&smf[i..i + 4], b"MTrk", "piste SMF attendue");
+            i += 4;
+            let tlen = u32::from_be_bytes(smf[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            let end = i + tlen;
+            let mut running: Option<u8> = None;
+            while i < end {
+                // delta-time (VLQ)
+                loop {
+                    let b = smf[i];
+                    i += 1;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                }
+                let mut status = smf[i];
+                if status & 0x80 == 0 {
+                    status = running.expect("running status sans statut initial");
+                } else {
+                    i += 1;
+                }
+                match status {
+                    0x90..=0x9f | 0x80..=0x8f => {
+                        let d1 = smf[i];
+                        let d2 = smf[i + 1];
+                        i += 2;
+                        running = Some(status);
+                        if status & 0xf0 == 0x90 && d2 > 0 {
+                            out.push((status & 0x0f, d1, d2));
+                        }
+                    }
+                    0xc0..=0xcf | 0xd0..=0xdf => {
+                        i += 1;
+                        running = Some(status);
+                    }
+                    0xb0..=0xbf | 0xe0..=0xef => {
+                        i += 2;
+                        running = Some(status);
+                    }
+                    0xff => {
+                        i += 1; // type de meta event
+                        let mut mlen = 0u32;
+                        loop {
+                            let b = smf[i];
+                            i += 1;
+                            mlen = (mlen << 7) | (b & 0x7f) as u32;
+                            if b & 0x80 == 0 {
+                                break;
+                            }
+                        }
+                        i += mlen as usize; // données du meta event
+                        running = None;
+                    }
+                    _ => {
+                        running = Some(status);
+                    }
+                }
+            }
+            i = end;
+        }
+        out
+    }
+
+    /// generate_click_smf : une note par battement, accent (vel 127) sur
+    /// chaque début de mesure — exactement le comportement du métronome
+    /// rendu dans le WAV.
+    #[test]
+    fn generate_click_smf_notes_et_accents() {
+        // 4/4, 8 battements → 8 notes, accents aux beats 0 et 4
+        let smf = generate_click_smf(120, 4, 8.0, true, 0);
+        assert!(smf.starts_with(b"MThd"));
+        let evs = parse_smf_notes(&smf);
+        assert_eq!(evs.len(), 8);
+        let accented = evs.iter().filter(|(_, _, v)| *v == 127).count();
+        assert_eq!(accented, 2, "2 débuts de mesure sur 8 battements en 4/4");
+        // Sans accent : aucune vélocité 127
+        let smf = generate_click_smf(120, 4, 8.0, false, 0);
+        let evs = parse_smf_notes(&smf);
+        assert_eq!(evs.len(), 8);
+        assert!(evs.iter().all(|(_, _, v)| *v == 120));
+        // 7/8 : accent au beat 0 seulement (mesures de 7 battements)
+        let smf = generate_click_smf(120, 7, 14.0, true, 0);
+        let evs = parse_smf_notes(&smf);
+        assert_eq!(evs.len(), 14);
+        let accented = evs.iter().filter(|(_, _, v)| *v == 127).count();
+        assert_eq!(accented, 2);
+    }
+
+    /// generate_click_smf : canal/pitch selon le son choisi (métronome GM
+    /// sur le canal drums, woodblock/agogo/taiko mélodiques sur le 15).
+    #[test]
+    fn generate_click_smf_sons_et_pitches() {
+        // Métronome GM : canal 9, cloche 34 (accent) / clic 33 (normal)
+        let smf = generate_click_smf(120, 4, 4.0, true, 0);
+        let evs = parse_smf_notes(&smf);
+        assert_eq!(evs.len(), 4);
+        assert_eq!(evs[0], (9, 34, 127));
+        assert_eq!(evs[1], (9, 33, 120));
+        // Woodblock : canal 15, pitch 72
+        let smf = generate_click_smf(120, 4, 1.0, true, 1);
+        let evs = parse_smf_notes(&smf);
+        assert_eq!(evs[0], (15, 72, 127));
+        // Taiko : canal 15, pitch 55
+        let smf = generate_click_smf(120, 4, 1.0, true, 3);
+        let evs = parse_smf_notes(&smf);
+        assert_eq!(evs[0], (15, 55, 127));
+    }
+
+    // ── Mix main + clic (mode « clic dans le rendu ») ──
+
+    /// mix_wavs : somme main + clic×gain, clamp 16-bit, troncature à la
+    /// plus courte des deux.
+    #[test]
+    fn mix_wavs_melange_et_clamp() {
+        let spec = hound::WavSpec {
+            channels: 1, sample_rate: 44100, bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut main: Vec<u8> = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut main), spec).unwrap();
+            for v in [100i16, 32000, -32000, 0] {
+                w.write_sample(v).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let mut click: Vec<u8> = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut click), spec).unwrap();
+            for v in [100i16, 32000, -32000, 0] {
+                w.write_sample(v).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let out = mix_wavs(&main, &click, 0.5).unwrap();
+        let mut r = hound::WavReader::new(std::io::Cursor::new(&out)).unwrap();
+        let s: Vec<i16> = r.samples::<i16>().filter_map(|x| x.ok()).collect();
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0], 150); // 100 + 100×0,5
+        assert_eq!(s[1], 32767); // clamp haut (32000 + 16000)
+        assert_eq!(s[2], -32768); // clamp bas (−32000 − 16000)
+        assert_eq!(s[3], 0);
+        // Gain 0 → identique au main
+        let out = mix_wavs(&main, &click, 0.0).unwrap();
+        let mut r = hound::WavReader::new(std::io::Cursor::new(&out)).unwrap();
+        let s: Vec<i16> = r.samples::<i16>().filter_map(|x| x.ok()).collect();
+        assert_eq!(s[0], 100);
+    }
 }

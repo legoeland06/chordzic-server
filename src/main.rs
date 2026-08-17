@@ -1430,11 +1430,7 @@ fn midi_play_custom(
         // passes suivantes repartent de L) ; sans boucle, on ignore celles
         // avant start_at. Les notes après le locator droit ne sont jamais
         // jouées.
-        let mut sorted: Vec<_> = notes.into_iter()
-            .filter(|n| n.start_time < loop_end)
-            .filter(|n| loop_playback || n.start_time + n.duration > start_at)
-            .collect();
-        sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = select_notes(notes, loop_playback, start_at, loop_start, loop_end);
         // Clic : sortie et hauteurs (FluidSynth si dispo, sinon repli).
         let bars = (sig_code_v / 10).max(1) as u64;
         let total_int = total_beats.ceil() as u64;
@@ -1491,11 +1487,7 @@ fn midi_play_custom(
                         done = true; // hors intervalle : plus rien à jouer
                     } else {
                         let (target_ms, end_ms) = note_loop_window(pass, n.start_time, start_at, loop_start, loop_end, tempo_ms);
-                        let dur_eff = if loop_playback {
-                            (end_ms - target_ms - 2.0).min(note_dur[$i] as f64).max(0.0)
-                        } else {
-                            note_dur[$i] as f64
-                        };
+                        let dur_eff = note_off_clamped(target_ms, end_ms, note_dur[$i] as f64, loop_playback);
                         if dur_eff <= 0.0 {
                             if !loop_playback {
                                 done = true; // plus rien à jouer pour cette note
@@ -1520,18 +1512,15 @@ fn midi_play_custom(
         // Le décalage est lu à la planification (comme l'ancien code).
         macro_rules! plan_click {
             () => {{
-                if !loop_playback && b > total_int {
-                    // fin de lecture : plus de clic
-                } else {
-                    // Wrap de fin d'intervalle (boucle) : retour au locator
-                    // gauche. Le beat "loop_end" n'est PAS joué (il
-                    // coïnciderait avec le beat L du cycle suivant → double
-                    // clic).
-                    if loop_playback && b as f64 >= loop_end {
-                        b = loop_start.floor() as u64;
-                        cycle += 1;
-                        offset_ms = pass0_len_ms + (cycle - 1) as f64 * loop_len_ms;
-                    }
+                let (nb, nc, no) = next_click_state(
+                    b, cycle, offset_ms, loop_playback, loop_start, loop_end,
+                    pass0_len_ms, loop_len_ms, total_int,
+                );
+                // Fin de lecture (non bouclée) : plus de clic à planifier.
+                if loop_playback || nb <= total_int {
+                    b = nb;
+                    cycle = nc;
+                    offset_ms = no;
                     let shift_ms = click.delay_ms.load(Ordering::Relaxed) as f64;
                     let beat_in_cycle = if cycle == 0 { b as f64 - start_at } else { b as f64 - loop_start };
                     let target_ms = (offset_ms + beat_in_cycle * tempo_ms + shift_ms).max(0.0);
@@ -1565,11 +1554,7 @@ fn midi_play_custom(
                     Ev::NoteOn(i) => {
                         let n = &sorted[i];
                         let (target_ms, end_ms) = note_loop_window(note_pass[i], n.start_time, start_at, loop_start, loop_end, tempo_ms);
-                        let dur_eff = if loop_playback {
-                            (end_ms - target_ms - 2.0).min(note_dur[i] as f64).max(0.0)
-                        } else {
-                            note_dur[i] as f64
-                        };
+                        let dur_eff = note_off_clamped(target_ms, end_ms, note_dur[i] as f64, loop_playback);
                         {
                             let mut c = handle.lock().unwrap();
                             no_mv(&mut c, note_out[i], n.pitch, n.velocity, master_vol);
@@ -1642,6 +1627,71 @@ fn start_sec_from_beats(start_at: Option<f64>, tempo: u32) -> f64 {
         Some(ba) if ba > 0.0 => (ba * 60.0) / tempo.max(1) as f64,
         _ => 0.0,
     }
+}
+
+/// Sélection + tri des notes pour une lecture MIDI (boucle [L, R[).
+/// - Les notes dont le début est ≥ `loop_end` ne sont JAMAIS jouées.
+/// - Sans boucle : ignore les notes finissant avant `start_at` (scrub).
+/// - Avec boucle : toutes les notes < `loop_end` sont gardées (les passes
+///   suivantes repartent de L). Tri par start_time pour le scheduler.
+fn select_notes(
+    notes: Vec<render::CustomNote>,
+    loop_playback: bool,
+    start_at: f64,
+    _loop_start: f64,
+    loop_end: f64,
+) -> Vec<render::CustomNote> {
+    let mut sorted: Vec<_> = notes
+        .into_iter()
+        .filter(|n| n.start_time < loop_end)
+        .filter(|n| loop_playback || n.start_time + n.duration > start_at)
+        .collect();
+    sorted.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
+    sorted
+}
+
+/// Durée effective (ms) d'une note à la passe `pass` — clamp du note-off.
+/// En boucle, le note-off est clampé à la fin de la passe (−2 ms) pour que
+/// l'off passe TOUJOURS avant le note-on du cycle suivant : sinon le vieux
+/// off coupe la même note rejouée au début du passage suivant (bug historique
+/// « le son coupe au 2e passage », en MIDI le off tue la note de même
+/// canal/pitch). Sans boucle : durée brute inchangée.
+fn note_off_clamped(target_ms: f64, end_ms: f64, note_dur_ms: f64, loop_playback: bool) -> f64 {
+    if loop_playback {
+        (end_ms - target_ms - 2.0).min(note_dur_ms).max(0.0)
+    } else {
+        note_dur_ms
+    }
+}
+
+/// État suivant du clic métronome — wrap sur l'intervalle [L, R[.
+/// Quand le beat courant atteint `loop_end`, on revient à `loop_start`
+/// (le beat `loop_end` n'est PAS joué : il coïnciderait avec le beat L du
+/// cycle suivant → double clic) et le cycle avance (offset = fin de la
+/// passe 0 + (cycle−1) × durée d'un cycle). Sans boucle, une fois le
+/// morceau dépassé (`b > total_int`) plus aucun clic n'est planifié
+/// (état renvoyé inchangé).
+fn next_click_state(
+    b: u64,
+    cycle: u64,
+    offset_ms: f64,
+    loop_playback: bool,
+    loop_start: f64,
+    loop_end: f64,
+    pass0_len_ms: f64,
+    loop_len_ms: f64,
+    total_int: u64,
+) -> (u64, u64, f64) {
+    if !loop_playback && b > total_int {
+        return (b, cycle, offset_ms); // fin de lecture : plus de clic
+    }
+    if loop_playback && b as f64 >= loop_end {
+        let b = loop_start.floor() as u64;
+        let cycle = cycle + 1;
+        let offset_ms = pass0_len_ms + (cycle - 1) as f64 * loop_len_ms;
+        return (b, cycle, offset_ms);
+    }
+    (b, cycle, offset_ms)
 }
 
 /// Fenêtre temporelle (ms) d'une note à la passe `pass` d'une lecture MIDI
@@ -1896,6 +1946,83 @@ async fn navig_play(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl I
 
 // ─── Main ───────────────────────────────────────────────────────────────
 
+/// Liste des samples disponibles (boucle sample du mode Navig).
+async fn samples_list() -> impl IntoResponse {
+    let data = samples::get_available();
+    (StatusCode::OK, axum::Json(data))
+}
+
+/// Sert un fichier sample (~/samples/drums/<name>) au navigateur — utilisé
+/// par la boucle sample du mode Navig (lecture Web Audio côté client).
+async fn sample_file(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
+    // Sécurité : nom de fichier simple uniquement (pas de chemin)
+    if name.contains('/') || name.contains("\\") || name.contains("..") {
+        return (StatusCode::BAD_REQUEST, "nom de fichier invalide").into_response();
+    }
+    let dir = samples::drum_dir();
+    match std::fs::read(std::path::Path::new(&dir).join(&name)) {
+        Ok(data) => {
+            let typ = if name.to_ascii_lowercase().ends_with(".wav") {
+                "audio/wav"
+            } else {
+                "application/octet-stream"
+            };
+            (StatusCode::OK, [(header::CONTENT_TYPE, typ)], data).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "sample introuvable").into_response(),
+    }
+}
+
+/// Construit le routeur Axum complet (routes API + fallback frontend).
+/// Séparé de `main` pour être testable : les tests d'intégration HTTP
+/// montent l'app en mémoire (tower::ServiceExt::oneshot) sans socket.
+///
+/// En mode standalone, les routes du frontend sont servies par
+/// `frontend_embed::serve`. En mode dev, la route GET / sert l'index.html
+/// statique (le frontend est servi par Vite sur :5176).
+fn build_app(state: AppState) -> Router {
+    let mut app = Router::new()
+        .route("/play", post(play))
+        .route("/config", post(conf))
+        .route("/stop", post(stop))
+        .route("/render-wav", post(render_wav))
+        .route("/render-tracks", post(render_tracks))
+        .route("/render-notes", post(render_notes))
+        .route("/note", post(note))
+        .route("/samples-list", get(samples_list))
+        .route("/sample-file/:name", get(sample_file))
+        .route("/rendered/:file", get(serve_rendered))
+        .route("/audio-devices", get(audio_devices))
+        .route("/audio-device", post(audio_device))
+        .route("/midi-ports", get(midi_ports))
+        .route("/midi-port", post(midi_port))
+        .route("/click", get(get_click).post(post_click))
+        .route("/navig-click-start", post(navig_click_start))
+        .route("/navig-click-stop", post(navig_click_stop))
+        .route("/navig-play", post(navig_play))
+        .route("/navig-play-midi", post(navig_play_midi))
+        .route("/navig-stop-midi", post(navig_stop_midi))
+        .route("/save", post(grilles::save_grille))
+        .route("/grilles", get(grilles::list_grilles))
+        .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))
+        .layer(CorsLayer::permissive())
+        .with_state(state);
+
+    #[cfg(feature = "standalone")]
+    {
+        // Mode standalone : le frontend embarqué gère toutes les routes
+        // non-API (SPA routing + fichiers statiques)
+        app = app.fallback(frontend_embed::serve);
+    }
+
+    #[cfg(not(feature = "standalone"))]
+    {
+        // Mode dev : servir l'ancien index.html statique sur /
+        app = app.route("/", get(idx));
+    }
+    app
+}
+
 #[tokio::main]
 async fn main() {
     println!("🚀 chordZIC backend — serveur de séquencement MIDI");
@@ -1954,78 +2081,10 @@ async fn main() {
         rendered_dual: Arc::new(Mutex::new(None)),
     };
 
-    async fn samples_list() -> impl IntoResponse {
-        let data = samples::get_available();
-        (StatusCode::OK, axum::Json(data))
-    }
-
-    /// Sert un fichier sample (~/samples/drums/<name>) au navigateur — utilisé
-    /// par la boucle sample du mode Navig (lecture Web Audio côté client).
-    async fn sample_file(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
-        // Sécurité : nom de fichier simple uniquement (pas de chemin)
-        if name.contains('/') || name.contains("\\") || name.contains("..") {
-            return (StatusCode::BAD_REQUEST, "nom de fichier invalide").into_response();
-        }
-        let dir = samples::drum_dir();
-        match std::fs::read(std::path::Path::new(&dir).join(&name)) {
-            Ok(data) => {
-                let typ = if name.to_ascii_lowercase().ends_with(".wav") {
-                    "audio/wav"
-                } else {
-                    "application/octet-stream"
-                };
-                (StatusCode::OK, [(header::CONTENT_TYPE, typ)], data).into_response()
-            }
-            Err(_) => (StatusCode::NOT_FOUND, "sample introuvable").into_response(),
-        }
-    }
-
     let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
 
-    // ── Construction du routeur ───────────────────────────────────
-    // En mode standalone, les routes du frontend sont servies par
-    // `frontend_embed::serve`.  En mode dev, la route GET / sert
-    // l'index.html statique (le frontend est servi par Vite sur :5176).
-    let mut app = Router::new()
-        .route("/play", post(play))
-        .route("/config", post(conf))
-        .route("/stop", post(stop))
-        .route("/render-wav", post(render_wav))
-        .route("/render-tracks", post(render_tracks))
-        .route("/render-notes", post(render_notes))
-        .route("/note", post(note))
-        .route("/samples-list", get(samples_list))
-        .route("/sample-file/:name", get(sample_file))
-        .route("/rendered/:file", get(serve_rendered))
-        .route("/audio-devices", get(audio_devices))
-        .route("/audio-device", post(audio_device))
-        .route("/midi-ports", get(midi_ports))
-        .route("/midi-port", post(midi_port))
-        .route("/click", get(get_click).post(post_click))
-        .route("/navig-click-start", post(navig_click_start))
-        .route("/navig-click-stop", post(navig_click_stop))
-        .route("/navig-play", post(navig_play))
-        .route("/navig-play-midi", post(navig_play_midi))
-        .route("/navig-stop-midi", post(navig_stop_midi))
-        .route("/save", post(grilles::save_grille))
-        .route("/grilles", get(grilles::list_grilles))
-        .route("/grilles/:name", axum::routing::delete(grilles::delete_grille))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = build_app(state);
 
-    #[cfg(feature = "standalone")]
-    {
-        // Mode standalone : le frontend embarqué gère toutes les routes
-        // non-API (SPA routing + fichiers statiques)
-        app = app.fallback(frontend_embed::serve);
-        println!("\n   🎯 Mode standalone — frontend embarqué dans le binaire");
-    }
-
-    #[cfg(not(feature = "standalone"))]
-    {
-        // Mode dev : servir l'ancien index.html statique sur /
-        app = app.route("/", get(idx));
-    }
 
     println!(
         "\n📡 Serveur prêt sur http://0.0.0.0:{}",
@@ -2169,5 +2228,251 @@ mod tests {
         // start_at 12), passe 1 = 2000 + (9−8)×500 = 2500
         let (t, _) = note_loop_window(1, 9.0, 12.0, 8.0, 16.0, tempo_ms);
         assert!((t - 2500.0).abs() < 1e-9);
+    }
+
+    // ── Scheduler mono-thread : sélection des notes (features locators) ──
+
+    fn note(start_time: f64, duration: f64) -> render::CustomNote {
+        render::CustomNote {
+            channel: 0, start_time, pitch: 60, duration, velocity: 100,
+        }
+    }
+
+    /// select_notes : les notes ≥ locator droit ne sont JAMAIS jouées,
+    /// le tout est trié par start_time.
+    #[test]
+    fn select_notes_exclut_les_notes_apres_le_locator_droit() {
+        let notes = vec![note(4.0, 1.0), note(20.0, 1.0), note(15.0, 1.0), note(3.0, 1.0)];
+        let sel = select_notes(notes, true, 0.0, 0.0, 16.0);
+        let starts: Vec<f64> = sel.iter().map(|n| n.start_time).collect();
+        assert_eq!(starts, vec![3.0, 4.0, 15.0]); // 20 ≥ 16 → exclue, tri ✓
+    }
+
+    /// select_notes sans boucle : les notes finissant avant start_at (scrub)
+    /// sont ignorées ; en boucle, TOUT l'intervalle est gardé (les passes
+    /// suivantes repartent de L).
+    #[test]
+    fn select_notes_scrub_et_boucle() {
+        // Sans boucle : note finissant à 10, scrub à 12 → ignorée
+        let notes = vec![note(8.0, 2.0), note(12.0, 1.0)];
+        let sel = select_notes(notes.clone(), false, 12.0, 0.0, 32.0);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].start_time, 12.0);
+        // Avec boucle : même note gardée (elle rejouera aux cycles suivants)
+        let sel = select_notes(notes, true, 12.0, 0.0, 32.0);
+        assert_eq!(sel.len(), 2);
+    }
+
+    /// select_notes : une note avant le locator gauche reste dans la liste
+    /// (elle est jouée une seule fois en passe 0 si elle déborde sur L).
+    #[test]
+    fn select_notes_garde_les_notes_avant_le_locator_gauche() {
+        let notes = vec![note(6.0, 3.0)]; // déborde jusqu'à 9 (L = 8)
+        let sel = select_notes(notes, true, 0.0, 8.0, 16.0);
+        assert_eq!(sel.len(), 1, "note avant L jouée une fois en passe 0");
+    }
+
+    // ── Scheduler mono-thread : clamp du note-off ──
+
+    /// note_off_clamped : en boucle, le note-off est clampé à la fin de passe
+    /// (−2 ms) pour qu'il passe AVANT le note-on du cycle suivant ; sans
+    /// boucle, la durée brute est conservée.
+    #[test]
+    fn note_off_clamped_boucle_et_sans_boucle() {
+        // Boucle : note finissant après la fin de passe → coupée à fin − 2 ms
+        let d = note_off_clamped(1000.0, 2000.0, 2000.0, true);
+        assert!((d - 998.0).abs() < 1e-9);
+        // Note courte dans la passe → durée brute conservée
+        let d = note_off_clamped(1000.0, 2000.0, 500.0, true);
+        assert!((d - 500.0).abs() < 1e-9);
+        // Jamais négatif (note qui commencerait après la fin de passe)
+        let d = note_off_clamped(1999.0, 2000.0, 500.0, true);
+        assert_eq!(d, 0.0);
+        // Sans boucle : durée brute, même si elle dépasse la passe
+        let d = note_off_clamped(1000.0, 2000.0, 2000.0, false);
+        assert!((d - 2000.0).abs() < 1e-9);
+    }
+
+    // ── Scheduler mono-thread : wrap du clic sur [L, R[ ──
+
+    /// next_click_state : le clic reboucle à L quand il atteint R, l'offset
+    /// avance d'un cycle (fin de passe 0 + (cycle−1) × durée de cycle).
+    #[test]
+    fn next_click_state_wrap_locators() {
+        // Locators [8, 16[, scrub à 12 : passe 0 = 2000 ms, cycles = 4000 ms
+        let (b, c, o) = next_click_state(15, 0, 0.0, true, 8.0, 16.0, 2000.0, 4000.0, 32);
+        assert_eq!((b, c), (15, 0)); // 15 < 16 : pas de wrap
+        assert_eq!(o, 0.0);
+        let (b, c, o) = next_click_state(16, 0, 0.0, true, 8.0, 16.0, 2000.0, 4000.0, 32);
+        assert_eq!((b, c), (8, 1)); // wrap à L, 1er cycle
+        assert!((o - 2000.0).abs() < 1e-9);
+        // 2e wrap : offset = 2000 + 4000
+        let (b, c, o) = next_click_state(16, 1, 2000.0, true, 8.0, 16.0, 2000.0, 4000.0, 32);
+        assert_eq!((b, c), (8, 2));
+        assert!((o - 6000.0).abs() < 1e-9);
+        // Début de lecture sans scrub : passe 0 = intervalle complet (0 ms)
+        let (b, c, o) = next_click_state(16, 0, 0.0, true, 8.0, 16.0, 8000.0, 4000.0, 32);
+        assert_eq!((b, c), (8, 1));
+        assert!((o - 8000.0).abs() < 1e-9);
+    }
+
+    /// next_click_state sans boucle : après la fin du morceau, plus aucun
+    /// clic (état inchangé) ; le beat loop_end n'est jamais atteint en wrap.
+    #[test]
+    fn next_click_state_fin_de_lecture_sans_boucle() {
+        let (b, c, o) = next_click_state(33, 0, 0.0, false, 0.0, 32.0, 0.0, 16000.0, 32);
+        assert_eq!((b, c), (33, 0)); // inchangé → l'appelant ne planifie rien
+        assert_eq!(o, 0.0);
+        // Dernier beat valide : clic planifié normalement
+        let (b, _, _) = next_click_state(32, 0, 0.0, false, 0.0, 32.0, 0.0, 16000.0, 32);
+        assert_eq!(b, 32);
+    }
+
+    // ── Tests d'intégration HTTP (app montée en mémoire, sans socket) ──
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+
+    /// État de test : pas de connexion MIDI, pas de SoundFont, config par
+    /// défaut — les routes de validation pure sont testables sans matériel.
+    fn test_state() -> AppState {
+        use std::sync::atomic::{AtomicU16, AtomicU8};
+        AppState {
+            midi: Arc::new(Mutex::new(None)),
+            midi_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            soundfont: None,
+            live: Arc::new(Live {
+                tracks: Mutex::new(vec![
+                    LiveTrack::new(0, 51, 60),
+                    LiveTrack::new(2, 33, 70),
+                    LiveTrack::new(3, 48, 60),
+                    LiveTrack::new(9, 1, 90),
+                    LiveTrack::new(4, 2, 50),
+                ]),
+                pattern: AtomicU8::new(patterns::PAT_ROCK),
+                tempo: AtomicU16::new(120),
+                stop: AtomicBool::new(false),
+                sig: AtomicU16::new(44),
+                walking: AtomicBool::new(false),
+                master_vol: AtomicU8::new(127),
+                use432: AtomicBool::new(false),
+            }),
+            click: Arc::new(click::ClickState::default()),
+            rendered_dual: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Envoie une requête HTTP à l'app montée en mémoire.
+    async fn req(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, String) {
+        let mut rb = axum::http::Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            rb = rb.header("content-type", "application/json");
+        }
+        let b = axum::body::Body::from(body.map(|v| v.to_string()).unwrap_or_default());
+        let resp = app.clone().oneshot(rb.body(b).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Les routes de lecture refusent une séquence vide (400) AVANT tout
+    /// accès MIDI — testable sans matériel.
+    #[tokio::test]
+    async fn api_sequence_vide_refusee_sur_les_routes_de_lecture() {
+        let app = build_app(test_state());
+        for uri in ["/render-wav", "/navig-play", "/navig-play-midi"] {
+            let (s, body) = req(&app, "POST", uri, Some(serde_json::json!({}))).await;
+            assert_eq!(
+                s,
+                StatusCode::BAD_REQUEST,
+                "{uri} doit refuser la séquence vide (reçu {s}: {body})"
+            );
+        }
+    }
+
+    /// GET /click renvoie la config complète du clic (JSON).
+    #[tokio::test]
+    async fn api_click_retourne_la_config() {
+        let app = build_app(test_state());
+        let (s, body) = req(&app, "GET", "/click", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for key in ["volume", "accent", "sound", "in_render", "delay_ms", "sounds"] {
+            assert!(v.get(key).is_some(), "GET /click doit contenir {key}");
+        }
+    }
+
+    /// GET /sample-file : nom avec chemin → 400 (sécurité), inconnu → 404.
+    #[tokio::test]
+    async fn api_sample_file_valide_les_noms() {
+        let app = build_app(test_state());
+        let (s, _) = req(&app, "GET", "/sample-file/..%2F..", None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "path traversal refusé");
+        let (s, _) = req(&app, "GET", "/sample-file/inexistant_xyz.wav", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "sample inconnu → 404");
+    }
+
+    /// POST /render-wav avec une séquence valide : rendu WAV réel (via
+    /// FluidSynth) → 200 + body audio/wav non vide. C'est le test
+    /// d'intégration le plus proche du flux réel (grille → SMF → WAV).
+    #[tokio::test]
+    async fn api_render_wav_sequence_valide_rend_un_wav() {
+        let app = build_app(test_state());
+        let body = serde_json::json!({
+            "sequence": [{"notes": ["C4", "E4", "G4"], "beats": 4.0}],
+            "tempo": 120,
+            "pattern": "rock",
+            "walking": false,
+            "sig": "4/4",
+            "master_vol": 127
+        });
+        let (s, body) = req(&app, "POST", "/render-wav", Some(body)).await;
+        assert_eq!(s, StatusCode::OK, "render-wav doit réussir : {body}");
+        // Réponse = WAV brut (audio/wav) : commence par le header RIFF
+        assert!(body.starts_with("RIFF"), "réponse WAV attendue, reçu: {}", &body[..body.len().min(80)]);
+    }
+
+    /// POST /save + GET /grilles + DELETE : cycle de vie d'une grille
+    /// (dossier isolé via HOME temporaire — aucun impact sur les vraies
+    /// grilles de l'utilisateur).
+    #[tokio::test]
+    async fn api_grilles_cycle_de_vie() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        let result = async {
+            let app = build_app(test_state());
+            // Sauvegarde
+            let (s, body) = req(
+                &app,
+                "POST",
+                "/save",
+                Some(serde_json::json!({"name": "test_integration", "grille": [1, 2, 3]})),
+            ).await;
+            assert_eq!(s, StatusCode::OK, "save doit réussir : {body}");
+            // Liste — la grille doit apparaître
+            let (s, body) = req(&app, "GET", "/grilles", None).await;
+            assert_eq!(s, StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                body.contains("test_integration"),
+                "la grille doit apparaître dans la liste : {body}"
+            );
+            // Suppression
+            let (s, _) = req(&app, "DELETE", "/grilles/test_integration", None).await;
+            assert_eq!(s, StatusCode::OK, "delete doit réussir");
+            let (_, body) = req(&app, "GET", "/grilles", None).await;
+            assert!(!body.contains("test_integration"), "grille supprimée : {body}");
+            v
+        }.await;
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = result; // évite un warning si le contenu n'est pas utilisé
     }
 }

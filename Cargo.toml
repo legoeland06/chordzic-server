@@ -19,3 +19,8 @@ cpal = "0.15"
 hound = "3.5"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
