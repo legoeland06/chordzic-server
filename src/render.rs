@@ -287,6 +287,10 @@ pub fn generate_notes(
         // Nombre de temps que dure cet accord (4.0 = mesure complète)
         let bc = if ci < beats.len() { beats[ci] } else { 4.0 };
         let nq = bc as u32;       // Temps entiers dans cet accord (floor)
+        // Accords plus courts qu'1 temps (notation 6:, 8:, 12:…) : au moins
+        // un slot d'attaque pour que lead et drums ne soient pas muets.
+        let slots = if bc > 0.0 && nq == 0 { 1 } else { nq };
+        let short_chord = bc < 1.0;  // durées < 1 temps : traitement spécifique
 
         // Accord vide (silence) → skip sans générer de notes
         if notes.is_empty() {
@@ -300,16 +304,26 @@ pub fn generate_notes(
         let chord: &[u8] = if notes.len() > 1 { &notes[1..] } else { &[] };
 
         // ── Lead — pompe skank : staccato sur contretemps 8ème ──
-        // Start = beat + 0.5 (contretemps), durée 0.25 (1/16 staccato)
+        // Start = beat + 0.5 (contretemps), durée 0.25 (1/16 staccato).
+        // Accord < 1 temps : plaqué au début (le contretemps déborderait).
         if !lead_mute {
             let lv = sc(lead_vol, 127);
-            for b in 0..nq {
-                let start = abs_beats + b as f64 + 0.5;
+            if short_chord {
                 for &n in chord {
                     out.push(CustomNote {
-                        channel: CH_LEAD, start_time: start, pitch: n,
-                        duration: 0.25, velocity: lv,
+                        channel: CH_LEAD, start_time: abs_beats, pitch: n,
+                        duration: bc.min(0.25), velocity: lv,
                     });
+                }
+            } else {
+                for b in 0..nq {
+                    let start = abs_beats + b as f64 + 0.5;
+                    for &n in chord {
+                        out.push(CustomNote {
+                            channel: CH_LEAD, start_time: start, pitch: n,
+                            duration: 0.25, velocity: lv,
+                        });
+                    }
                 }
             }
         }
@@ -335,9 +349,18 @@ pub fn generate_notes(
                 // fin de l'accord. Si la durée est négative (accord < 3
                 // temps), la note était inaudible dans l'ancien rendu → on
                 // ne l'émet pas (comportement identique).
+                // Accord < 1 temps : une seule note tenue sur bc (la walking
+                // complète déborderait sur l'accord suivant).
                 let short = (TICKS_PER_BEAT as f64 - 1.0) / tpb;
-                for (bi, &bn) in wb_notes.iter().enumerate() {
-                    let dur = if bi < 3 { short } else { bc - 3.0 };
+                let nb = if short_chord { 1 } else { 4 };
+                for (bi, &bn) in wb_notes.iter().enumerate().take(nb) {
+                    let dur = if short_chord {
+                        bc
+                    } else if bi < 3 {
+                        short
+                    } else {
+                        bc - 3.0
+                    };
                     if dur > 0.0 {
                         out.push(CustomNote {
                             channel: CH_BASS, start_time: abs_beats + bi as f64,
@@ -368,11 +391,13 @@ pub fn generate_notes(
         }
 
         // ── Drums + Accent : par temps ────────────
-        for b in 0..nq {
+        for b in 0..slots {
             // Beat absolu pour le pattern (wrap à beats_per_bar)
             let bar_beat = (abs_beats as u32 + b) % beats_per_bar;
             let t0 = abs_beats + b as f64;   // Début du temps
             let up = t0 + 0.5;               // Contretemps 8ème
+            // Accord < 1 temps : pas de contretemps (il déborderait de l'accord)
+            let play_up = !short_chord;
 
             // ── Drums — pattern exact comme drum_hit() ──────────
             if !drums_mute {
@@ -406,7 +431,7 @@ pub fn generate_notes(
                             }
                             _ => {}
                         }
-                        hit(HH, hh40, up);
+                        if play_up { hit(HH, hh40, up); }
                     }
                     "jazz" => {
                         let bb2 = bar_beat % 8; // Le jazz se répète sur 2 mesures
@@ -423,7 +448,7 @@ pub fn generate_notes(
                             }
                             _ => {}
                         }
-                        hit(HH, 35, up);
+                        if play_up { hit(HH, 35, up); }
                     }
                     "pop" => {
                         match bar_beat % 4 {
@@ -442,7 +467,7 @@ pub fn generate_notes(
                             }
                             _ => {}
                         }
-                        hit(HH, sc(dv, 45), up);
+                        if play_up { hit(HH, sc(dv, 45), up); }
                     }
                     "bossa" => {
                         match bar_beat % 4 {
@@ -464,7 +489,7 @@ pub fn generate_notes(
                             }
                             _ => {}
                         }
-                        hit(HH, hh40, up);
+                        if play_up { hit(HH, hh40, up); }
                     }
                     "onedrop" => {
                         match bar_beat % 4 {
@@ -481,7 +506,7 @@ pub fn generate_notes(
                             3 => { hit(HH, hh55, t0); }
                             _ => {}
                         }
-                        hit(HH, hh40, up);
+                        if play_up { hit(HH, hh40, up); }
                     }
                     // Pattern par défaut : ROCK
                     _ => {
@@ -504,7 +529,7 @@ pub fn generate_notes(
                             }
                             _ => {}
                         }
-                        hit(HH, hh_eighth, up);
+                        if play_up { hit(HH, hh_eighth, up); }
                     }
                 }
             }
@@ -1330,5 +1355,83 @@ mod tests {
         let mut r = hound::WavReader::new(std::io::Cursor::new(&out)).unwrap();
         let s: Vec<i16> = r.samples::<i16>().filter_map(|x| x.ok()).collect();
         assert_eq!(s[0], 100);
+    }
+}
+
+mod tests_courtes {
+    use super::*;
+
+    fn cfg_test() -> RenderCfg {
+        RenderCfg {
+            tempo: 120, pattern: "rock".into(), walking: true, sig: "4/4".into(), lead_inst: 51,
+            tracks: vec![
+                TrackCfg { channel: CH_LEAD, program: 1, volume: 100, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: CH_BASS, program: 1, volume: 100, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: CH_STR, program: 1, volume: 100, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: CH_DRUMS, program: 1, volume: 100, mute: false, drums: true, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: CH_ACC, program: 1, volume: 100, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+            ],
+        }
+    }
+
+    /// Notation 8: (croche = 0,5 temps) : lead plaqué, basse tenue bc, drums
+    /// au temps 0 — et AUCUNE note ne déborde de la durée de l'accord.
+    #[test]
+    fn accord_8_croche_complet() {
+        let cfg = cfg_test();
+        let notes_arrays = vec![vec![48, 60, 64, 67]]; // basse C2 + C E G
+        let out = generate_notes(&notes_arrays, &[0.5], &cfg);
+
+        assert!(out.iter().any(|n| n.channel == CH_LEAD), "lead doit jouer sur une croche");
+        assert!(out.iter().any(|n| n.channel == CH_DRUMS), "drums doivent jouer sur une croche");
+        let basses: Vec<_> = out.iter().filter(|n| n.channel == CH_BASS).collect();
+        assert_eq!(basses.len(), 1, "une seule note de basse");
+        assert!((basses[0].duration - 0.5).abs() < 1e-9, "basse tenue sur toute la croche");
+        assert!(out.iter().all(|n| n.start_time + n.duration <= 0.5 + 1e-9),
+            "aucune note ne doit déborder de l'accord (8:)");
+    }
+
+    /// Notation 6: (triolet de noire ≈ 0,667 temps) : idem, sans débordement.
+    #[test]
+    fn accord_6_triolet_noire_complet() {
+        let cfg = cfg_test();
+        let notes_arrays = vec![vec![48, 60, 64, 67]];
+        let out = generate_notes(&notes_arrays, &[2.0 / 3.0], &cfg);
+
+        assert!(out.iter().any(|n| n.channel == CH_LEAD), "lead doit jouer");
+        assert!(out.iter().any(|n| n.channel == CH_DRUMS), "drums doivent jouer");
+        let basses: Vec<_> = out.iter().filter(|n| n.channel == CH_BASS).collect();
+        assert_eq!(basses.len(), 1);
+        assert!((basses[0].duration - 2.0 / 3.0).abs() < 1e-9);
+        assert!(out.iter().all(|n| n.start_time + n.duration <= 2.0 / 3.0 + 1e-9),
+            "aucune note ne doit déborder de l'accord (6:)");
+    }
+
+    /// Notation 12: (triolet de croche = 0,333 temps) : idem.
+    #[test]
+    fn accord_12_triolet_croche_complet() {
+        let cfg = cfg_test();
+        let notes_arrays = vec![vec![48, 60, 64, 67]];
+        let out = generate_notes(&notes_arrays, &[1.0 / 3.0], &cfg);
+
+        assert!(out.iter().any(|n| n.channel == CH_LEAD), "lead doit jouer");
+        assert!(out.iter().any(|n| n.channel == CH_DRUMS), "drums doivent jouer");
+        assert!(out.iter().all(|n| n.start_time + n.duration <= 1.0 / 3.0 + 1e-9),
+            "aucune note ne doit déborder de l'accord (12:)");
+    }
+
+    /// Notation 3: (1,333 temps) : le lead skank joue (1 attaque), drums au
+    /// temps 0, et le lead ne déborde pas (le contretemps 0,5 est dans l'accord).
+    #[test]
+    fn accord_3_tiers_de_mesure_lead_et_drums() {
+        let cfg = cfg_test();
+        let notes_arrays = vec![vec![48, 60, 64, 67]];
+        let out = generate_notes(&notes_arrays, &[4.0 / 3.0], &cfg);
+
+        let leads: Vec<_> = out.iter().filter(|n| n.channel == CH_LEAD).collect();
+        assert!(!leads.is_empty(), "lead doit jouer");
+        assert!(leads.iter().all(|n| n.start_time + n.duration <= 4.0 / 3.0 + 1e-9),
+            "le lead ne doit pas déborder de l'accord (3:)");
+        assert!(out.iter().any(|n| n.channel == CH_DRUMS), "drums doivent jouer");
     }
 }
