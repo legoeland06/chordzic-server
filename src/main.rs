@@ -27,6 +27,7 @@
 mod click;
 mod dsp;
 mod grilles;
+mod live_input;
 mod midi;
 mod patterns;
 mod render;
@@ -246,6 +247,9 @@ struct AppState {
     /// un scrub (start_at) relance la lecture depuis l'offset SANS re-rendre
     /// (FluidSynth ≈ 3 s — le clic lane doit être instantané comme en MIDI).
     rendered_dual: Arc<Mutex<Option<(String, String, f64)>>>,
+    /// Entrée MIDI live (notes tenues sur le clavier du pianiste) — sert la
+    /// reconnaissance d'accords en mode Live (route GET /live-input).
+    live_input: Arc<live_input::LiveInputState>,
 }
 
 /// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
@@ -1952,6 +1956,15 @@ async fn samples_list() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(data))
 }
 
+/// GET /live-input — état de l'entrée MIDI live : le clavier écouté et les
+/// notes actuellement tenues (pitchs MIDI). Le frontend fait la
+/// reconnaissance d'accords avec son harmonie (QUALITY_INTERVALS).
+async fn live_input(State(s): State<AppState>) -> impl IntoResponse {
+    let device = s.live_input.device.lock().unwrap().clone();
+    let active = s.live_input.active.lock().unwrap().clone();
+    axum::Json(serde_json::json!({ "device": device, "active": active }))
+}
+
 /// Sert un fichier sample (~/samples/drums/<name>) au navigateur — utilisé
 /// par la boucle sample du mode Navig (lecture Web Audio côté client).
 async fn sample_file(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
@@ -1996,6 +2009,7 @@ fn build_app(state: AppState) -> Router {
         .route("/audio-device", post(audio_device))
         .route("/midi-ports", get(midi_ports))
         .route("/midi-port", post(midi_port))
+        .route("/live-input", get(live_input))
         .route("/click", get(get_click).post(post_click))
         .route("/navig-click-start", post(navig_click_start))
         .route("/navig-click-stop", post(navig_click_stop))
@@ -2079,7 +2093,11 @@ async fn main() {
             ),
         }),
         rendered_dual: Arc::new(Mutex::new(None)),
+        live_input: live_input::LiveInputState::new(),
     };
+
+    // Écoute du clavier du pianiste (reconnaissance d'accords — mode Live).
+    live_input::start(&state.live_input);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
 
@@ -2358,6 +2376,7 @@ mod tests {
             }),
             click: Arc::new(click::ClickState::default()),
             rendered_dual: Arc::new(Mutex::new(None)),
+            live_input: live_input::LiveInputState::new(),
         }
     }
 
