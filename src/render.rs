@@ -35,7 +35,7 @@ static RENDER_TAG: AtomicU64 = AtomicU64::new(0);
 /// séparé, render-tracks + render-wav simultanés…). Avant : noms fixes
 /// /tmp/chordj_render.mid|.wav → le premier appel supprimait les fichiers
 /// pendant que le second les lisait (« No such file or directory »).
-fn next_render_tag() -> String {
+pub fn next_render_tag() -> String {
     let n = RENDER_TAG.fetch_add(1, Ordering::Relaxed);
     format!("chordj_render_{}_{}", std::process::id(), n)
 }
@@ -563,7 +563,7 @@ pub fn generate_notes(
 /// pic 0,5 puis master/127) : le niveau d'un rendu ne dépend plus du chemin
 /// emprunté (FX on/off) ni du nombre de pistes. Avant : gain fixe ×3 — les
 /// rendus simple et par piste ne sonnaient pas au même niveau.
-fn apply_gain(wav: &[u8], master_vol: u8) -> Vec<u8> {
+pub fn apply_gain(wav: &[u8], master_vol: u8) -> Vec<u8> {
     use hound::WavReader;
     let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
         return wav.to_vec();

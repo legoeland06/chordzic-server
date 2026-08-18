@@ -26,6 +26,7 @@
 /// - `grilles`  : sauvegarde/chargement des grilles en JSON
 mod click;
 mod dsp;
+mod external_render;
 mod grilles;
 mod live_input;
 mod midi;
@@ -1212,28 +1213,25 @@ async fn navig_click_stop() -> impl IntoResponse {
     (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
 }
 
-/// POST /navig-play-midi — lecture MIDI temps réel (mode Navig) : toutes les
-/// pistes (grille + notes personnalisées du PianoRoll) jouées sur le port MIDI
-/// courant (ex. Roland), comme le mode Live mais avec le contenu du Navig.
-async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoResponse {
-    let ev: &[ChordEv] = if !b.seq.is_empty() {
-        &b.seq
-    } else if !b.sequence.is_empty() {
-        &b.sequence
-    } else {
-        &[]
-    };
-    if ev.is_empty() && b.custom_notes.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à jouer").into_response();
-    }
-    let (notes_arrays, beats, rcfg) = render_inputs(&b);
-    let all_notes: Vec<render::CustomNote> = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
-        let custom_channels: std::collections::HashSet<u8> = b.custom_channels
+/// Construit les notes à jouer/rendre depuis une requête : notes custom
+/// (piano roll) fusionnées avec la génération classique, ou génération seule.
+/// Les pistes mutées sont silencieuses, les pistes drums sont redirigées
+/// vers le canal 9 et le volume de piste est appliqué (logique métier
+/// partagée par navig-play-midi et render-external).
+fn build_all_notes(
+    b: &PlayReq,
+    notes_arrays: &[Vec<u8>],
+    beats: &[f64],
+    rcfg: &render::RenderCfg,
+) -> Vec<render::CustomNote> {
+    if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
+        let custom_channels: std::collections::HashSet<u8> = b
+            .custom_channels
             .iter()
             .copied()
             .chain(b.custom_notes.iter().map(|n| n.channel))
             .collect();
-        let classic = render::generate_notes(&notes_arrays, &beats, &rcfg);
+        let classic = render::generate_notes(notes_arrays, beats, rcfg);
         let mut merged: Vec<render::CustomNote> = classic
             .into_iter()
             .filter(|n| !custom_channels.contains(&n.channel))
@@ -1259,8 +1257,105 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
         }
         merged
     } else {
-        render::generate_notes(&notes_arrays, &beats, &rcfg)
+        render::generate_notes(notes_arrays, beats, rcfg)
+    }
+}
+
+/// POST /render-external — Rendu Externe : joue la grille sur le périphérique
+/// MIDI courant (Roland, expander…) et ENREGISTRE sa sortie audio (carte de
+/// capture associée) → WAV avec le vrai son du synthétiseur matériel.
+/// Temps réel : la requête bloque pendant la durée du morceau.
+async fn render_external(
+    State(s): State<AppState>,
+    Json(b): Json<PlayReq>,
+) -> impl IntoResponse {
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
     };
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à rendre").into_response();
+    }
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+    let all_notes = build_all_notes(&b, &notes_arrays, &beats, &rcfg);
+    if all_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Aucune note à rendre").into_response();
+    }
+
+    let guard = s.midi.lock().unwrap();
+    let Some(link) = guard.as_ref() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Aucun port MIDI connecté").into_response();
+    };
+    // Carte de capture associée au port MIDI courant (match par nom)
+    let cards = external_render::list_capture_cards();
+    let Some(capture) = external_render::find_capture_device(&link.port, &cards) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Aucune carte de capture trouvée pour ce périphérique MIDI (Rendu Externe indisponible)",
+        )
+            .into_response();
+    };
+
+    // Clic métronome à mixer après capture (mêmes règles que render-wav)
+    let click_wav = if b.click_in_render {
+        let dur = external_render::total_duration_sec(&all_notes, b.tempo) + 2.0;
+        let bars = (sig_code(&b.sig) / 10).max(1) as u64;
+        let total_beats = (dur * b.tempo.max(1) as f64 / 60.0).ceil();
+        let smf = render::generate_click_smf(b.tempo as u16, bars, total_beats, true, 0);
+        s.soundfont
+            .as_ref()
+            .and_then(|sf| render::render_wav_raw(&smf, sf, dur).ok())
+    } else {
+        None
+    };
+
+    let tag = render::next_render_tag();
+    let opts = external_render::ExternalOptions {
+        tempo: b.tempo,
+        master_vol: b.master_vol,
+        click_wav,
+        click_gain: 0.8,
+    };
+    match external_render::render_external(
+        &link.handle,
+        &all_notes,
+        &rcfg.tracks,
+        &capture,
+        &tag,
+        &opts,
+    ) {
+        Ok(wav) => (
+            [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+            wav,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Rendu externe : {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /navig-play-midi — lecture MIDI temps réel (mode Navig) : toutes les
+/// pistes (grille + notes personnalisées du PianoRoll) jouées sur le port MIDI
+/// courant (ex. Roland), comme le mode Live mais avec le contenu du Navig.
+async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> impl IntoResponse {
+    let ev: &[ChordEv] = if !b.seq.is_empty() {
+        &b.seq
+    } else if !b.sequence.is_empty() {
+        &b.sequence
+    } else {
+        &[]
+    };
+    if ev.is_empty() && b.custom_notes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Séquence vide — rien à jouer").into_response();
+    }
+    let (notes_arrays, beats, rcfg) = render_inputs(&b);
+    let all_notes = build_all_notes(&b, &notes_arrays, &beats, &rcfg);
     if all_notes.is_empty() {
         return (StatusCode::BAD_REQUEST, "Aucune note à jouer").into_response();
     }
@@ -1999,6 +2094,7 @@ fn build_app(state: AppState) -> Router {
         .route("/config", post(conf))
         .route("/stop", post(stop))
         .route("/render-wav", post(render_wav))
+        .route("/render-external", post(render_external))
         .route("/render-tracks", post(render_tracks))
         .route("/render-notes", post(render_notes))
         .route("/note", post(note))
@@ -2403,7 +2499,7 @@ mod tests {
     #[tokio::test]
     async fn api_sequence_vide_refusee_sur_les_routes_de_lecture() {
         let app = build_app(test_state());
-        for uri in ["/render-wav", "/navig-play", "/navig-play-midi"] {
+        for uri in ["/render-wav", "/render-external", "/navig-play", "/navig-play-midi"] {
             let (s, body) = req(&app, "POST", uri, Some(serde_json::json!({}))).await;
             assert_eq!(
                 s,
