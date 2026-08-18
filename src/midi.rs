@@ -173,18 +173,18 @@ pub fn init_midi() -> Option<(MidiHandle, String)> {
         // Chercher un port FluidSynth ou Roland par nom
         let names: Vec<String> = p.iter().filter_map(|x| mo.port_name(x).ok()).collect();
 
-        // Priorité : FluidSynth (nommé "FLUID" ou "FluidSynth" ou "fluid")
+        // Priorité : Roland Digital Piano (le piano branché), sinon FluidSynth
         if let Some((idx, _)) = names.iter().enumerate().find(|(_, n)| {
-            n.to_lowercase().contains("fluid")
-        }) {
-            println!("   → Auto-détection : port FluidSynth [{}] {}", idx, names[idx]);
-            idx
-        }
-        // Priorité 2 : Roland Digital Piano
-        else if let Some((idx, _)) = names.iter().enumerate().find(|(_, n)| {
             n.to_lowercase().contains("roland")
         }) {
             println!("   → Auto-détection : port Roland [{}] {}", idx, names[idx]);
+            idx
+        }
+        // Priorité 2 : FluidSynth (nommé "FLUID" ou "FluidSynth" ou "fluid")
+        else if let Some((idx, _)) = names.iter().enumerate().find(|(_, n)| {
+            n.to_lowercase().contains("fluid")
+        }) {
+            println!("   → Auto-détection : port FluidSynth [{}] {}", idx, names[idx]);
             idx
         }
         // Priorité 3 : premier port qui n'est pas "Midi Through" ou "System"
