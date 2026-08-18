@@ -187,8 +187,8 @@ pub fn generate_smf_fmt0(
     // partagée avec le PianoRoll via l'endpoint /render-notes.
     let notes = generate_notes(notes_arrays, beats, cfg);
     for n in &notes {
-        let start_tick = (n.start_time * tpb as f64) as u32;
-        let end_tick = ((n.start_time + n.duration) * tpb as f64) as u32;
+        let start_tick = (n.start_time * tpb as f64).round() as u32;
+        let end_tick = ((n.start_time + n.duration) * tpb as f64).round() as u32;
         e(&mut evs, start_tick, &[0x90 | n.channel, n.pitch, n.velocity]);
         e(&mut evs, end_tick, &[0x80 | n.channel, n.pitch, 64]);
     }
@@ -746,7 +746,7 @@ pub fn slice_wav_from(wav: &[u8], start_sec: f64) -> Vec<u8> {
     let spec = reader.spec();
     let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
     let ch = spec.channels.max(1) as usize;
-    let start = ((start_sec * spec.sample_rate as f64) as usize) * ch;
+    let start = ((start_sec * spec.sample_rate as f64).round() as usize) * ch;
     if start >= samples.len() {
         return wav.to_vec(); // garde-fou : offset au-delà de la durée
     }
@@ -1038,8 +1038,8 @@ pub fn generate_smf_from_custom(
     audible.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
 
     for n in &audible {
-        let start_tick = (n.start_time * tpb as f64) as u32;
-        let end_tick = ((n.start_time + n.duration) * tpb as f64) as u32;
+        let start_tick = (n.start_time * tpb as f64).round() as u32;
+        let end_tick = ((n.start_time + n.duration) * tpb as f64).round() as u32;
 
         // Note On
         e(&mut evs, start_tick, &[0x90 | n.channel, n.pitch, n.velocity]);
@@ -1433,5 +1433,111 @@ mod tests_courtes {
         assert!(leads.iter().all(|n| n.start_time + n.duration <= 4.0 / 3.0 + 1e-9),
             "le lead ne doit pas déborder de l'accord (3:)");
         assert!(out.iter().any(|n| n.channel == CH_DRUMS), "drums doivent jouer");
+    }
+}
+
+mod tests_triolets {
+    use super::*;
+
+    fn cfg_tt() -> RenderCfg {
+        RenderCfg {
+            tempo: 120, pattern: "rock".into(), walking: false, sig: "4/4".into(), lead_inst: 51,
+            tracks: vec![
+                TrackCfg { channel: CH_LEAD, program: 1, volume: 100, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: CH_BASS, program: 1, volume: 100, mute: false, drums: false, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+                TrackCfg { channel: CH_DRUMS, program: 1, volume: 100, mute: false, drums: true, bank_msb: 0, bank_lsb: 0, fx: Default::default() },
+            ],
+        }
+    }
+
+    /// Parse un SMF et renvoie les ticks absolus des note-on d'un canal donné.
+    fn smf_ticks(smf: &[u8], canal: u8) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        assert_eq!(&smf[i..i + 4], b"MThd");
+        i += 4;
+        let hlen = u32::from_be_bytes(smf[i..i + 4].try_into().unwrap()) as usize;
+        i += 4 + hlen;
+        while i + 4 <= smf.len() {
+            assert_eq!(&smf[i..i + 4], b"MTrk");
+            i += 4;
+            let tlen = u32::from_be_bytes(smf[i..i + 4].try_into().unwrap()) as usize;
+            i += 4;
+            let end = i + tlen;
+            let mut tick = 0u32;
+            let mut running: Option<u8> = None;
+            while i < end {
+                // delta-time VLQ
+                let mut delta = 0u32;
+                loop {
+                    let b = smf[i];
+                    i += 1;
+                    delta = (delta << 7) | (b & 0x7f) as u32;
+                    if b & 0x80 == 0 { break; }
+                }
+                tick += delta;
+                let mut status = smf[i];
+                if status & 0x80 == 0 {
+                    status = running.expect("running status sans statut initial");
+                } else {
+                    i += 1;
+                }
+                match status {
+                    0x80..=0xef => {
+                        let nbytes = match status & 0xf0 {
+                            0xc0 | 0xd0 => 1, // program change / channel pressure
+                            _ => 2,
+                        };
+                        let ch = status & 0x0f;
+                        let d1 = smf[i];
+                        let d2 = if nbytes == 2 { smf[i + 1] } else { 0 };
+                        i += nbytes;
+                        running = Some(status);
+                        if status & 0xf0 == 0x90 && d2 > 0 && ch == canal {
+                            out.push(tick);
+                        }
+                    }
+                    0xff => {
+                        i += 1; // type de meta event
+                        let mut mlen = 0u32;
+                        loop {
+                            let b = smf[i];
+                            i += 1;
+                            mlen = (mlen << 7) | (b & 0x7f) as u32;
+                            if b & 0x80 == 0 { break; }
+                        }
+                        i += mlen as usize;
+                    }
+                    _ => {
+                        // sysex (0xf0/0xf7) : sauter par longueur VLQ
+                        let mut slen = 0u32;
+                        loop {
+                            let b = smf[i];
+                            i += 1;
+                            slen = (slen << 7) | (b & 0x7f) as u32;
+                            if b & 0x80 == 0 { break; }
+                        }
+                        i += slen as usize;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 3:Cx3 sur 2 mesures = 6 accords de 4/3 temps. Les attaques de basse
+    /// doivent tomber pile sur les ticks 0, 384, 768, 1152, 1536, 1920
+    /// (une mesure de 4 temps = 1152 ticks à 288 tpb ; 4/3 × 288 = 384).
+    /// La troncature donnait 383/767 (dérive de 1 tick par frontière) —
+    /// l'arrondi (round) des conversions beats→ticks corrige la dérive.
+    #[test]
+    fn triolets_couvrent_exactement_deux_mesures() {
+        let cfg = cfg_tt();
+        let notes_arrays = vec![vec![48, 60, 64, 67]; 6];
+        let beats: Vec<f64> = vec![4.0 / 3.0; 6];
+        let smf = generate_smf_fmt0(&notes_arrays, &beats, &cfg);
+        let ticks = smf_ticks(&smf, CH_BASS);
+        assert_eq!(ticks, vec![0, 384, 768, 1152, 1536, 1920],
+            "les triolets 3: doivent couvrir exactement 2 mesures de 4 temps");
     }
 }
