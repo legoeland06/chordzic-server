@@ -731,6 +731,41 @@ async fn note(State(s): State<AppState>, Json(b): Json<NoteReq>) -> impl IntoRes
     Json(Rsp { status: "ok".into() })
 }
 
+/// POST /piano-note — LivePiano cliquable : note-on / note-off envoyée au
+/// périphérique (Roland) comme un vrai appui de touche.
+///
+/// `channel` optionnel : canal cible (piste sélectionnée en mode Navig) ;
+/// sinon le canal d'écho configuré ; sinon canal 1 (0). Si le canal
+/// correspond à une piste drums, la note part sur le canal drums natif (9).
+#[derive(Deserialize)]
+struct PianoNoteReq {
+    pitch: u8,
+    #[serde(default = "nv")]
+    velocity: u8,
+    on: bool,
+    channel: Option<u8>,
+}
+
+async fn piano_note(State(s): State<AppState>, Json(b): Json<PianoNoteReq>) -> impl IntoResponse {
+    let pitch = b.pitch;
+    let vel = b.velocity.min(127);
+    let on = b.on;
+    let mut channel = b.channel.or_else(|| {
+        s.live_input.echo.lock().unwrap().channel
+    }).unwrap_or(0) & 0x0F;
+    // Piste drums : note sur le canal drums natif (9) quel que soit le canal.
+    {
+        let tracks = s.live.tracks.lock().unwrap();
+        if let Some(t) = tracks.iter().find(|t| t.channel == channel) {
+            if t.drums.load(std::sync::atomic::Ordering::Relaxed) && channel != 9 {
+                channel = 9;
+            }
+        }
+    }
+    midi_send(&s, &live_input::piano_note_message(pitch, vel, on, channel));
+    Json(Rsp { status: "ok".into() })
+}
+
 /// POST /render-wav — Rendu batch d'une séquence en WAV.
 async fn render_wav(
     State(s): State<AppState>,
@@ -2218,6 +2253,7 @@ fn build_app(state: AppState) -> Router {
         .route("/render-tracks", post(render_tracks))
         .route("/render-notes", post(render_notes))
         .route("/note", post(note))
+        .route("/piano-note", post(piano_note))
         .route("/samples-list", get(samples_list))
         .route("/sample-file/:name", get(sample_file))
         .route("/rendered/:file", get(serve_rendered))
@@ -2345,6 +2381,7 @@ async fn main() {
     println!("     GET  /rendered/<f>  → WAV temporaire du bounce PostProd");
     println!("     POST /render-notes  → notes mode classique (PianoRoll)");
     println!("     POST /note          → audition note en direct (preview)");
+    println!("     POST /piano-note    → LivePiano cliquable : note on/off vers le Roland");
     println!("     GET  /audio-devices → lister les sorties audio (cpal)");
     println!("     GET  /click         → config de la piste de clic");
     println!("     POST /click         → modifier la config du clic");

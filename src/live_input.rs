@@ -121,6 +121,17 @@ pub fn echo_message(msg: &[u8], echo: &EchoConfig) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Messages à envoyer pour une note jouée au clic sur le LivePiano :
+/// note-on (vel > 0) ou note-off (0x80) sur le canal cible.
+/// Fonction pure (testable sans matériel).
+pub fn piano_note_message(pitch: u8, velocity: u8, on: bool, channel: u8) -> Vec<u8> {
+    if on {
+        vec![0x90 | (channel & 0x0F), pitch, velocity.min(127)]
+    } else {
+        vec![0x80 | (channel & 0x0F), pitch, 0]
+    }
+}
+
 /// Messages à envoyer pour faire sonner une piste avec son instrument :
 /// program change (ou bank select + PC pour les banques GM2). Le canal
 /// drums natif (9) n'a pas de PC (kit standard) sauf banque explicite.
@@ -431,6 +442,17 @@ mod tests {
         rec_send(&mut notes, &mut held, 0x90, 60, 100, 0);
         rec_send(&mut notes, &mut held, 0x90, 60, 100, 100); // repiquage
         assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn piano_note_on_off() {
+        // note-on : status 0x90 + canal, pitch, vélocité (bornée à 127)
+        assert_eq!(piano_note_message(60, 100, true, 0), vec![0x90, 60, 100]);
+        assert_eq!(piano_note_message(60, 100, true, 9), vec![0x99, 60, 100]);
+        assert_eq!(piano_note_message(60, 200, true, 2), vec![0x92, 60, 127]); // vélocité bornée
+        // note-off : 0x80 + canal, pitch, 0
+        assert_eq!(piano_note_message(60, 100, false, 0), vec![0x80, 60, 0]);
+        assert_eq!(piano_note_message(60, 100, false, 15), vec![0x8F, 60, 0]);
     }
 
     #[test]
