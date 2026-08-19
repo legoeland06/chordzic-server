@@ -32,17 +32,21 @@ impl Default for EchoConfig {
     }
 }
 
-/// Transforme un message de note (note-on/note-off) pour l'écho : le canal
-/// est remplacé par celui de la piste cible. Retourne None si l'écho est
-/// désactivé, sans piste cible, ou si le message n'est pas une note.
+/// Transforme un message pour l'écho vers la piste cible : le canal est
+/// remplacé par celui de la piste. Sont relayés les NOTES (note-on/off) et
+/// la PÉDALE DE SUSTAIN (CC64) — les autres CC/PC/pitch bend ne sont pas
+/// échoés. Retourne None si l'écho est désactivé, sans piste cible, ou si
+/// le message n'est pas relégué.
 /// Fonction pure (testable sans matériel).
-pub fn echo_note_message(msg: &[u8], echo: &EchoConfig) -> Option<Vec<u8>> {
+pub fn echo_message(msg: &[u8], echo: &EchoConfig) -> Option<Vec<u8>> {
     if !echo.enabled || msg.len() < 2 {
         return None;
     }
     let channel = echo.channel?;
     let high = msg[0] & 0xF0;
-    if high != 0x90 && high != 0x80 {
+    let is_note = high == 0x90 || high == 0x80;
+    let is_sustain = high == 0xB0 && msg.len() >= 3 && msg[1] == 64;
+    if !is_note && !is_sustain {
         return None;
     }
     let mut out = msg.to_vec();
@@ -84,6 +88,9 @@ pub struct LiveInputState {
     _conn: Mutex<Option<MidiInputConnection<()>>>,
     /// Écho des notes du pianiste vers la sortie MIDI (mode Navig ✨).
     pub echo: Mutex<EchoConfig>,
+    /// État courant de la pédale de sustain (CC64) — relancé à l'activation
+    /// de l'écho pour que le sustain s'applique aussi aux notes renvoyées.
+    pub sustain: std::sync::atomic::AtomicBool,
     /// Émetteur MIDI (configuré par main.rs avec la sortie réelle).
     sender: Mutex<Option<Box<dyn Fn(&[u8]) + Send + Sync>>>,
 }
@@ -95,6 +102,7 @@ impl LiveInputState {
             active: Mutex::new(Vec::new()),
             _conn: Mutex::new(None),
             echo: Mutex::new(EchoConfig::default()),
+            sustain: std::sync::atomic::AtomicBool::new(false),
             sender: Mutex::new(None),
         })
     }
@@ -176,10 +184,16 @@ pub fn start(shared: &Arc<LiveInputState>) {
             if let Ok(mut a) = shared2.active.lock() {
                 apply_midi_message(&mut a, msg);
             }
+            // Pédale de sustain : mémorise l'état courant (relancé à
+            // l'activation de l'écho) puis écho vers la sortie.
+            if msg.len() >= 3 && (msg[0] & 0xF0) == 0xB0 && msg[1] == 64 {
+                shared2.sustain.store(msg[2] >= 64, std::sync::atomic::Ordering::Relaxed);
+            }
             // Écho vers la sortie (mode Navig ✨) : le pianiste entend le son
-            // (program) de la piste sélectionnée sur le canal de celle-ci.
+            // (program) de la piste sélectionnée sur le canal de celle-ci —
+            // notes ET pédale de sustain (les notes écho durent avec la pédale).
             let cfg = shared2.echo.lock().unwrap();
-            if let Some(out) = echo_note_message(msg, &cfg) {
+            if let Some(out) = echo_message(msg, &cfg) {
                 if let Some(sender) = shared2.sender.lock().unwrap().as_ref() {
                     sender(&out);
                 }
@@ -263,21 +277,31 @@ mod tests {
     #[test]
     fn echo_remplace_le_canal_de_la_note() {
         let cfg = EchoConfig { enabled: true, channel: Some(5) };
-        let out = echo_note_message(&[0x90, 60, 100], &cfg).unwrap();
+        let out = echo_message(&[0x90, 60, 100], &cfg).unwrap();
         assert_eq!(out, vec![0x95, 60, 100]); // canal 0 → 5, note intacte
-        let off = echo_note_message(&[0x80, 64, 64], &cfg).unwrap();
+        let off = echo_message(&[0x80, 64, 64], &cfg).unwrap();
         assert_eq!(off, vec![0x85, 64, 64]);
     }
 
     #[test]
-    fn echo_desactive_sans_piste_ou_sur_non_note() {
+    fn echo_relaie_la_pedale_de_sustain() {
+        let cfg = EchoConfig { enabled: true, channel: Some(2) };
+        let on = echo_message(&[0xB0, 64, 127], &cfg).unwrap();
+        assert_eq!(on, vec![0xB2, 64, 127]); // CC64 canal 0 → 2
+        let off = echo_message(&[0xB0, 64, 0], &cfg).unwrap();
+        assert_eq!(off, vec![0xB2, 64, 0]);
+    }
+
+    #[test]
+    fn echo_desactive_sans_piste_ou_sur_message_non_relaye() {
         let off = EchoConfig { enabled: false, channel: Some(0) };
-        assert_eq!(echo_note_message(&[0x90, 60, 100], &off), None);
+        assert_eq!(echo_message(&[0x90, 60, 100], &off), None);
         let no_ch = EchoConfig { enabled: true, channel: None };
-        assert_eq!(echo_note_message(&[0x90, 60, 100], &no_ch), None);
+        assert_eq!(echo_message(&[0x90, 60, 100], &no_ch), None);
         let on = EchoConfig { enabled: true, channel: Some(0) };
-        assert_eq!(echo_note_message(&[0xB0, 7, 100], &on), None); // CC
-        assert_eq!(echo_note_message(&[0x90], &on), None); // trop court
+        assert_eq!(echo_message(&[0xB0, 7, 100], &on), None); // CC volume
+        assert_eq!(echo_message(&[0xC0, 5], &on), None); // program change
+        assert_eq!(echo_message(&[0x90], &on), None); // trop court
     }
 
     #[test]

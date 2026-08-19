@@ -2091,6 +2091,10 @@ async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> imp
                 for msg in live_input::program_change_messages(out_ch, prog as u8, bmsb as u8, blsb as u8) {
                     midi_send(&s, &msg);
                 }
+                // Pédale de sustain : relance son état courant pour que les
+                // notes écho durent aussi si la pédale était déjà enfoncée.
+                let sustain = s.live_input.sustain.load(std::sync::atomic::Ordering::Relaxed);
+                midi_send(&s, &[0xB0 | out_ch, 64, if sustain { 127 } else { 0 }]);
             }
         }
     }
