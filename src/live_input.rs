@@ -19,7 +19,10 @@ pub const DRUM_CHANNEL: u8 = 9;
 pub struct LiveInputState {
     /// Nom du port écouté (None si aucun clavier détecté).
     pub device: Mutex<Option<String>>,
-    /// Pitchs MIDI actuellement tenus (triés, sans doublons).
+    /// Pitchs MIDI actuellement tenus (sans doublons, ORDRE D'ARRIVÉE —
+    /// l'ordre dans lequel le pianiste plaque les notes est conservé pour
+    /// l'insertion fidèle dans le piano roll ; la reconnaissance d'accords
+    /// trie elle-même les classes de hauteur).
     pub active: Mutex<Vec<u8>>,
     /// Connexion gardée vivante (si dropped → l'écoute s'arrête).
     _conn: Mutex<Option<MidiInputConnection<()>>>,
@@ -37,7 +40,8 @@ impl LiveInputState {
 
 /// Applique un message MIDI entrant à l'état des notes tenues.
 /// Fonction pure (testable sans matériel) :
-/// - Note-on (vel > 0) → pitch actif
+/// - Note-on (vel > 0) → pitch actif (AJOUTÉ EN FIN, sans tri — l'ordre
+///   d'appui du pianiste est conservé)
 /// - Note-off OU note-on vel 0 → pitch inactif
 /// - Canal drums (9) → ignoré
 /// - Autres messages (CC, PC, pitch bend…) → ignorés
@@ -60,7 +64,6 @@ pub fn apply_midi_message(active: &mut Vec<u8>, msg: &[u8]) {
     if is_on {
         if !active.contains(&pitch) {
             active.push(pitch);
-            active.sort_unstable();
         }
     } else {
         active.retain(|&p| p != pitch);
@@ -127,12 +130,13 @@ mod tests {
     }
 
     #[test]
-    fn note_on_ajoute_et_trie() {
+    fn note_on_ajoute_dans_l_ordre_d_arrivee() {
         let mut a = Vec::new();
-        send(&mut a, 0x90, 67, 100);
-        send(&mut a, 0x90, 60, 100);
-        send(&mut a, 0x90, 64, 100);
-        assert_eq!(a, vec![60, 64, 67]); // trié
+        send(&mut a, 0x90, 67, 100); // G d'abord
+        send(&mut a, 0x90, 60, 100); // puis C
+        send(&mut a, 0x90, 64, 100); // puis E
+        // L'ordre d'appui du pianiste est CONSERVÉ (pas de tri) :
+        assert_eq!(a, vec![67, 60, 64]);
     }
 
     #[test]
