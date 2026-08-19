@@ -2079,6 +2079,53 @@ struct LiveEchoReq {
     channel: Option<u8>,
 }
 
+/// POST /tts — synthèse vocale (Piper local) : le texte est envoyé au serveur
+/// Piper (127.0.0.1:5001 par défaut, surchargeable via l'env PIPER_URL) et le
+/// WAV est renvoyé au navigateur (même origine → pas de CORS). Utilisé par
+/// l'aide intégrée (lecture des rubriques à voix haute).
+#[derive(Deserialize)]
+struct TtsReq {
+    text: String,
+}
+
+/// Appelle le serveur Piper et retourne le WAV brut.
+/// URL configurable (env PIPER_URL) — testable avec un serveur factice.
+fn piper_synthesize(text: &str, url: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let payload = serde_json::to_string(&serde_json::json!({ "text": text }))
+        .map_err(|e| format!("encodage requête TTS : {e}"))?;
+    let resp = ureq::post(url)
+        .set("Content-Type", "application/json")
+        .send_string(&payload)
+        .map_err(|e| format!("Piper injoignable : {e}"))?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("lecture réponse Piper : {e}"))?;
+    if bytes.is_empty() {
+        return Err("réponse Piper vide".into());
+    }
+    Ok(bytes)
+}
+
+async fn tts(Json(b): Json<TtsReq>) -> impl IntoResponse {
+    let url = std::env::var("PIPER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:5001/synthesize".to_string());
+    let text = b.text;
+    match tokio::task::spawn_blocking(move || piper_synthesize(&text, &url))
+        .await
+        .unwrap_or_else(|e| Err(format!("tâche TTS interrompue : {e}")))
+    {
+        Ok(wav) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "audio/wav")],
+            wav,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("TTS indisponible : {e}")).into_response(),
+    }
+}
+
 async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> impl IntoResponse {
     if b.enabled {
         if let Some(ch) = b.channel {
@@ -2152,6 +2199,7 @@ fn build_app(state: AppState) -> Router {
         .route("/midi-port", post(midi_port))
         .route("/live-input", get(live_input))
         .route("/live-echo", post(live_echo))
+        .route("/tts", post(tts))
         .route("/click", get(get_click).post(post_click))
         .route("/navig-click-start", post(navig_click_start))
         .route("/navig-click-stop", post(navig_click_stop))
@@ -2642,5 +2690,91 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         let _ = result; // évite un warning si le contenu n'est pas utilisé
+    }
+}
+
+#[cfg(test)]
+mod tts_tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    const FAKE_WAV: &[u8] = b"RIFF\x24\x00\x00\x00WAVEfmt ";
+
+    /// Démarre un mini-serveur HTTP factice : vérifie que la requête contient
+    /// le champ JSON "text" puis répond un WAV factice (comme Piper).
+    fn start_fake_piper() -> (String, thread::JoinHandle<()>, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/synthesize");
+        let received = Arc::new(AtomicBool::new(false));
+        let received2 = received.clone();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+                let mut buf = [0u8; 4096];
+                let mut total = 0;
+                // Lire jusqu'à recevoir le body JSON (la requête peut arriver
+                // en plusieurs morceaux : headers puis corps).
+                loop {
+                    match stream.read(&mut buf[total..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            total += n;
+                            if String::from_utf8_lossy(&buf[..total]).contains("Bonjour") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..total]);
+                if req.contains("\"text\"") && req.contains("Bonjour") {
+                    received2.store(true, Ordering::Relaxed);
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    FAKE_WAV.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(FAKE_WAV);
+            }
+        });
+        (url, handle, received)
+    }
+
+    #[test]
+    fn piper_synthesize_recupere_le_wav_du_serveur() {
+        let (url, handle, received) = start_fake_piper();
+        let wav = piper_synthesize("Bonjour", &url).unwrap();
+        handle.join().unwrap();
+        assert!(received.load(Ordering::Relaxed), "le mock doit recevoir le JSON avec le champ text");
+        assert_eq!(wav, FAKE_WAV);
+    }
+
+    #[test]
+    fn piper_synthesize_erreur_si_serveur_injoignable() {
+        let err = piper_synthesize("Bonjour", "http://127.0.0.1:1/synthesize");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn piper_synthesize_erreur_si_reponse_vide() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/synthesize");
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let err = piper_synthesize("Bonjour", &url);
+        handle.join().unwrap();
+        assert!(err.is_err());
     }
 }

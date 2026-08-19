@@ -17,6 +17,7 @@ midir = "0.9"
 rodio = "0.18"
 cpal = "0.15"
 hound = "3.5"
+ureq = "2"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 
