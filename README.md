@@ -35,6 +35,9 @@ En mode **standalone**, le serveur embarque le frontend complet :
   (banque + PC, canal drums natif) et renvoie les notes du pianiste sur son canal
   (il sonne avec l'instrument de la piste) ; **pédale de sustain (CC64)** relayée et
   état mémorisé (relancé à l'activation)
+- **🔴 Rec MIDI (mode Navig)** : `POST /rec-midi` / `GET /rec-midi-state` — enregistrement
+  du clavier du pianiste en événements **horodatés** (ordre d'appui conservé, repiquage
+  ignoré), restitués au frontend pour insertion dans le piano roll
 - **🗣 Synthèse vocale** : `POST /tts` — proxy vers le serveur **Piper** local
   (env `PIPER_URL`, défaut `http://127.0.0.1:5001/synthesize`) pour la lecture des
   rubriques d'aide à voix haute (WAV renvoyé, même origine → pas de CORS)
@@ -90,6 +93,7 @@ Ne pas définir `MIDI_PORT` sur un index invalide → serveur muet.
 | POST | `/render-notes` | Notes isolées (pré-remplissage piano roll) |
 | GET | `/live-input` | Notes tenues sur le clavier du pianiste (ordre d'arrivée) |
 | POST | `/live-echo` | Écho MIDI + program change de la piste sélectionnée |
+| POST | `/rec-midi` · GET `/rec-midi-state` | Enregistrement MIDI horodaté (mode Navig) |
 | POST | `/tts` | Synthèse vocale Piper (proxy, renvoie un WAV) |
 | GET | `/samples-list` · `/sample-file/:name` | Échantillons |
 | GET | `/rendered/:file` | Fichier de rendu généré |
@@ -116,7 +120,7 @@ Ne pas définir `MIDI_PORT` sur un index invalide → serveur muet.
 - `main.rs` — serveur Axum, routes, orchestration, TTS proxy
 - `midi.rs` — sortie MIDI (midir), FluidSynth
 - `live_input.rs` — écoute du clavier (notes tenues, ordre d'arrivée), écho MIDI,
-  pédale de sustain, program change
+  pédale de sustain, program change, **session d'enregistrement MIDI** (RecSession)
 - `patterns.rs` — patterns batterie
 - `walking.rs` — walking bass
 - `render.rs` — rendu WAV hors-ligne (hound + synthèse)
@@ -138,8 +142,9 @@ Ne pas définir `MIDI_PORT` sur un index invalide → serveur muet.
 cargo test --release
 ```
 
-72 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
-(ordre d'arrivée), écho MIDI, program change, TTS (serveur Piper factice).
+76 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
+(ordre d'arrivée), écho MIDI, program change, enregistrement MIDI, TTS
+(serveur Piper factice).
 
 ---
 
