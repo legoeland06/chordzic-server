@@ -260,8 +260,8 @@ struct AppState {
 /// port connecté à la liste des ports actuellement disponibles — s'il n'y est
 /// plus, on rouvre une connexion (init_midi) avant d'envoyer.
 /// Retourne true si le message est parti.
-fn midi_send(state: &AppState, msg: &[u8]) -> bool {
-    let mut guard = state.midi.lock().unwrap();
+fn midi_send_raw(midi: &Arc<Mutex<Option<MidiLink>>>, msg: &[u8]) -> bool {
+    let mut guard = midi.lock().unwrap();
 
     // Ports actuellement disponibles (énumération légère, ~µs)
     let available: Vec<String> = MidiOutput::new("chords-server-rs")
@@ -281,6 +281,10 @@ fn midi_send(state: &AppState, msg: &[u8]) -> bool {
     let Some(link) = guard.as_ref() else { return false; };
     let Ok(mut conn) = link.handle.lock() else { return false; };
     conn.send(msg).is_ok()
+}
+
+fn midi_send(state: &AppState, msg: &[u8]) -> bool {
+    midi_send_raw(&state.midi, msg)
 }
 
 // ─── Signature ──────────────────────────────────────────────────────────
@@ -2060,6 +2064,43 @@ async fn live_input(State(s): State<AppState>) -> impl IntoResponse {
     axum::Json(serde_json::json!({ "device": device, "active": active }))
 }
 
+/// POST /live-echo — écho des notes du pianiste vers la sortie MIDI avec le
+/// son de la piste sélectionnée (mode Navig, piste agrandie + toggle ✨).
+///
+/// Envoie immédiatement au périphérique le program change (banque + PC) de
+/// la piste cible sur son canal d'envoi (9 si piste drums), puis active
+/// l'écho : les notes tenues sur le clavier sont renvoyées sur ce canal —
+/// le pianiste entend le son de la piste en jouant.
+#[derive(Deserialize)]
+struct LiveEchoReq {
+    /// Écho activé ? (piste sélectionnée + bouton ✨ ON)
+    enabled: bool,
+    /// Canal de la piste sélectionnée (None = aucune piste).
+    channel: Option<u8>,
+}
+
+async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> impl IntoResponse {
+    if b.enabled {
+        if let Some(ch) = b.channel {
+            let tracks = s.live.tracks.lock().unwrap();
+            if let Some(t) = tracks.iter().find(|t| t.channel == ch) {
+                let out_ch = if t.drums.load(std::sync::atomic::Ordering::Relaxed) && ch != 9 { 9 } else { ch };
+                let prog = t.program.load(std::sync::atomic::Ordering::Relaxed);
+                let bmsb = t.bank_msb.load(std::sync::atomic::Ordering::Relaxed);
+                let blsb = t.bank_lsb.load(std::sync::atomic::Ordering::Relaxed);
+                for msg in live_input::program_change_messages(out_ch, prog as u8, bmsb as u8, blsb as u8) {
+                    midi_send(&s, &msg);
+                }
+            }
+        }
+    }
+    *s.live_input.echo.lock().unwrap() = live_input::EchoConfig {
+        enabled: b.enabled,
+        channel: b.channel,
+    };
+    axum::Json(serde_json::json!({ "ok": true }))
+}
+
 /// Sert un fichier sample (~/samples/drums/<name>) au navigateur — utilisé
 /// par la boucle sample du mode Navig (lecture Web Audio côté client).
 async fn sample_file(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
@@ -2106,6 +2147,7 @@ fn build_app(state: AppState) -> Router {
         .route("/midi-ports", get(midi_ports))
         .route("/midi-port", post(midi_port))
         .route("/live-input", get(live_input))
+        .route("/live-echo", post(live_echo))
         .route("/click", get(get_click).post(post_click))
         .route("/navig-click-start", post(navig_click_start))
         .route("/navig-click-stop", post(navig_click_stop))
@@ -2194,6 +2236,13 @@ async fn main() {
 
     // Écoute du clavier du pianiste (reconnaissance d'accords — mode Live).
     live_input::start(&state.live_input);
+
+    // Émetteur d'écho (mode Navig ✨) : les notes du pianiste sont renvoyées
+    // vers la sortie MIDI réelle (avec reconnexion automatique).
+    let midi_out = state.midi.clone();
+    live_input::set_echo_sender(&state.live_input, Box::new(move |msg: &[u8]| {
+        midi_send_raw(&midi_out, msg);
+    }));
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
 

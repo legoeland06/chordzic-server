@@ -15,6 +15,62 @@ use std::sync::{Arc, Mutex};
 /// pour la reconnaissance d'accords (percussions ≠ accords).
 pub const DRUM_CHANNEL: u8 = 9;
 
+/// Configuration de l'écho des notes du pianiste vers la sortie MIDI
+/// (mode Navig, toggle ✨) : le Roland joue avec le son (program) de la
+/// piste sélectionnée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchoConfig {
+    /// Écho activé (piste sélectionnée + bouton ✨ ON).
+    pub enabled: bool,
+    /// Canal de la piste cible (None = aucune piste sélectionnée).
+    pub channel: Option<u8>,
+}
+
+impl Default for EchoConfig {
+    fn default() -> Self {
+        Self { enabled: false, channel: None }
+    }
+}
+
+/// Transforme un message de note (note-on/note-off) pour l'écho : le canal
+/// est remplacé par celui de la piste cible. Retourne None si l'écho est
+/// désactivé, sans piste cible, ou si le message n'est pas une note.
+/// Fonction pure (testable sans matériel).
+pub fn echo_note_message(msg: &[u8], echo: &EchoConfig) -> Option<Vec<u8>> {
+    if !echo.enabled || msg.len() < 2 {
+        return None;
+    }
+    let channel = echo.channel?;
+    let high = msg[0] & 0xF0;
+    if high != 0x90 && high != 0x80 {
+        return None;
+    }
+    let mut out = msg.to_vec();
+    out[0] = high | (channel & 0x0F);
+    Some(out)
+}
+
+/// Messages à envoyer pour faire sonner une piste avec son instrument :
+/// program change (ou bank select + PC pour les banques GM2). Le canal
+/// drums natif (9) n'a pas de PC (kit standard) sauf banque explicite.
+/// Fonction pure (testable sans matériel).
+pub fn program_change_messages(
+    out_channel: u8,
+    program: u8,
+    bank_msb: u8,
+    bank_lsb: u8,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    if out_channel != 9 {
+        out.push(vec![0xC0 | out_channel, program]);
+    } else if bank_msb != 0 || bank_lsb != 0 {
+        out.push(vec![0xB0 | 9, 0, bank_msb]);
+        out.push(vec![0xB0 | 9, 32, bank_lsb]);
+        out.push(vec![0xC0 | 9, program]);
+    }
+    out
+}
+
 /// État partagé des notes tenues sur le clavier.
 pub struct LiveInputState {
     /// Nom du port écouté (None si aucun clavier détecté).
@@ -26,6 +82,10 @@ pub struct LiveInputState {
     pub active: Mutex<Vec<u8>>,
     /// Connexion gardée vivante (si dropped → l'écoute s'arrête).
     _conn: Mutex<Option<MidiInputConnection<()>>>,
+    /// Écho des notes du pianiste vers la sortie MIDI (mode Navig ✨).
+    pub echo: Mutex<EchoConfig>,
+    /// Émetteur MIDI (configuré par main.rs avec la sortie réelle).
+    sender: Mutex<Option<Box<dyn Fn(&[u8]) + Send + Sync>>>,
 }
 
 impl LiveInputState {
@@ -34,8 +94,16 @@ impl LiveInputState {
             device: Mutex::new(None),
             active: Mutex::new(Vec::new()),
             _conn: Mutex::new(None),
+            echo: Mutex::new(EchoConfig::default()),
+            sender: Mutex::new(None),
         })
     }
+}
+
+/// Configure l'émetteur MIDI utilisé par l'écho (la sortie réelle,
+/// gérée par main.rs — reconnexion automatique incluse).
+pub fn set_echo_sender(shared: &Arc<LiveInputState>, sender: Box<dyn Fn(&[u8]) + Send + Sync>) {
+    *shared.sender.lock().unwrap() = Some(sender);
 }
 
 /// Applique un message MIDI entrant à l'état des notes tenues.
@@ -107,6 +175,14 @@ pub fn start(shared: &Arc<LiveInputState>) {
         move |_, msg, _| {
             if let Ok(mut a) = shared2.active.lock() {
                 apply_midi_message(&mut a, msg);
+            }
+            // Écho vers la sortie (mode Navig ✨) : le pianiste entend le son
+            // (program) de la piste sélectionnée sur le canal de celle-ci.
+            let cfg = shared2.echo.lock().unwrap();
+            if let Some(out) = echo_note_message(msg, &cfg) {
+                if let Some(sender) = shared2.sender.lock().unwrap().as_ref() {
+                    sender(&out);
+                }
             }
         },
         (),
@@ -180,5 +256,44 @@ mod tests {
         let mut a = vec![60];
         send(&mut a, 0x80, 72, 64); // note jamais jouée
         assert_eq!(a, vec![60]);
+    }
+
+    // ── Écho (mode Navig ✨) ──
+
+    #[test]
+    fn echo_remplace_le_canal_de_la_note() {
+        let cfg = EchoConfig { enabled: true, channel: Some(5) };
+        let out = echo_note_message(&[0x90, 60, 100], &cfg).unwrap();
+        assert_eq!(out, vec![0x95, 60, 100]); // canal 0 → 5, note intacte
+        let off = echo_note_message(&[0x80, 64, 64], &cfg).unwrap();
+        assert_eq!(off, vec![0x85, 64, 64]);
+    }
+
+    #[test]
+    fn echo_desactive_sans_piste_ou_sur_non_note() {
+        let off = EchoConfig { enabled: false, channel: Some(0) };
+        assert_eq!(echo_note_message(&[0x90, 60, 100], &off), None);
+        let no_ch = EchoConfig { enabled: true, channel: None };
+        assert_eq!(echo_note_message(&[0x90, 60, 100], &no_ch), None);
+        let on = EchoConfig { enabled: true, channel: Some(0) };
+        assert_eq!(echo_note_message(&[0xB0, 7, 100], &on), None); // CC
+        assert_eq!(echo_note_message(&[0x90], &on), None); // trop court
+    }
+
+    #[test]
+    fn program_change_simple_sur_canal_non_drums() {
+        let msgs = program_change_messages(2, 51, 0, 0);
+        assert_eq!(msgs, vec![vec![0xC2, 51]]);
+    }
+
+    #[test]
+    fn program_change_drums_avec_banque() {
+        let msgs = program_change_messages(9, 128, 1, 0);
+        assert_eq!(msgs, vec![vec![0xB9, 0, 1], vec![0xB9, 32, 0], vec![0xC9, 128]]);
+    }
+
+    #[test]
+    fn program_change_drums_sans_banque_vide() {
+        assert_eq!(program_change_messages(9, 1, 0, 0), Vec::<Vec<u8>>::new());
     }
 }
