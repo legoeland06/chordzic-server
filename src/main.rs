@@ -2126,6 +2126,34 @@ async fn tts(Json(b): Json<TtsReq>) -> impl IntoResponse {
     }
 }
 
+/// POST /rec-midi — démarre/arrête l'enregistrement MIDI (mode Navig, Rec).
+/// À l'arrêt, renvoie les notes enregistrées (pitch, on_ms, off_ms).
+#[derive(Deserialize)]
+struct RecMidiReq {
+    enabled: bool,
+}
+
+async fn rec_midi(State(s): State<AppState>, Json(b): Json<RecMidiReq>) -> impl IntoResponse {
+    let mut rec = s.live_input.rec.lock().unwrap();
+    if b.enabled {
+        if rec.is_none() {
+            *rec = Some(live_input::RecSession::new());
+        }
+        axum::Json(serde_json::json!({ "ok": true }))
+    } else {
+        let notes = rec.take().map(|sess| sess.notes).unwrap_or_default();
+        axum::Json(serde_json::json!({ "ok": true, "notes": notes }))
+    }
+}
+
+/// GET /rec-midi-state — notes en cours d'enregistrement (polling direct pour
+/// l'affichage temps réel dans le piano roll).
+async fn rec_midi_state(State(s): State<AppState>) -> impl IntoResponse {
+    let rec = s.live_input.rec.lock().unwrap();
+    let notes = rec.as_ref().map(|r| r.notes.clone()).unwrap_or_default();
+    axum::Json(serde_json::json!({ "notes": notes }))
+}
+
 async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> impl IntoResponse {
     if b.enabled {
         if let Some(ch) = b.channel {
@@ -2199,6 +2227,8 @@ fn build_app(state: AppState) -> Router {
         .route("/midi-port", post(midi_port))
         .route("/live-input", get(live_input))
         .route("/live-echo", post(live_echo))
+        .route("/rec-midi", post(rec_midi))
+        .route("/rec-midi-state", get(rec_midi_state))
         .route("/tts", post(tts))
         .route("/click", get(get_click).post(post_click))
         .route("/navig-click-start", post(navig_click_start))

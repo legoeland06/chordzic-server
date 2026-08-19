@@ -32,6 +32,73 @@ impl Default for EchoConfig {
     }
 }
 
+// ── Enregistrement MIDI (mode Navig, Rec MIDI) ─────────────────────────
+
+/// Note enregistrée pendant une session Rec MIDI.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RecNote {
+    pub pitch: u8,
+    /// ms depuis le début de la session (note-on).
+    pub on_ms: u64,
+    /// ms de la note-off (None = encore tenue).
+    pub off_ms: Option<u64>,
+}
+
+/// Session d'enregistrement MIDI : accumulateur d'événements horodatés.
+pub struct RecSession {
+    /// Instant de début (référence des timestamps).
+    pub start: std::time::Instant,
+    /// Notes en cours d'enregistrement (ordre d'appui conservé).
+    pub notes: Vec<RecNote>,
+    /// pitch → index dans `notes` (retrouver la note à la relâche).
+    pub held: std::collections::HashMap<u8, usize>,
+}
+
+impl RecSession {
+    pub fn new() -> Self {
+        Self { start: std::time::Instant::now(), notes: Vec::new(), held: std::collections::HashMap::new() }
+    }
+
+    /// ms écoulées depuis le début de la session.
+    pub fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+}
+
+/// Applique un message de note (note-on/off) à la session d'enregistrement.
+/// Fonction pure (testable sans matériel) :
+/// - note-on (vel > 0) → nouvelle note (repiquage sur une note tenue ignoré) ;
+/// - note-off / note-on vel 0 → ferme la durée de la note tenue ;
+/// - autres messages (CC, PC…) → ignorés.
+pub fn apply_rec_message(
+    notes: &mut Vec<RecNote>,
+    held: &mut std::collections::HashMap<u8, usize>,
+    msg: &[u8],
+    now_ms: u64,
+) {
+    if msg.len() < 2 {
+        return;
+    }
+    let high = msg[0] & 0xF0;
+    let pitch = msg[1];
+    let is_on = match high {
+        0x90 => msg.get(2).copied().unwrap_or(127) > 0,
+        0x80 => false,
+        _ => return,
+    };
+    if is_on {
+        if !held.contains_key(&pitch) {
+            held.insert(pitch, notes.len());
+            notes.push(RecNote { pitch, on_ms: now_ms, off_ms: None });
+        }
+    } else if let Some(&idx) = held.get(&pitch) {
+        if notes[idx].off_ms.is_none() {
+            notes[idx].off_ms = Some(now_ms);
+        }
+        held.remove(&pitch);
+    }
+}
+
 /// Transforme un message pour l'écho vers la piste cible : le canal est
 /// remplacé par celui de la piste. Sont relayés les NOTES (note-on/off) et
 /// la PÉDALE DE SUSTAIN (CC64) — les autres CC/PC/pitch bend ne sont pas
@@ -91,6 +158,8 @@ pub struct LiveInputState {
     /// État courant de la pédale de sustain (CC64) — relancé à l'activation
     /// de l'écho pour que le sustain s'applique aussi aux notes renvoyées.
     pub sustain: std::sync::atomic::AtomicBool,
+    /// Session d'enregistrement MIDI (mode Navig, Rec) — None si inactive.
+    pub rec: Mutex<Option<RecSession>>,
     /// Émetteur MIDI (configuré par main.rs avec la sortie réelle).
     sender: Mutex<Option<Box<dyn Fn(&[u8]) + Send + Sync>>>,
 }
@@ -103,6 +172,7 @@ impl LiveInputState {
             _conn: Mutex::new(None),
             echo: Mutex::new(EchoConfig::default()),
             sustain: std::sync::atomic::AtomicBool::new(false),
+            rec: Mutex::new(None),
             sender: Mutex::new(None),
         })
     }
@@ -196,6 +266,14 @@ pub fn start(shared: &Arc<LiveInputState>) {
             if let Some(out) = echo_message(msg, &cfg) {
                 if let Some(sender) = shared2.sender.lock().unwrap().as_ref() {
                     sender(&out);
+                }
+            }
+            // Enregistrement MIDI (mode Navig, Rec) : les notes jouées sont
+            // horodatées depuis le début de la session.
+            if let Ok(mut rec) = shared2.rec.lock() {
+                if let Some(session) = rec.as_mut() {
+                    let now = session.now_ms();
+                    apply_rec_message(&mut session.notes, &mut session.held, msg, now);
                 }
             }
         },
@@ -314,6 +392,57 @@ mod tests {
     fn program_change_drums_avec_banque() {
         let msgs = program_change_messages(9, 128, 1, 0);
         assert_eq!(msgs, vec![vec![0xB9, 0, 1], vec![0xB9, 32, 0], vec![0xC9, 128]]);
+    }
+
+    // ── Enregistrement MIDI (Rec) ──
+
+    fn rec_send(notes: &mut Vec<RecNote>, held: &mut std::collections::HashMap<u8, usize>, status: u8, d1: u8, d2: u8, now: u64) {
+        apply_rec_message(notes, held, &[status, d1, d2], now);
+    }
+
+    #[test]
+    fn rec_note_on_cree_et_off_ferme_la_duree() {
+        let mut notes = Vec::new();
+        let mut held = std::collections::HashMap::new();
+        rec_send(&mut notes, &mut held, 0x90, 60, 100, 0);   // C4 à t=0
+        rec_send(&mut notes, &mut held, 0x90, 64, 100, 500); // E4 à t=500ms
+        rec_send(&mut notes, &mut held, 0x80, 60, 64, 1000); // C4 relâché
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0], RecNote { pitch: 60, on_ms: 0, off_ms: Some(1000) });
+        assert_eq!(notes[1], RecNote { pitch: 64, on_ms: 500, off_ms: None });
+        assert!(!held.contains_key(&60));
+        assert!(held.contains_key(&64));
+    }
+
+    #[test]
+    fn rec_conserve_l_ordre_d_appui() {
+        let mut notes = Vec::new();
+        let mut held = std::collections::HashMap::new();
+        rec_send(&mut notes, &mut held, 0x90, 67, 100, 0);
+        rec_send(&mut notes, &mut held, 0x90, 60, 100, 50);
+        rec_send(&mut notes, &mut held, 0x90, 64, 100, 100);
+        assert_eq!(notes.iter().map(|n| n.pitch).collect::<Vec<_>>(), vec![67, 60, 64]);
+    }
+
+    #[test]
+    fn rec_repiquage_dune_note_tenue_ignore() {
+        let mut notes = Vec::new();
+        let mut held = std::collections::HashMap::new();
+        rec_send(&mut notes, &mut held, 0x90, 60, 100, 0);
+        rec_send(&mut notes, &mut held, 0x90, 60, 100, 100); // repiquage
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn rec_note_on_vel_0_ferme_et_non_note_ignore() {
+        let mut notes = Vec::new();
+        let mut held = std::collections::HashMap::new();
+        rec_send(&mut notes, &mut held, 0x90, 60, 100, 0);
+        rec_send(&mut notes, &mut held, 0x90, 60, 0, 200); // note-on vel 0 = off
+        assert_eq!(notes[0].off_ms, Some(200));
+        rec_send(&mut notes, &mut held, 0xB0, 7, 100, 300); // CC ignoré
+        rec_send(&mut notes, &mut held, 0x90, 61, 0, 400); // off d'une note jamais jouée
+        assert_eq!(notes.len(), 1);
     }
 
     #[test]
