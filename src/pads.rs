@@ -138,22 +138,33 @@ pub enum PadPlayError {
     Spawn(String),
 }
 
-/// Args ffplay : sans fenêtre, auto-exit, volume 0-100.
-pub fn ffplay_args(volume: u8) -> Vec<String> {
-    vec![
+/// Args ffplay : sans fenêtre, auto-exit, volume 0-100 ; `-loop 0` = boucle
+/// infinie (mode loop par défaut du 64-pad).
+pub fn ffplay_args(volume: u8, looping: bool) -> Vec<String> {
+    let mut args = vec![
         "-nodisp".to_string(),
         "-autoexit".to_string(),
         "-loglevel".to_string(),
         "quiet".to_string(),
         "-volume".to_string(),
         volume.min(100).to_string(),
-    ]
+    ];
+    if looping {
+        args.push("-loop".to_string());
+        args.push("0".to_string());
+    }
+    args
 }
 
 /// Déclenche la lecture d'un sample de pad via ffplay — RETRIGGER : le
 /// process précédent du MÊME fichier est tué avant le nouveau spawn.
 /// `players` : map fichier → process en cours (état partagé du serveur).
-pub fn trigger_pad(file: &str, volume: u8, players: &Mutex<HashMap<String, Child>>) -> Result<(), PadPlayError> {
+pub fn trigger_pad(
+    file: &str,
+    volume: u8,
+    looping: bool,
+    players: &Mutex<HashMap<String, Child>>,
+) -> Result<(), PadPlayError> {
     let Some(path) = path_for(file) else { return Err(PadPlayError::BadName); };
     if !path.is_file() {
         return Err(PadPlayError::NotFound);
@@ -163,7 +174,7 @@ pub fn trigger_pad(file: &str, volume: u8, players: &Mutex<HashMap<String, Child
         let _ = old.kill();
     }
     let mut cmd = Command::new("ffplay");
-    cmd.args(ffplay_args(volume));
+    cmd.args(ffplay_args(volume, looping));
     cmd.arg(&path);
     match cmd.spawn() {
         Ok(child) => {
@@ -188,22 +199,27 @@ mod tests {
 
     #[test]
     fn ffplay_args_volume_borne() {
-        let a = ffplay_args(80);
+        let a = ffplay_args(80, false);
         assert_eq!(a[0], "-nodisp");
         assert!(a.iter().any(|s| s == "-volume"));
         assert!(a.iter().any(|s| s == "80"));
-        assert!(ffplay_args(200).iter().any(|s| s == "100")); // borné
-        assert!(ffplay_args(0).iter().any(|s| s == "0"));
+        assert!(ffplay_args(200, false).iter().any(|s| s == "100")); // borné
+        assert!(ffplay_args(0, false).iter().any(|s| s == "0"));
+        // Mode loop : -loop 0 ajouté (boucle infinie), absent sinon
+        let l = ffplay_args(80, true);
+        assert!(l.iter().any(|s| s == "-loop"));
+        assert!(l.iter().any(|s| s == "0"));
+        assert!(!a.iter().any(|s| s == "-loop"));
     }
 
     #[test]
     fn trigger_pad_valide_nom_et_existence() {
         let players = Mutex::new(HashMap::new());
         // Nom invalide → BadName (aucun spawn)
-        assert_eq!(trigger_pad("autre.wav", 100, &players), Err(PadPlayError::BadName));
-        assert_eq!(trigger_pad("pad_1/../../x", 100, &players), Err(PadPlayError::BadName));
+        assert_eq!(trigger_pad("autre.wav", 100, false, &players), Err(PadPlayError::BadName));
+        assert_eq!(trigger_pad("pad_1/../../x", 100, false, &players), Err(PadPlayError::BadName));
         // Nom valide mais fichier absent → NotFound
-        assert_eq!(trigger_pad("pad_zzz_inexistant.wav", 100, &players), Err(PadPlayError::NotFound));
+        assert_eq!(trigger_pad("pad_zzz_inexistant.wav", 100, false, &players), Err(PadPlayError::NotFound));
     }
 
     #[test]

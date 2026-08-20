@@ -2662,19 +2662,23 @@ async fn pad_sample(axum::extract::Path(name): axum::extract::Path<String>) -> i
 
 /// POST /pad-trigger — joue un sample de pad côté SERVEUR (ffplay, tous
 /// formats, sortie audio du PC). Retrigger : le process du même fichier est
-/// tué avant le nouveau spawn. Le frontend choisit le chemin de lecture
-/// (navigateur Web Audio ou serveur) ; la quantification reste gérée par le
-/// métronome navigateur (le serveur ne fait que jouer).
+/// tué avant le nouveau spawn. `loop` (défaut vrai — mode loop par défaut
+/// du 64-pad) : ffplay -loop 0, le sample boucle jusqu'au ■ Stop. Le
+/// frontend choisit le chemin de lecture (navigateur Web Audio ou serveur).
 #[derive(serde::Deserialize)]
 struct PadTriggerReq {
     /// Nom du sample stocké (pad_*.ext) — validé côté serveur.
     file: String,
     /// Volume 0-100 (ffplay -volume).
     volume: Option<u8>,
+    /// Boucle le sample en continu (défaut : vrai) — `loop` est un mot-clé
+    /// Rust, le champ est `looping` (JSON : `loop`).
+    #[serde(rename = "loop")]
+    looping: Option<bool>,
 }
 
 async fn pad_trigger(State(s): State<AppState>, Json(b): Json<PadTriggerReq>) -> impl IntoResponse {
-    match pads::trigger_pad(&b.file, b.volume.unwrap_or(100), &s.pad_players) {
+    match pads::trigger_pad(&b.file, b.volume.unwrap_or(100), b.looping.unwrap_or(true), &s.pad_players) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(pads::PadPlayError::BadName) => (StatusCode::BAD_REQUEST, "nom de fichier invalide").into_response(),
         Err(pads::PadPlayError::NotFound) => (StatusCode::NOT_FOUND, "sample introuvable").into_response(),
