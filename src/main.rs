@@ -3617,6 +3617,7 @@ mod tests {
     /// test d'intégration : la machine de dev a Surge XT installé.
     #[tokio::test]
     async fn api_vst3_presets_liste_les_presets_surge() {
+        let _guard = live_instrument::HOME_LOCK.lock().unwrap(); // $HOME partagé
         let app = build_app(test_state());
         let (s, body) = req(&app, "GET", "/vst3-presets", None).await;
         assert_eq!(s, StatusCode::OK);
@@ -3940,6 +3941,7 @@ mod tests {
     /// grilles de l'utilisateur).
     #[tokio::test]
     async fn api_grilles_cycle_de_vie() {
+        let _guard = live_instrument::HOME_LOCK.lock().unwrap(); // $HOME partagé
         let tmp = tempfile::tempdir().unwrap();
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", tmp.path());

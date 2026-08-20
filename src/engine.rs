@@ -240,7 +240,15 @@ pub fn render_sfz(
         .map_err(|e| format!("Impossible de lire le WAV sfizz : {e}"))?;
     let _ = std::fs::remove_file(&wav_path);
 
-    Ok(fit_duration(&wav, duration_sec))
+    // Lecture en f32 (sfizz écrit du i16 ou du f32 selon la version), puis
+    // normalisation RMS bornée par la crête (jamais de clipping — la
+    // dynamique du piano/des percussions est préservée), réécriture i16,
+    // ajustement de la durée exacte.
+    let (left, right) = read_stereo_f32(&wav)?;
+    let (left, right) = normalize_channels(&left, &right, -24.0);
+    let wav16 = write_i16_wav_stereo(&left, &right, 44_100)?;
+
+    Ok(fit_duration(&wav16, duration_sec))
 }
 
 /// Rendu VST3 : notes → événements datés (frames) → plugin → WAV.
@@ -364,32 +372,13 @@ pub fn render_vst3(
         .stop_processing()
         .map_err(|e| format!("stop_processing : {e}"))?;
 
-    // Stéréo i16 (mix des canaux du plugin — Surge sort 6 canaux, on prend L/R).
-    let left: Vec<f32> = channels[0].clone();
-    let right: Vec<f32> = channels
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| left.clone());
-    use hound::{SampleFormat, WavSpec, WavWriter};
-    let spec = WavSpec {
-        channels: 2,
-        sample_rate: sample_rate as u32,
-        bits_per_sample: 16,
-        sample_format: SampleFormat::Int,
-    };
-    let mut buf = Vec::new();
-    if let Ok(mut w) = WavWriter::new(std::io::Cursor::new(&mut buf), spec) {
-        for i in 0..left.len().min(right.len()) {
-            let l = (left[i].clamp(-1.0, 1.0) * 32767.0) as i16;
-            let r = (right[i].clamp(-1.0, 1.0) * 32767.0) as i16;
-            let _ = w.write_sample(l);
-            let _ = w.write_sample(r);
-        }
-        let _ = w.finalize();
-    }
-    if buf.is_empty() {
-        return Err("Écriture du WAV VST3 impossible".into());
-    }
+    // Stéréo i16 (mix des canaux du plugin — Surge sort 6 canaux, on prend L/R),
+    // normalisée RMS bornée par la crête (comme les banques SFZ : niveau perçu
+    // comparable, dynamique préservée, jamais de clipping).
+    let left = channels.first().cloned().unwrap_or_default();
+    let right = channels.get(1).cloned().unwrap_or_else(|| left.clone());
+    let (left, right) = normalize_channels(&left, &right, -24.0);
+    let buf = write_i16_wav_stereo(&left, &right, sample_rate as u32)?;
     Ok(fit_duration(&buf, duration_sec))
 }
 
@@ -452,19 +441,9 @@ pub fn render_wav_with_engine(
                 crate::render::render_wav_raw(&smf, p.as_str(), duration_sec)?
             }
         };
-        // Les banques SFZ (ex. piano Salamander, cymbales enregistrées en
-        // douceur) et les patches VST3 ont des niveaux internes très variables.
-        // Normalisation RMS par piste (-20 dBFS) : chaque instrument externe
-        // sort avec un niveau PERÇU comparable, quelle que soit la douceur de
-        // ses samples — la balance entre pistes devient prévisible (le volume
-        // de piste reste le réglage fin). Soft clip tanh contre les transients.
-        // (Le mix final re-normalise au pic — la balance RMS est conservée.)
-        // Les SoundFonts GM (FluidSynth / Sf2) sont déjà équilibrées : pas de
-        // normalisation (même comportement que FluidSynth).
-        let wav = match &engine {
-            Engine::FluidSynth | Engine::Sf2(_) => wav,
-            Engine::Sfz(_) | Engine::Vst3(_) => normalize_rms(&wav, -20.0),
-        };
+        // Les moteurs Sfz/VST3 normalisent eux-mêmes leur sortie (RMS bornée
+        // par la crête — voir normalize_channels) ; FluidSynth/Sf2 sortent
+        // déjà équilibrés. Le mix final re-normalise au pic (mix_tracks).
         let wav = if t.fx.is_off() {
             wav
         } else {
@@ -525,9 +504,10 @@ pub fn mix_tracks(tracks: &[crate::render::RenderedTrack], master_vol: u8) -> Re
     for i in 0..ml.len() {
         pic = pic.max(ml[i].abs()).max(mr[i].abs());
     }
-    // Normalisation au pic ~0.9 (au lieu de 0.5) : le rendu instruments
-    // libres sort avec un niveau comparable à FluidSynth, pas en dessous.
-    let norm = if pic > 1e-6 { 0.9 / pic } else { 1.0 };
+    // Normalisation au pic ~0.8 (marge −1,9 dBFS) : niveau comparable à
+    // FluidSynth avec du headroom — les attaques ne saturent pas les
+    // enceintes (les pistes individuelles sont déjà bornées à 0,85).
+    let norm = if pic > 1e-6 { 0.8 / pic } else { 1.0 };
     let gain = norm * (master_vol as f32) / 127.0;
 
     let spec = WavSpec {
@@ -550,47 +530,129 @@ pub fn mix_tracks(tracks: &[crate::render::RenderedTrack], master_vol: u8) -> Re
     Ok(crate::render::fade_out_wav(&buf, 30))
 }
 
-/// Normalise un WAV PCM i16 à un niveau RMS cible (dBFS, négatif) — gain
-/// uniforme + saturation douce tanh (les transients ne clippent pas dur).
-/// Spec conservée. WAV invalide/silencieux → renvoyé tel quel.
-pub fn normalize_rms(wav: &[u8], target_db: f32) -> Vec<u8> {
-    use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
-    let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
-        return wav.to_vec();
-    };
+/// Lit un WAV (Int 8/16/24/32 ou Float, mono ou multi-canaux) en stéréo f32 :
+/// L = canal 1, R = canal 2 (mono → dupliqué, canaux supplémentaires ignorés).
+pub fn read_stereo_f32(wav: &[u8]) -> Result<(Vec<f32>, Vec<f32>), String> {
+    use hound::{SampleFormat, WavReader};
+    let mut reader = WavReader::new(std::io::Cursor::new(wav)).map_err(|e| e.to_string())?;
     let spec = reader.spec();
-    let samples: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
-    if samples.is_empty() {
-        return wav.to_vec();
+    let ch = spec.channels.max(1) as usize;
+    let mut left = Vec::new();
+    let mut right = Vec::new();
+    let mut idx = 0usize;
+    match spec.sample_format {
+        SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                let s = s.map_err(|e| e.to_string())?;
+                if idx % ch == 0 { left.push(s); }
+                else if idx % ch == 1 { right.push(s); }
+                idx += 1;
+            }
+        }
+        SampleFormat::Int => match spec.bits_per_sample {
+            8 => {
+                for s in reader.samples::<i8>() {
+                    let s = s.map_err(|e| e.to_string())? as f32 / 128.0;
+                    if idx % ch == 0 { left.push(s); }
+                    else if idx % ch == 1 { right.push(s); }
+                    idx += 1;
+                }
+            }
+            16 => {
+                for s in reader.samples::<i16>() {
+                    let s = s.map_err(|e| e.to_string())? as f32 / 32768.0;
+                    if idx % ch == 0 { left.push(s); }
+                    else if idx % ch == 1 { right.push(s); }
+                    idx += 1;
+                }
+            }
+            24 => {
+                for s in reader.samples::<i32>() {
+                    let s = s.map_err(|e| e.to_string())? as f32 / 8_388_608.0;
+                    if idx % ch == 0 { left.push(s); }
+                    else if idx % ch == 1 { right.push(s); }
+                    idx += 1;
+                }
+            }
+            32 => {
+                for s in reader.samples::<i32>() {
+                    let s = s.map_err(|e| e.to_string())? as f32 / 2_147_483_648.0;
+                    if idx % ch == 0 { left.push(s); }
+                    else if idx % ch == 1 { right.push(s); }
+                    idx += 1;
+                }
+            }
+            b => return Err(format!("bits par échantillon non gérés : {b}")),
+        },
     }
-    let sum_sq: f64 = samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum();
-    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
-    if rms < 1.0 {
-        return wav.to_vec();
+    if ch == 1 {
+        // Mono : R = copie de L
+        let r = left.clone();
+        return Ok((left, r));
     }
-    let target = 10f32.powf(target_db / 20.0) * 32767.0; // cible en unités i16
-    let gain = target / rms;
+    Ok((left, right))
+}
 
-    let out_spec = WavSpec {
-        channels: spec.channels,
-        sample_rate: spec.sample_rate,
+/// Normalise des canaux stéréo f32 à un niveau RMS cible (dBFS, négatif), en
+/// BORNANT le gain par la crête (headroom 0,9) : les transients forts (piano,
+/// percussions) ne sont JAMAIS poussés dans un soft clip — la dynamique est
+/// préservée, pas de distorsion. Les instruments doux (cymbales échantillonnées
+/// en douceur) reçoivent le gain RMS complet → balance prévisible.
+pub fn normalize_channels(left: &[f32], right: &[f32], target_db: f32) -> (Vec<f32>, Vec<f32>) {
+    let n = left.len().min(right.len());
+    if n == 0 {
+        return (left.to_vec(), right.to_vec());
+    }
+    let mut sum_sq = 0f64;
+    let mut peak = 0f32;
+    for i in 0..n {
+        let l = left[i] as f64;
+        let r = right[i] as f64;
+        sum_sq += l * l + r * r;
+        peak = peak.max(left[i].abs()).max(right[i].abs());
+    }
+    let rms = (sum_sq / (2.0 * n as f64)).sqrt() as f32;
+    if rms < 1e-6 || peak < 1e-6 {
+        return (left.to_vec(), right.to_vec());
+    }
+    let target = 10f32.powf(target_db / 20.0);
+    let gain_rms = target / rms;
+    // Limite de crête : jamais plus de 0,85 (≈ −1,4 dBFS) après gain —
+    // les attaques (piano, percussions) gardent de la marge pour le mix.
+    let gain = gain_rms.min(0.85 / peak);
+    let mut l = Vec::with_capacity(n);
+    let mut r = Vec::with_capacity(n);
+    for i in 0..n {
+        l.push(left[i] * gain);
+        r.push(right[i] * gain);
+    }
+    (l, r)
+}
+
+/// Écrit un WAV stéréo i16 depuis des canaux f32 (clamp à ±1 — jamais de wrap).
+pub fn write_i16_wav_stereo(left: &[f32], right: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
+    use hound::{SampleFormat, WavSpec, WavWriter};
+    let spec = WavSpec {
+        channels: 2,
+        sample_rate,
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    let mut out = Vec::new();
-    if let Ok(mut w) = WavWriter::new(std::io::Cursor::new(&mut out), out_spec) {
-        for &s in &samples {
-            let v = (s as f32 / 32767.0) * gain;
-            let v = if v.abs() > 1.0 { v.tanh() } else { v };
-            let _ = w.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16);
+    let mut buf = Vec::new();
+    if let Ok(mut w) = WavWriter::new(std::io::Cursor::new(&mut buf), spec) {
+        let n = left.len().min(right.len());
+        for i in 0..n {
+            let l = (left[i].clamp(-1.0, 1.0) * 32767.0) as i16;
+            let r = (right[i].clamp(-1.0, 1.0) * 32767.0) as i16;
+            let _ = w.write_sample(l);
+            let _ = w.write_sample(r);
         }
         let _ = w.finalize();
     }
-    if out.is_empty() {
-        wav.to_vec()
-    } else {
-        out
+    if buf.is_empty() {
+        return Err("Écriture du WAV impossible".into());
     }
+    Ok(buf)
 }
 
 /// Scan récursif des fichiers `.sfz` dans un dossier d'instruments.
@@ -616,4 +678,62 @@ pub fn scan_sfz_instruments(root: &std::path::Path) -> Vec<(String, String)> {
     }
     out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La normalisation RMS bornée par la crête : les transients chauds
+    /// (piano, percussions) ne sont JAMAIS poussés dans un soft clip — le
+    /// gain est limité pour que le pic reste ≤ 0,9, dynamique préservée.
+    #[test]
+    fn normalisation_bornée_par_la_crête() {
+        // Attaque très chaude (pic 0,95) + corps doux (0,05)
+        let mut l = vec![0.05f32; 44_100];
+        l[0] = 0.95;
+        let r = l.clone();
+        let (nl, nr) = normalize_channels(&l, &r, -24.0);
+        let peak = nl.iter().chain(nr.iter()).fold(0f32, |a, &s| a.max(s.abs()));
+        assert!(peak <= 0.85 + 1e-6, "pic {peak} > 0,85 — clipping !");
+        // L'attaque est préservée (le gain est borné, pas de tanh)
+        assert!((nl[0] - 0.85).abs() < 0.02, "attaque écrasée : {}", nl[0]);
+        // Le gain n'est pas nul pour autant : le corps a bien été amplifié
+        assert!(nl[100] > 0.04, "corps non amplifié : {}", nl[100]);
+    }
+
+    /// Instrument doux et uniforme : le gain RMS complet est appliqué
+    /// (cible −24 dBFS ≈ 0,063 RMS), la balance reste prévisible.
+    #[test]
+    fn normalisation_rms_applique_la_cible() {
+        let quiet = vec![0.01f32; 1000];
+        let (ql, qr) = normalize_channels(&quiet, &quiet, -24.0);
+        let rms = (ql.iter().zip(qr.iter()).map(|(a, b)| a * a + b * b).sum::<f32>()
+            / (2.0 * ql.len() as f32)).sqrt();
+        assert!((rms - 0.0631).abs() < 0.004, "RMS {rms} ≠ cible 0,063");
+    }
+
+    /// Lecture stéréo : mono dupliqué, i16 converti proprement en f32.
+    #[test]
+    fn lecture_stereo_depuis_i16_mono() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut buf = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            w.write_sample(16_384i16).unwrap();
+            w.write_sample(-16_384i16).unwrap();
+            w.finalize().unwrap();
+        }
+        let (l, r) = read_stereo_f32(&buf).unwrap();
+        assert_eq!(l.len(), 2);
+        assert_eq!(r.len(), 2);
+        assert!((l[0] - 0.5).abs() < 1e-4);
+        assert!((r[0] - l[0]).abs() < 1e-9); // mono → R = L
+        assert!((l[1] + 0.5).abs() < 1e-4);
+    }
 }

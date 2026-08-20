@@ -74,6 +74,12 @@ impl LiveSource {
     }
 }
 
+/// Verrou global des tests qui lisent `$HOME` (scan des presets/soundfonts)
+/// ou l'écrivent (`api_grilles_cycle_de_vie` isole un HOME temporaire) : les
+/// scans exécutés en parallèle voyaient le HOME temporaire → flaky.
+#[cfg(test)]
+pub static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// État agrégé du moteur live : source courante + sous-états.
 pub struct LiveInstrumentState {
     /// Source active (le routage `monitor_send` la consulte à chaque message).
@@ -609,15 +615,18 @@ fn engine_start(
                 }
                 let l = buffers.outputs.first().map(|v| v.as_slice()).unwrap_or(&[]);
                 let r = buffers.outputs.get(1).map(|v| v.as_slice()).unwrap_or(l);
+                // Gain de sécurité (≈ −2 dB) : les presets Surge chauds ne
+                // saturent pas l'entrée audio USB du Roland. Clamp final.
+                const LIVE_GAIN: f32 = 0.8;
                 if dev_channels >= 2 {
                     for i in 0..frames {
-                        data[i * 2] = l.get(i).copied().unwrap_or(0.0);
-                        data[i * 2 + 1] = r.get(i).copied().unwrap_or(0.0);
+                        data[i * 2] = (l.get(i).copied().unwrap_or(0.0) * LIVE_GAIN).clamp(-0.98, 0.98);
+                        data[i * 2 + 1] = (r.get(i).copied().unwrap_or(0.0) * LIVE_GAIN).clamp(-0.98, 0.98);
                     }
                 } else {
                     for i in 0..frames {
-                        data[i] =
-                            (l.get(i).copied().unwrap_or(0.0) + r.get(i).copied().unwrap_or(0.0)) * 0.5;
+                        let m = (l.get(i).copied().unwrap_or(0.0) + r.get(i).copied().unwrap_or(0.0)) * 0.5;
+                        data[i] = (m * LIVE_GAIN).clamp(-0.98, 0.98);
                     }
                 }
             },
@@ -781,6 +790,7 @@ mod tests {
 
     #[test]
     fn scan_presets_surge() {
+        let _guard = HOME_LOCK.lock().unwrap(); // $HOME est partagé entre tests
         // Test d'intégration : la machine de dev a Surge XT installé.
         let presets = list_presets();
         assert!(presets.len() >= 600, "attendu ≥ 600 presets, trouvé {}", presets.len());
@@ -806,6 +816,7 @@ mod tests {
 
     #[test]
     fn best_of_tous_les_presets_existent() {
+        let _guard = HOME_LOCK.lock().unwrap(); // $HOME est partagé entre tests
         // Chaque entrée du best-of doit exister dans patches_factory
         // (catégorie + nom) — sinon le ⭐ ne mènerait nulle part.
         let presets = list_presets();
@@ -830,6 +841,7 @@ mod tests {
 
     #[test]
     fn scan_soundfonts_trouve_des_banques() {
+        let _guard = HOME_LOCK.lock().unwrap(); // $HOME est partagé entre tests
         let sfs = scan_soundfonts();
         assert!(sfs.len() >= 3, "attendu ≥ 3 soundfonts, trouvé {}", sfs.len());
         // La SoundFont du serveur (MuseScore General Full) est en premier
@@ -852,6 +864,7 @@ mod tests {
 
     #[test]
     fn resolution_chemins_instruments() {
+        let _guard = HOME_LOCK.lock().unwrap(); // $HOME est partagé entre tests
         let home = std::env::var("HOME").unwrap_or_default();
         // Chemin absolu conservé
         let abs = format!("{home}/.local/share/Surge XT/patches_factory/Keys/DX EP.fxp");
