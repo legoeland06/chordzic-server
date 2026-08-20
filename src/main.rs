@@ -2303,6 +2303,8 @@ struct MpeReq {
     channel: Option<u8>,
     /// Cible du son pendant le monitoring : auto / roland / fluid.
     target: Option<mpe::MpeTarget>,
+    /// Instrument GM (0-127) posé sur le canal cible (mode PC / sans Roland).
+    program: Option<u8>,
 }
 
 async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoResponse {
@@ -2344,9 +2346,22 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
     if let Some(v) = b.target {
         st.target = v;
     }
+    if let Some(v) = b.program {
+        st.program = v;
+    }
     if b.channel.is_some() {
         st.channel = b.channel;
     }
+
+    // Vrai si la sortie principale est FluidSynth (pas de Roland branché) :
+    // le monitoring Auto passe alors par le PC — un instrument doit être posé.
+    let main_is_fluid = s
+        .midi
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| l.port.to_lowercase().contains("fluid"))
+        .unwrap_or(false);
 
     // Canal cible (copies — echo locké seul)
     let ch = {
@@ -2374,6 +2389,12 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         }
     };
 
+    // Changement d'instrument : posé immédiatement sur la cible résolue
+    // (FluidSynth si la cible est fluid, sinon la sortie principale).
+    if st.enabled && b.program.is_some() {
+        send_msgs(&s, &[vec![0xC0 | ch, st.program]], false);
+    }
+
     // Bascule de cible : FluidSynth doit être préparé (RPN + program piano)
     // à l'arrivée, et remis à zéro au départ (le bend résiduel resterait
     // appliqué aux futures notes).
@@ -2382,7 +2403,7 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         && was_target != mpe::MpeTarget::Fluid
     {
         let mut setup = mpe::rpn_pitch_range_messages(ch, st.pitch_range_st);
-        setup.push(vec![0xC0 | ch, 0]);
+        setup.push(vec![0xC0 | ch, st.program]);
         send_msgs(&s, &setup, true);
     } else if st.enabled && was_target == mpe::MpeTarget::Fluid && st.target != mpe::MpeTarget::Fluid {
         send_msgs(&s, &mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None), true);
@@ -2392,10 +2413,10 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         // Activation : préparer le récepteur (RPN range + état courant) et
         // relancer la pédale de sustain (comme live-echo).
         let mut setup = mpe::rpn_pitch_range_messages(ch, st.pitch_range_st);
-        // FluidSynth : poser un instrument (piano GM) pour que les notes
-        // renvoyées aient un son.
-        if st.target == mpe::MpeTarget::Fluid {
-            setup.push(vec![0xC0 | ch, 0]);
+        // FluidSynth (cible PC, ou sortie principale sans Roland) : poser
+        // l'instrument choisi pour que les notes renvoyées aient un son.
+        if st.target == mpe::MpeTarget::Fluid || main_is_fluid {
+            setup.push(vec![0xC0 | ch, st.program]);
         }
         setup.extend(mpe::expression_messages(ch, st.bend, st.pressure, st.timbre, None));
         let sustain = s.live_input.sustain.load(std::sync::atomic::Ordering::Relaxed);
@@ -2465,6 +2486,13 @@ async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
     let active = s.live_input.active.lock().unwrap().clone();
     let rec_active = s.live_input.rec.lock().unwrap().is_some();
     let fluid_ok = s.live_input.fluid_sender.lock().unwrap().is_some();
+    let main_is_fluid = s
+        .midi
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| l.port.to_lowercase().contains("fluid"))
+        .unwrap_or(false);
     let route_str = match route {
         live_input::OutputTarget::Fluid => "fluid",
         live_input::OutputTarget::Main => "main",
@@ -2479,11 +2507,13 @@ async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
         "lfo_depth_st": mpe.lfo.depth_st,
         "lfo_shape": mpe.lfo.shape,
         "target": mpe.target,
+        "program": mpe.program,
         "channel": mpe.channel,
         "target_channel": ch,
         "route": route_str,
         "echo_active": echo.enabled,
         "fluid_ok": fluid_ok,
+        "main_is_fluid": main_is_fluid,
         "notes": active,
         "rec_active": rec_active,
         "effective_bend": mpe::effective_bend(&mpe, epoch_ms()),

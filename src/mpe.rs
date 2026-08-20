@@ -99,6 +99,9 @@ pub struct MpeState {
     pub lfo: Lfo,
     /// Cible du son pendant le monitoring (Auto / Roland / FluidSynth).
     pub target: MpeTarget,
+    /// Instrument GM posé sur le canal cible (0-127, défaut 0 = piano).
+    /// Reposé à chaque activation (et quand la sortie est FluidSynth).
+    pub program: u8,
     /// Canal cible explicite (None = auto : écho ✨ si actif, sinon canal 0
     /// — le canal de jeu 1 du pianiste, 0-indexé).
     pub channel: Option<u8>,
@@ -114,6 +117,7 @@ impl Default for MpeState {
             pitch_range_st: 48,
             lfo: Lfo::default(),
             target: MpeTarget::Auto,
+            program: 0,
             channel: None,
         }
     }
