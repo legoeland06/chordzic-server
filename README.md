@@ -77,6 +77,8 @@ puis premier port utilisable). Pour forcer un index : `MIDI_PORT=N ./chords-serv
 Ne pas définir `MIDI_PORT` sur un index invalide → serveur muet.
 ⚠️ **TTS** : la synthèse vocale de l'aide nécessite un serveur Piper local (ou
 `PIPER_URL` pointant ailleurs).
+⚠️ **REC_COMP_MS** : compensation de latence MIDI IN (ms) appliquée à l'horodatage
+des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défaut 2 ms).
 
 ## Routes API
 

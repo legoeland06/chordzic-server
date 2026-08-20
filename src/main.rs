@@ -372,6 +372,9 @@ struct PlayReq {
     loop_end: Option<f64>,            // Locator droit (beats) — intervalle de boucle [L, R[
     #[serde(default)]
     exclude_channel: Option<u8>,     // Canal EXCLU de la lecture (play-along REC)
+    #[serde(default)]
+    rec_after_beats: Option<f64>,    // Décompte REC : active l'enregistrement
+                                     // après N beats (même horloge que la lecture)
 }
 
 /// Réponse standardisée du serveur.
@@ -1446,6 +1449,8 @@ async fn navig_play_midi(State(s): State<AppState>, Json(b): Json<PlayReq>) -> i
                 b.loop_enabled.unwrap_or(false),
                 loop_start,
                 loop_end,
+                b.rec_after_beats,
+                s.live_input.rec.clone(),
             );
             drop(guard);
             let dur = all_notes.iter().map(|n| n.start_time + n.duration).fold(0.0, f64::max)
@@ -1493,6 +1498,8 @@ fn midi_play_custom(
     loop_playback: bool,
     loop_start: f64,
     loop_end: f64,
+    rec_after_beats: Option<f64>,
+    rec_state: Arc<std::sync::Mutex<Option<live_input::RecSession>>>,
 ) {
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
@@ -1694,11 +1701,22 @@ fn midi_play_custom(
         plan_click!();
 
         // Boucle d'horloge : joue les événements dus, dort jusqu'au suivant.
+        let mut rec_started = false;
         loop {
             if gen_ref.load(Ordering::Relaxed) != gen {
                 return; // lecture invalidée (stop/relance)
             }
             let now = now_ms();
+            // DÉCOMPTE REC : après `rec_after_beats` beats (mesurés sur la
+            // MÊME horloge que le clic/la lecture), la session démarre toute
+            // seule — le décompte (clic) et le play-along sont parfaitement
+            // synchrones (plus de décalage Web Audio vs MIDI).
+            if let Some(rb) = rec_after_beats {
+                if !rec_started && now >= rec_activation_ms(start_at, rb, tempo_ms) {
+                    rec_started = true;
+                    *rec_state.lock().unwrap() = Some(live_input::RecSession::new());
+                }
+            }
             // Joue tous les événements dont l'heure est arrivée (tolérance 0,5 ms).
             while let Some((neg_t_us, _, kind)) = heap.peek().copied() {
                 let t_ms = (-neg_t_us) as f64 / 1000.0;
@@ -1812,6 +1830,13 @@ fn select_notes(
 /// off coupe la même note rejouée au début du passage suivant (bug historique
 /// « le son coupe au 2e passage », en MIDI le off tue la note de même
 /// canal/pitch). Sans boucle : durée brute inchangée.
+/// Moment (ms depuis le début de la lecture) où la session REC doit
+/// démarrer — décompte intégré au play-along (rec_after_beats), sur la MÊME
+/// horloge que le clic et les notes. Fonction pure.
+fn rec_activation_ms(start_at: f64, rec_after_beats: f64, tempo_ms: f64) -> f64 {
+    (start_at + rec_after_beats.max(0.0)) * tempo_ms
+}
+
 fn note_off_clamped(target_ms: f64, end_ms: f64, note_dur_ms: f64, loop_playback: bool) -> f64 {
     if loop_playback {
         (end_ms - target_ms - 2.0).min(note_dur_ms).max(0.0)
@@ -2194,8 +2219,9 @@ async fn rec_midi(State(s): State<AppState>, Json(b): Json<RecMidiReq>) -> impl 
         }
         axum::Json(serde_json::json!({ "ok": true }))
     } else {
+        let started = rec.is_some(); // session activée par le décompte serveur ?
         let notes = rec.take().map(|sess| sess.notes).unwrap_or_default();
-        axum::Json(serde_json::json!({ "ok": true, "notes": notes }))
+        axum::Json(serde_json::json!({ "ok": true, "notes": notes, "started": started }))
     }
 }
 
@@ -2369,6 +2395,13 @@ async fn main() {
         rendered_dual: Arc::new(Mutex::new(None)),
         live_input: live_input::LiveInputState::new(),
     };
+    // Compensation de latence MIDI IN (ms) pour l'horodatage Rec :
+    // transport USB MIDI (~1 ms) + pile ALSA (~1 ms) — constant matériel.
+    if let Ok(v) = std::env::var("REC_COMP_MS") {
+        if let Ok(ms) = v.trim().parse::<u64>() {
+            state.live_input.rec_comp_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 
     // Écoute du clavier du pianiste (reconnaissance d'accords — mode Live).
     live_input::start(&state.live_input);
@@ -2592,6 +2625,21 @@ mod tests {
     }
 
     // ── Scheduler mono-thread : clamp du note-off ──
+
+    /// rec_activation_ms : le REC démarre après le décompte, sur l'horloge
+    /// de la lecture (start_at + rec_after_beats, en ms).
+    #[test]
+    fn rec_activation_ms_apres_le_decompte() {
+        // 120 BPM → tempo_ms = 500 ; décompte de 4 beats depuis le début.
+        let t = rec_activation_ms(0.0, 4.0, 500.0);
+        assert!((t - 2000.0).abs() < 1e-9);
+        // Scrub : départ à 8 beats → l'enregistrement démarre à 8 + 4.
+        let t = rec_activation_ms(8.0, 4.0, 500.0);
+        assert!((t - 6000.0).abs() < 1e-9);
+        // Valeur négative clampée à 0 (jamais avant le départ).
+        let t = rec_activation_ms(8.0, -2.0, 500.0);
+        assert!((t - 4000.0).abs() < 1e-9);
+    }
 
     /// note_off_clamped : en boucle, le note-off est clampé à la fin de passe
     /// (−2 ms) pour qu'il passe AVANT le note-on du cycle suivant ; sans

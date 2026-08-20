@@ -170,7 +170,13 @@ pub struct LiveInputState {
     /// de l'écho pour que le sustain s'applique aussi aux notes renvoyées.
     pub sustain: std::sync::atomic::AtomicBool,
     /// Session d'enregistrement MIDI (mode Navig, Rec) — None si inactive.
-    pub rec: Mutex<Option<RecSession>>,
+    /// Arc : partagée avec le thread de lecture (play-along rec_after_beats).
+    pub rec: Arc<Mutex<Option<RecSession>>>,
+    /// Compensation de latence MIDI IN (ms) appliquée à l'horodatage des
+    /// notes enregistrées : le serveur horodate à la RÉCEPTION du message ;
+    /// la note a été jouée ~comp ms plus tôt (transport USB MIDI + pile
+    /// ALSA, constant pour un matériel donné — env REC_COMP_MS, défaut 2).
+    pub rec_comp_ms: std::sync::atomic::AtomicU64,
     /// Émetteur MIDI (configuré par main.rs avec la sortie réelle).
     sender: Mutex<Option<Box<dyn Fn(&[u8]) + Send + Sync>>>,
 }
@@ -183,7 +189,8 @@ impl LiveInputState {
             _conn: Mutex::new(None),
             echo: Mutex::new(EchoConfig::default()),
             sustain: std::sync::atomic::AtomicBool::new(false),
-            rec: Mutex::new(None),
+            rec: Arc::new(Mutex::new(None)),
+            rec_comp_ms: std::sync::atomic::AtomicU64::new(2),
             sender: Mutex::new(None),
         })
     }
@@ -280,10 +287,14 @@ pub fn start(shared: &Arc<LiveInputState>) {
                 }
             }
             // Enregistrement MIDI (mode Navig, Rec) : les notes jouées sont
-            // horodatées depuis le début de la session.
+            // horodatées depuis le début de la session, AVANCÉES de la
+            // latence MIDI IN (compensation constante du transport) — le
+            // placement dans le piano roll colle à l'appui réel, pas à la
+            // réception serveur.
             if let Ok(mut rec) = shared2.rec.lock() {
                 if let Some(session) = rec.as_mut() {
-                    let now = session.now_ms();
+                    let comp = shared2.rec_comp_ms.load(std::sync::atomic::Ordering::Relaxed) as u64;
+                    let now = session.now_ms().saturating_sub(comp);
                     apply_rec_message(&mut session.notes, &mut session.held, msg, now);
                 }
             }
