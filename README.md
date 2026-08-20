@@ -145,9 +145,17 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 cargo test --release
 ```
 
-76 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
+112 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
 (ordre d'arrivée), écho MIDI, program change, enregistrement MIDI, TTS
 (serveur Piper factice).
+
+## Notes de version
+
+- **v2.7.2 (20/08/2026)** — 📱 Frontend embarqué : mode tactile (inhibition
+  des réactions navigateur/OS sur écran tactile : appui long = clic droit,
+  double-tap = zoom, sélection au glissé).
+- **v2.7.1 (20/08/2026)** — 🐛 Frontend embarqué : fix notes coincées en jeu
+  rapide (file FIFO sur `POST /piano-note` — ordre note-on/note-off garanti).
 
 ---
 
