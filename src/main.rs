@@ -1580,6 +1580,12 @@ fn midi_play_custom(
         // s'accumulaient). Horloge UNIQUE (start.elapsed()) → clic et notes
         // parfaitement synchrones, même en boucle et après un scrub.
         let tempo_ms = 60_000.0 / tempo.max(1) as f64;
+        // DÉCOMPTE REC : le clic sonne seul pendant `rec_after_beats` beats
+        // (pré-roll), puis le play-along (notes) ET l'enregistrement
+        // démarrent ENSEMBLE — même instant, même horloge. Le backing joue
+        // depuis SON début (référentiel inchangé), simplement décalé de
+        // rec_delay_ms en temps réel.
+        let rec_delay_ms = rec_after_beats.unwrap_or(0.0) * tempo_ms;
         // Intervalle de boucle (locators [L, R[ en beats) : le repeat boucle
         // [L, R[ au lieu du morceau complet. Sans intervalle valide :
         // boucle complète (loop_start = 0, loop_end = total_beats).
@@ -1658,7 +1664,7 @@ fn midi_play_custom(
                                 note_pass[$i] += 1; // note hors passe → suivante
                             }
                         } else {
-                            push_ev!(target_ms, Ev::NoteOn($i));
+                            push_ev!(target_ms + rec_delay_ms, Ev::NoteOn($i));
                             done = true;
                         }
                     }
