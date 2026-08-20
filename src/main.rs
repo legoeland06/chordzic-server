@@ -2282,8 +2282,9 @@ fn epoch_ms() -> u64 {
 /// tourne, chaque geste est horodaté (RecExpr) pour être réappliqué au rendu.
 #[derive(Deserialize)]
 struct MpeReq {
-    /// Monitoring MPE actif ? (modal ouverte)
-    enabled: bool,
+    /// Monitoring MPE actif ? (modal ouverte) — OPTIONNEL : les gestes
+    /// (bend/pression/timbre/LFO) n'envoient pas `enabled` (patch partiel).
+    enabled: Option<bool>,
     /// Pitch bend manuel (0-16383, centre 8192).
     bend: Option<u16>,
     /// Channel pressure (0-127).
@@ -2313,8 +2314,11 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         st = *m; // Copy — jamais de lock mpe+echo simultanés (deadlock)
     }
 
-    // Appliquer les changements demandés par la modal
-    st.enabled = b.enabled;
+    // Appliquer les changements demandés par la modal (patch partiel :
+    // `enabled` absent = on n'y touche pas)
+    if let Some(v) = b.enabled {
+        st.enabled = v;
+    }
     if let Some(v) = b.bend {
         st.bend = v;
     }
@@ -2336,6 +2340,7 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
     if let Some(v) = b.lfo_shape {
         st.lfo.shape = v;
     }
+    let was_target = st.target;
     if let Some(v) = b.target {
         st.target = v;
     }
@@ -2350,10 +2355,11 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
     };
 
     // Envoi des messages MPE vers la sortie choisie (FluidSynth si la cible
-    // est « fluid », sinon la sortie principale — Roland). Aucun verrou
-    // d'état tenu pendant l'envoi.
-    let send_mpe_msgs = |s: &AppState, msgs: &[Vec<u8>]| {
-        if st.enabled && st.target == mpe::MpeTarget::Fluid {
+    // est « fluid », sinon la sortie principale — Roland). `force_fluid`
+    // permet de viser FluidSynth même après une bascule de cible (reset).
+    // Aucun verrou d'état tenu pendant l'envoi.
+    let send_msgs = |s: &AppState, msgs: &[Vec<u8>], force_fluid: bool| {
+        if (st.enabled && st.target == mpe::MpeTarget::Fluid) || force_fluid {
             let guard = s.live_input.fluid_sender.lock().unwrap();
             if let Some(sender) = guard.as_ref() {
                 for msg in msgs {
@@ -2368,6 +2374,20 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         }
     };
 
+    // Bascule de cible : FluidSynth doit être préparé (RPN + program piano)
+    // à l'arrivée, et remis à zéro au départ (le bend résiduel resterait
+    // appliqué aux futures notes).
+    if st.enabled && st.target == mpe::MpeTarget::Fluid
+        && b.target == Some(mpe::MpeTarget::Fluid)
+        && was_target != mpe::MpeTarget::Fluid
+    {
+        let mut setup = mpe::rpn_pitch_range_messages(ch, st.pitch_range_st);
+        setup.push(vec![0xC0 | ch, 0]);
+        send_msgs(&s, &setup, true);
+    } else if st.enabled && was_target == mpe::MpeTarget::Fluid && st.target != mpe::MpeTarget::Fluid {
+        send_msgs(&s, &mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None), true);
+    }
+
     if st.enabled && !was_enabled {
         // Activation : préparer le récepteur (RPN range + état courant) et
         // relancer la pédale de sustain (comme live-echo).
@@ -2380,7 +2400,7 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         setup.extend(mpe::expression_messages(ch, st.bend, st.pressure, st.timbre, None));
         let sustain = s.live_input.sustain.load(std::sync::atomic::Ordering::Relaxed);
         setup.push(vec![0xB0 | ch, 64, if sustain { 127 } else { 0 }]);
-        send_mpe_msgs(&s, &setup);
+        send_msgs(&s, &setup, false);
     } else if st.enabled {
         // Geste : envoi immédiat (bend effectif LFO inclus, AT, timbre)
         let t = epoch_ms();
@@ -2393,11 +2413,11 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         if let Some(r) = b.pitch_range_st {
             msgs.extend(mpe::rpn_pitch_range_messages(ch, r));
         }
-        send_mpe_msgs(&s, &msgs);
+        send_msgs(&s, &msgs, false);
     } else if was_enabled {
         // Fermeture : remettre l'expression à zéro (bend centre, AT 0,
         // timbre neutre) — sinon les notes suivantes gardent le bend.
-        send_mpe_msgs(&s, &mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None));
+        send_msgs(&s, &mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None), false);
     }
 
     // Enregistrer le nouvel état (même si désactivé)
@@ -2448,7 +2468,6 @@ async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
     let route_str = match route {
         live_input::OutputTarget::Fluid => "fluid",
         live_input::OutputTarget::Main => "main",
-        live_input::OutputTarget::None => "none",
     };
     axum::Json(serde_json::json!({
         "enabled": mpe.enabled,
@@ -3146,6 +3165,38 @@ mod tests {
         let (_, body) = req(&app, "GET", "/mpe-state", None).await;
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["enabled"], false);
+    }
+
+    /// Geste SANS `enabled` (le cas réel du frontend : la modal n'envoie que
+    /// bend/pression/timbre pendant les gestes) → 200 et valeurs appliquées.
+    /// Régression : le champ était obligatoire → 400 → aucune modulation.
+    #[tokio::test]
+    async fn api_mpe_geste_sans_enabled_est_un_patch_partiel() {
+        let app = build_app(test_state());
+
+        // Activation puis gestes partiels (exactement ce qu'envoie la modal)
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"enabled": true}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"bend": 10000}))).await;
+        assert_eq!(s, StatusCode::OK, "geste bend sans enabled doit être accepté");
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"pressure": 60}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"timbre": 30}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"lfo_freq": 4.0, "lfo_depth_st": 2.0}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"target": "fluid"}))).await;
+        assert_eq!(s, StatusCode::OK, "bascule de cible sans enabled acceptée");
+
+        let (_, body) = req(&app, "GET", "/mpe-state", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enabled"], true, "l'activation initiale est conservée");
+        assert_eq!(v["bend"], 10000);
+        assert_eq!(v["pressure"], 60);
+        assert_eq!(v["timbre"], 30);
+        assert_eq!(v["lfo_freq"], 4.0);
+        assert_eq!(v["target"], "fluid");
+        assert_eq!(v["route"], "fluid");
     }
 
     /// GET /sample-file : nom avec chemin → 400 (sécurité), inconnu → 404.

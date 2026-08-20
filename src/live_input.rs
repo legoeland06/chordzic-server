@@ -143,18 +143,14 @@ pub fn resolve_mpe_channel(mpe: &MpeState, echo: &EchoConfig) -> u8 {
     mpe.channel.unwrap_or(0)
 }
 
-/// Cible de SORTIE du monitoring (écho ✨ / modal MPE) : quelle connexion
-/// MIDI reçoit les notes du pianiste et les modulations.
-/// - modal MPE ouverte + cible `fluid` → FluidSynth (le PC sonne) — l'écho
-///   ✨ est suspendu le temps de la modal (pas de double son) ;
-/// - écho ✨ actif (cible non fluid) → sortie principale (comportement
-///   historique : le Roland joue l'instrument de la piste) ;
-/// - modal MPE ouverte seule → sortie principale (monitoring MPE) ;
-/// - sinon → rien (comportement historique sans écho).
+/// Monitoring (écho ✨ / modal MPE / THRU par défaut) : quand l'utilisateur
+/// joue sur le Roland (Local Control OFF), le serveur lui renvoie TOUJOURS
+/// ses notes — c'est le comportement historique « le serveur renvoie du son
+/// au Roland » — l'écho ✨ change le canal (piste + program), la modal MPE
+/// n'ajoute que les modulations.
 /// Fonction pure (testable sans matériel).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputTarget {
-    None,
     Main,
     Fluid,
 }
@@ -163,26 +159,21 @@ pub fn monitor_output_target(mpe: &MpeState, echo: &EchoConfig) -> OutputTarget 
     if mpe.enabled && mpe.target == mpe::MpeTarget::Fluid {
         return OutputTarget::Fluid;
     }
-    if echo.enabled {
-        return OutputTarget::Main;
-    }
-    if mpe.enabled {
-        return OutputTarget::Main;
-    }
-    OutputTarget::None
+    // Écho ✨, monitoring MPE ou thru par défaut : sortie principale.
+    OutputTarget::Main
 }
 
-/// Monitoring MPE : quand la modal 🎛 est ouverte (et qu'aucun écho ✨ n'est
-/// déjà actif), les notes du pianiste et la pédale sont renvoyées sur le canal
-/// cible MPE — le serveur redevient maître du son (Local Control OFF) et peut
-/// y injecter les modulations. Retourne None si rien à relayer.
-/// Fonction pure (testable sans matériel).
+/// Monitoring (écho ✨ / modal MPE / thru par défaut) : les notes du
+/// pianiste et la pédale de sustain sont renvoyées sur le canal cible —
+/// canal de l'écho ✨ si actif, sinon canal MPE explicite, sinon canal 0
+/// (canal de jeu). Retourne None pour les messages non relayés (CC autres,
+/// PC…). Fonction pure (testable sans matériel).
 pub fn monitor_message(msg: &[u8], mpe: &MpeState, echo: &EchoConfig) -> Option<Vec<u8>> {
     // Écho ✨ prioritaire : il relaie déjà notes + sustain sur le canal piste.
     if echo.enabled {
         return echo_message(msg, echo);
     }
-    if !mpe.enabled || msg.len() < 2 {
+    if msg.len() < 2 {
         return None;
     }
     let channel = resolve_mpe_channel(mpe, echo);
@@ -398,30 +389,32 @@ pub fn start(shared: &Arc<LiveInputState>) {
                 (*cfg, *m)
             };
             let route = monitor_output_target(&mpe_state, &echo_cfg);
-            if route != OutputTarget::None {
-                let out = monitor_message(msg, &mpe_state, &echo_cfg);
-                let exprs = if mpe_state.enabled {
-                    let t = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    mpe_expression_out(&mpe_state, &echo_cfg, t)
-                } else {
-                    Vec::new()
-                };
-                let fluid = route == OutputTarget::Fluid;
-                let sender_guard = if fluid {
-                    shared2.fluid_sender.lock().unwrap()
-                } else {
-                    shared2.sender.lock().unwrap()
-                };
-                if let Some(sender) = sender_guard.as_ref() {
-                    if let Some(m) = out {
-                        sender(&m);
-                    }
-                    for expr in &exprs {
-                        sender(expr);
-                    }
+            // Thru par défaut : les notes du pianiste sont TOUJOURS renvoyées
+            // (écho ✨ sur le canal piste, sinon canal de jeu) — la modal MPE
+            // ajoute les modulations (bend effectif LFO inclus, aftertouch,
+            // timbre) dès l'appui. Cible : FluidSynth si la modal le force.
+            let out = monitor_message(msg, &mpe_state, &echo_cfg);
+            let exprs = if mpe_state.enabled {
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                mpe_expression_out(&mpe_state, &echo_cfg, t)
+            } else {
+                Vec::new()
+            };
+            let fluid = route == OutputTarget::Fluid;
+            let sender_guard = if fluid {
+                shared2.fluid_sender.lock().unwrap()
+            } else {
+                shared2.sender.lock().unwrap()
+            };
+            if let Some(sender) = sender_guard.as_ref() {
+                if let Some(m) = out {
+                    sender(&m);
+                }
+                for expr in &exprs {
+                    sender(expr);
                 }
             }
             // Enregistrement MIDI (mode Navig, Rec) : les notes jouées sont
@@ -658,14 +651,18 @@ mod tests {
     }
 
     #[test]
-    fn monitor_mpe_desactive_ou_sur_non_note_ne_relaie_rien() {
+    fn monitor_mpe_desactive_relaie_quand_meme_thru_par_defaut() {
         let echo_off = EchoConfig::default();
-        let off = MpeState::default(); // disabled
-        assert_eq!(monitor_message(&[0x90, 60, 100], &off, &echo_off), None);
-        let m = mpe_on(None);
-        assert_eq!(monitor_message(&[0xB0, 7, 100], &m, &echo_off), None); // CC volume
-        assert_eq!(monitor_message(&[0xC0, 5], &m, &echo_off), None); // PC
-        assert_eq!(monitor_message(&[0x90], &m, &echo_off), None); // trop court
+        // MPE désactivé + pas d'écho → THRU par défaut : les notes reviennent
+        // sur le canal de jeu (comportement historique « le serveur renvoie
+        // du son au Roland »).
+        let off = MpeState::default();
+        let on = monitor_message(&[0x90, 60, 100], &off, &echo_off).unwrap();
+        assert_eq!(on, vec![0x90, 60, 100]);
+        // Les messages non relayés (CC volume, PC, trop court) → None
+        assert_eq!(monitor_message(&[0xB0, 7, 100], &off, &echo_off), None);
+        assert_eq!(monitor_message(&[0xC0, 5], &off, &echo_off), None);
+        assert_eq!(monitor_message(&[0x90], &off, &echo_off), None);
     }
 
     #[test]
@@ -731,8 +728,8 @@ mod tests {
         let echo_off = EchoConfig::default();
         // Modal ouverte (auto) → sortie principale (Roland)
         assert_eq!(monitor_output_target(&mpe_auto(None), &echo_off), OutputTarget::Main);
-        // Modal fermée → rien (comportement historique)
-        assert_eq!(monitor_output_target(&MpeState::default(), &echo_off), OutputTarget::None);
+        // Modal fermée → THRU par défaut : toujours la sortie principale
+        assert_eq!(monitor_output_target(&MpeState::default(), &echo_off), OutputTarget::Main);
     }
 
     #[test]
@@ -742,11 +739,25 @@ mod tests {
         // Cible fluid → FluidSynth, même avec l'écho ✨ actif (pas de double son)
         assert_eq!(monitor_output_target(&mpe_fluid(None), &echo_on), OutputTarget::Fluid);
         assert_eq!(monitor_output_target(&mpe_fluid(None), &echo_off), OutputTarget::Fluid);
-        // Modal fermée mais cible fluid → rien (l'écho ✨ reprend la main)
+        // Modal fermée mais cible fluid → l'écho ✨ / thru reprennent la main
         let mut off = MpeState::default();
         off.target = mpe::MpeTarget::Fluid;
         assert_eq!(monitor_output_target(&off, &echo_on), OutputTarget::Main);
-        assert_eq!(monitor_output_target(&off, &echo_off), OutputTarget::None);
+        assert_eq!(monitor_output_target(&off, &echo_off), OutputTarget::Main);
+    }
+
+    #[test]
+    fn thru_par_defaut_sur_le_canal_de_jeu() {
+        let echo_off = EchoConfig::default();
+        let off = MpeState::default();
+        // Note reçue sur le canal 0 → renvoyée telle quelle (canal de jeu)
+        assert_eq!(monitor_message(&[0x90, 60, 100], &off, &echo_off), Some(vec![0x90, 60, 100]));
+        assert_eq!(monitor_message(&[0x80, 64, 64], &off, &echo_off), Some(vec![0x80, 64, 64]));
+        // Note venue d'un autre canal → remappée sur le canal de jeu (0)
+        assert_eq!(monitor_message(&[0x93, 60, 100], &off, &echo_off), Some(vec![0x90, 60, 100]));
+        // Canal MPE explicite prioritaire sur le canal d'origine
+        let m = mpe_on(Some(4));
+        assert_eq!(monitor_message(&[0x90, 60, 100], &m, &echo_off), Some(vec![0x94, 60, 100]));
     }
 
     #[test]
