@@ -389,6 +389,14 @@ struct PlayReq {
     loop_start: Option<f64>,          // Locator gauche (beats) — intervalle de boucle [L, R[
     #[serde(default)]
     loop_end: Option<f64>,            // Locator droit (beats) — intervalle de boucle [L, R[
+    /// Export de section [L, R[ : début en beats — le WAV rendu est coupé
+    /// à partir de cette position (les notes avant ne sont pas exportées).
+    #[serde(default)]
+    section_start: Option<f64>,
+    /// Export de section [L, R[ : fin en beats — le rendu s'arrête à cette
+    /// position (les notes après ne sont pas jouées).
+    #[serde(default)]
+    section_end: Option<f64>,
     #[serde(default)]
     exclude_channel: Option<u8>,     // Canal EXCLU de la lecture (play-along REC)
     #[serde(default)]
@@ -868,8 +876,14 @@ async fn render_wav(
         "/usr/share/sounds/sf3/MuseScore_General_Full.sf3"
     );
 
-    // Durée totale en secondes
-    let duration_sec = total_beats * 60.0 / b.tempo.max(1) as f64;
+    // Durée totale en secondes — limitée à la section [L, R[ si demandée
+    // (l'export entre les locators ne rend que la partie utile).
+    let tempo_f = b.tempo.max(1) as f64;
+    let end_beats = b
+        .section_end
+        .map(|e| e.min(total_beats).max(0.0))
+        .unwrap_or(total_beats);
+    let duration_sec = end_beats * 60.0 / tempo_f;
 
     // ── Rendu : simple (1 passe, rapide) ou par piste (si effets actifs) ──
     let has_fx = rcfg.tracks.iter().any(|t| !t.fx.is_off());
@@ -908,6 +922,7 @@ async fn render_wav(
             } else {
                 click_cfg.out_device.is_some() && !click_cfg.in_render
             };
+            let mut sep_names: Option<(String, String)> = None;
             if mix_click || sep_click {
                 let bars = (sig_code(&b.sig) / 10).max(1) as u64;
                 let click_smf = render::generate_click_smf(
@@ -928,6 +943,7 @@ async fn render_wav(
                     if sep_click {
                         // Mode SÉPARÉ : 2 WAV en temp → le frontend récupère
                         // les URLs, joue le main, et déclenche le clic serveur.
+                        // (les fichiers sont écrits APRÈS le slice de section.)
                         let dir = std::env::temp_dir().join("chordj_rendered");
                         let _ = std::fs::create_dir_all(&dir);
                         let ts = std::time::SystemTime::now()
@@ -938,12 +954,7 @@ async fn render_wav(
                         let click_name = format!("navig_{}_click.wav", ts);
                         let _ = std::fs::write(dir.join(&main_name), &wav);
                         let _ = std::fs::write(dir.join(&click_name), &cwav);
-                        let json = serde_json::json!({
-                            "main_url": format!("/rendered/{}", main_name),
-                            "click_url": format!("/rendered/{}", click_name),
-                            "duration_sec": duration_sec,
-                        });
-                        return (StatusCode::OK, axum::Json(json)).into_response();
+                        sep_names = Some((main_name, click_name));
                     } else {
                         // Mode MIXÉ : synchro parfaite par construction
                         let gain = (click_cfg.volume as f32 / 100.0) * 1.0;
@@ -953,6 +964,27 @@ async fn render_wav(
                         }
                     }
                 }
+            }
+
+            // ── Export de section [L, R[ : coupe le début (les notes avant
+            // le locator gauche ne sont pas exportées — la fin est déjà
+            // limitée par la durée de rendu calculée plus haut).
+            if let Some(start) = b.section_start {
+                let start_sec = start.max(0.0) * 60.0 / tempo_f;
+                wav = render::slice_wav_from(&wav, start_sec);
+            }
+
+            // Mode clic SÉPARÉ : la réponse JSON part après le slice (le
+            // main écrit reflète la section demandée).
+            if let Some((main_name, click_name)) = sep_names {
+                let dir = std::env::temp_dir().join("chordj_rendered");
+                let _ = std::fs::write(dir.join(&main_name), &wav);
+                let json = serde_json::json!({
+                    "main_url": format!("/rendered/{}", main_name),
+                    "click_url": format!("/rendered/{}", click_name),
+                    "duration_sec": duration_sec,
+                });
+                return (StatusCode::OK, axum::Json(json)).into_response();
             }
 
             let mut headers = HeaderMap::new();
@@ -967,7 +999,6 @@ async fn render_wav(
         }
     }
 }
-
 // ─── Bounce multitrack (mode PostProd) ─────────────────────────────────
 
 /// Fichier WAV temporaire d'une piste (bounce multitrack).
@@ -3381,6 +3412,48 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "render-wav doit réussir : {body}");
         // Réponse = WAV brut (audio/wav) : commence par le header RIFF
         assert!(body.starts_with("RIFF"), "réponse WAV attendue, reçu: {}", &body[..body.len().min(80)]);
+    }
+
+    /// Export de section [L, R[ : le WAV rendu ne couvre QUE l'intervalle.
+    /// 2 accords × 4 temps à 120 BPM = 4 s ; section [2, 6[ beats → 2 s.
+    #[tokio::test]
+    async fn api_render_wav_section_locators_duree_exacte() {
+        let app = build_app(test_state());
+        let mut rb = axum::http::Request::builder()
+            .method("POST")
+            .uri("/render-wav")
+            .header("content-type", "application/json");
+        let body = serde_json::json!({
+            "sequence": [
+                {"notes": ["C4", "E4", "G4"], "beats": 4.0},
+                {"notes": ["F4", "A4", "C5"], "beats": 4.0}
+            ],
+            "tempo": 120,
+            "pattern": "rock",
+            "walking": false,
+            "sig": "4/4",
+            "master_vol": 127,
+            "section_start": 2.0,
+            "section_end": 6.0
+        });
+        let resp = app
+            .clone()
+            .oneshot(rb.body(axum::body::Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "render-wav section doit réussir");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.starts_with(b"RIFF"), "réponse WAV attendue");
+        // Durée du WAV : échantillons / taux (bytes bruts — pas de lossy)
+        use hound::WavReader;
+        let mut r = WavReader::new(std::io::Cursor::new(bytes.as_ref())).unwrap();
+        let spec = r.spec();
+        let n = r.samples::<i16>().count();
+        let dur = n as f64 / spec.channels.max(1) as f64 / spec.sample_rate as f64;
+        assert!(
+            (dur - 2.0).abs() < 0.05,
+            "section [2,6[ beats à 120 BPM = 2 s, obtenu {dur:.3} s"
+        );
     }
 
     /// POST /save + GET /grilles + DELETE : cycle de vie d'une grille
