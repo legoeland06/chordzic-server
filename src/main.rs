@@ -36,6 +36,7 @@ mod pads;
 mod patterns;
 mod render;
 mod samples;
+mod vst3_live;
 mod walking;
 
 use axum::{
@@ -255,6 +256,10 @@ struct AppState {
     /// Entrée MIDI live (notes tenues sur le clavier du pianiste) — sert la
     /// reconnaissance d'accords en mode Live (route GET /live-input).
     live_input: Arc<live_input::LiveInputState>,
+    /// Moteur VST3 live (monitoring des notes du pianiste via Surge XT au
+    /// lieu du thru MIDI) — option : quand il est actif, le monitoring passe
+    /// par le plugin → audio USB → haut-parleurs du Roland.
+    vst3_live: Arc<vst3_live::Vst3LiveState>,
     /// Lectures serveur des pads en cours (fichier → process ffplay) —
     /// route POST /pad-trigger (retrigger) ; POST /pad-stop coupe tout.
     pad_players: Arc<Mutex<HashMap<String, std::process::Child>>>,
@@ -309,6 +314,21 @@ fn midi_send_raw(midi: &Arc<Mutex<Option<MidiLink>>>, msg: &[u8]) -> bool {
 
 fn midi_send(state: &AppState, msg: &[u8]) -> bool {
     midi_send_raw(&state.midi, msg)
+}
+
+/// Envoie un message de MONITORING (notes du pianiste, sustain, modulations)
+/// vers la cible active : moteur VST3 live si activé (→ Surge → audio USB →
+/// haut-parleurs du Roland), sinon sortie MIDI (comportement historique :
+/// thru / écho ✨ / Roland GM). Les envois de la SÉQUENCE (lecture de grille)
+/// passent toujours par `midi_send` direct — le VST3 live ne capte QUE le
+/// jeu du pianiste.
+fn monitor_send(state: &AppState, msg: &[u8]) -> bool {
+    if state.vst3_live.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        vst3_live::enqueue(&state.vst3_live, msg);
+        true
+    } else {
+        midi_send(state, msg)
+    }
 }
 
 // ─── Signature ──────────────────────────────────────────────────────────
@@ -808,7 +828,7 @@ async fn piano_note(State(s): State<AppState>, Json(b): Json<PianoNoteReq>) -> i
             }
         }
     }
-    midi_send(&s, &live_input::piano_note_message(pitch, vel, on, channel));
+    monitor_send(&s, &live_input::piano_note_message(pitch, vel, on, channel));
     Json(Rsp { status: "ok".into() })
 }
 
@@ -2367,7 +2387,7 @@ async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> imp
                 // Pédale de sustain : relance son état courant pour que les
                 // notes écho durent aussi si la pédale était déjà enfoncée.
                 let sustain = s.live_input.sustain.load(std::sync::atomic::Ordering::Relaxed);
-                midi_send(&s, &[0xB0 | out_ch, 64, if sustain { 127 } else { 0 }]);
+                monitor_send(&s, &[0xB0 | out_ch, 64, if sustain { 127 } else { 0 }]);
             }
         }
     }
@@ -2376,6 +2396,71 @@ async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> imp
         channel: b.channel,
     };
     axum::Json(serde_json::json!({ "ok": true }))
+}
+
+// ─── Moteur VST3 live (Surge XT → audio USB → haut-parleurs du Roland) ───
+
+/// GET /vst3-presets — Liste les presets Surge XT (patches_factory),
+/// catégorisés (Leads, Pads, Basses…) pour le moteur VST3 live.
+async fn vst3_presets() -> impl IntoResponse {
+    axum::Json(vst3_live::list_presets())
+}
+
+/// POST /live-vst3 — Active/désactive le moteur VST3 live : le monitoring
+/// des notes du pianiste passe par le plugin (Surge XT) → audio USB →
+/// haut-parleurs du Roland au lieu du thru MIDI (Roland GM).
+/// Body : {enabled: bool, preset?: string} — preset = chemin .fxp OU nom
+/// partiel (cherché dans patches_factory).
+#[derive(Deserialize)]
+struct LiveVst3Req {
+    enabled: bool,
+    preset: Option<String>,
+}
+
+async fn live_vst3(State(s): State<AppState>, Json(b): Json<LiveVst3Req>) -> impl IntoResponse {
+    let result = if b.enabled {
+        match b.preset.as_deref() {
+            Some(p) => vst3_live::start(&s.vst3_live, p),
+            None => {
+                // Activer sans preset : le dernier connu (réactivation après
+                // un redémarrage du serveur).
+                let last = s.vst3_live.preset_path.lock().unwrap().clone();
+                match last {
+                    Some(p) => vst3_live::start(&s.vst3_live, &p),
+                    None => Err(
+                        "Aucun preset choisi — sélectionne un preset Surge d'abord".into(),
+                    ),
+                }
+            }
+        }
+    } else {
+        vst3_live::stop(&s.vst3_live);
+        Ok(())
+    };
+    match result {
+        Ok(()) => {
+            *s.vst3_live.last_error.lock().unwrap() = None;
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "state": vst3_live::status(&s.vst3_live),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            *s.vst3_live.last_error.lock().unwrap() = Some(e.clone());
+            eprintln!("⚠️ live-vst3 : {e}");
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "ok": false, "error": e })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /live-vst3 — État courant du moteur VST3 live (actif ? preset ?).
+async fn live_vst3_state(State(s): State<AppState>) -> impl IntoResponse {
+    axum::Json(vst3_live::status(&s.vst3_live))
 }
 
 // ─── Modal MPE (🎛) — simulation de contrôleur MPE ───────────────────────
@@ -2497,7 +2582,7 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
             // FluidSynth indisponible → repli sur la sortie principale
         }
         for msg in msgs {
-            midi_send(s, msg);
+            monitor_send(s, msg);
         }
     };
 
@@ -2831,6 +2916,8 @@ fn build_app(state: AppState) -> Router {
         .route("/midi-port", post(midi_port))
         .route("/live-input", get(live_input))
         .route("/live-echo", post(live_echo))
+        .route("/vst3-presets", get(vst3_presets))
+        .route("/live-vst3", get(live_vst3_state).post(live_vst3))
         .route("/mpe", post(mpe))
         .route("/mpe-state", get(mpe_state))
         .route("/mpe-reset", post(mpe_reset))
@@ -2922,6 +3009,7 @@ async fn main() {
         }),
         rendered_dual: Arc::new(Mutex::new(None)),
         live_input: live_input::LiveInputState::new(),
+        vst3_live: vst3_live::Vst3LiveState::new(),
     };
     // Compensation de latence MIDI IN (ms) pour l'horodatage Rec :
     // transport USB MIDI (~1 ms) + pile ALSA (~1 ms) — constant matériel.
@@ -2935,10 +3023,18 @@ async fn main() {
     live_input::start(&state.live_input);
 
     // Émetteur d'écho (mode Navig ✨) : les notes du pianiste sont renvoyées
-    // vers la sortie MIDI réelle (avec reconnexion automatique).
+    // vers la cible de monitoring active — moteur VST3 live si actif (Surge →
+    // audio USB → haut-parleurs du Roland), sinon la sortie MIDI réelle (avec
+    // reconnexion automatique). Le thru MIDI reste le défaut ; le VST3 live
+    // est une OPTION qui remplace l'envoi (pas de double son).
     let midi_out = state.midi.clone();
+    let vst3 = state.vst3_live.clone();
     live_input::set_echo_sender(&state.live_input, Box::new(move |msg: &[u8]| {
-        midi_send_raw(&midi_out, msg);
+        if vst3.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            vst3_live::enqueue(&vst3, msg);
+        } else {
+            midi_send_raw(&midi_out, msg);
+        }
     }));
 
     // Émetteur MPE vers FluidSynth (cible « PC » de la modal 🎛) : connexion
@@ -3336,6 +3432,7 @@ mod tests {
             click: Arc::new(click::ClickState::default()),
             rendered_dual: Arc::new(Mutex::new(None)),
             live_input: live_input::LiveInputState::new(),
+            vst3_live: vst3_live::Vst3LiveState::new(),
         }
     }
 
@@ -3370,6 +3467,66 @@ mod tests {
                 "{uri} doit refuser la séquence vide (reçu {s}: {body})"
             );
         }
+    }
+
+    /// GET /vst3-presets liste les presets Surge XT (patches_factory) —
+    /// test d'intégration : la machine de dev a Surge XT installé.
+    #[tokio::test]
+    async fn api_vst3_presets_liste_les_presets_surge() {
+        let app = build_app(test_state());
+        let (s, body) = req(&app, "GET", "/vst3-presets", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let arr = v.as_array().expect("liste JSON");
+        assert!(arr.len() >= 600, "attendu ≥ 600 presets, trouvé {}", arr.len());
+        let cats: std::collections::HashSet<&str> = arr
+            .iter()
+            .filter_map(|p| p.get("category").and_then(|c| c.as_str()))
+            .collect();
+        for want in ["Leads", "Pads", "Basses"] {
+            assert!(cats.contains(want), "catégorie {want} manquante");
+        }
+        for p in arr.iter().take(5) {
+            assert!(p.get("name").and_then(|n| n.as_str()).is_some());
+            assert!(p.get("path").and_then(|n| n.as_str()).unwrap_or("").ends_with(".fxp"));
+        }
+    }
+
+    /// GET /live-vst3 : état initial désactivé. POST {enabled:true} sans
+    /// preset (jamais activé) → 400 avec une erreur claire. POST
+    /// {enabled:false} quand le moteur n'a jamais tourné → 200 sans effet.
+    #[tokio::test]
+    async fn api_live_vst3_etat_initial_et_erreurs() {
+        let app = build_app(test_state());
+
+        // État initial
+        let (s, body) = req(&app, "GET", "/live-vst3", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enabled"], false);
+        assert!(v["preset"].is_null());
+
+        // Activation sans preset et sans historique → erreur claire
+        let (s, body) = req(
+            &app,
+            "POST",
+            "/live-vst3",
+            Some(serde_json::json!({ "enabled": true })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "reçu {s}: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["error"].as_str().unwrap_or("").contains("preset"));
+
+        // Stop sans moteur actif → 200 sans effet
+        let (s, _) = req(
+            &app,
+            "POST",
+            "/live-vst3",
+            Some(serde_json::json!({ "enabled": false })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
     }
 
     /// GET /click renvoie la config complète du clic (JSON).
