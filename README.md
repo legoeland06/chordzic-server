@@ -102,7 +102,7 @@ Ne pas définir `MIDI_PORT` sur un index invalide → serveur muet.
 | GET/POST | `/click` | Configuration / état du métronome |
 | POST | `/navig-click-start` / `/navig-click-stop` | Métronome en mode navigation |
 | POST | `/navig-play` | Lecture navigation (double canaux) |
-| POST | `/navig-play-midi` / `/navig-stop-midi` | Lecture MIDI de toutes les pistes |
+| POST | `/navig-play-midi` / `/navig-stop-midi` | Lecture MIDI de toutes les pistes (`exclude_channel` = play-along REC : la piste enregistrée ne joue pas) |
 | POST | `/save` · GET `/grilles` · DELETE `/grilles/:name` | Persistance des grilles |
 
 ## Tracks MIDI par défaut

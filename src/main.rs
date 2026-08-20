@@ -370,6 +370,8 @@ struct PlayReq {
     loop_start: Option<f64>,          // Locator gauche (beats) — intervalle de boucle [L, R[
     #[serde(default)]
     loop_end: Option<f64>,            // Locator droit (beats) — intervalle de boucle [L, R[
+    #[serde(default)]
+    exclude_channel: Option<u8>,     // Canal EXCLU de la lecture (play-along REC)
 }
 
 /// Réponse standardisée du serveur.
@@ -1263,7 +1265,8 @@ fn build_all_notes(
     beats: &[f64],
     rcfg: &render::RenderCfg,
 ) -> Vec<render::CustomNote> {
-    if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
+    let excluded = b.exclude_channel;
+    let out = if !b.custom_notes.is_empty() || !b.custom_channels.is_empty() {
         let custom_channels: std::collections::HashSet<u8> = b
             .custom_channels
             .iter()
@@ -1297,6 +1300,21 @@ fn build_all_notes(
         merged
     } else {
         render::generate_notes(notes_arrays, beats, rcfg)
+    };
+    // Play-along REC : le canal en cours d'enregistrement est EXCLU de la
+    // lecture (l'utilisateur joue cette piste lui-même — il entend les
+    // autres en accompagnement).
+    filter_excluded(out, excluded)
+}
+
+/// Filtre les notes du canal exclu (play-along REC). Fonction pure.
+fn filter_excluded(
+    notes: Vec<render::CustomNote>,
+    excluded: Option<u8>,
+) -> Vec<render::CustomNote> {
+    match excluded {
+        Some(ch) => notes.into_iter().filter(|n| n.channel != ch).collect(),
+        None => notes,
     }
 }
 
@@ -2543,6 +2561,25 @@ mod tests {
         // Avec boucle : même note gardée (elle rejouera aux cycles suivants)
         let sel = select_notes(notes, true, 12.0, 0.0, 32.0);
         assert_eq!(sel.len(), 2);
+    }
+
+    /// filter_excluded : le canal exclu (play-along REC) ne sort AUCUNE note.
+    #[test]
+    fn filter_excluded_exclut_le_canal_rec() {
+        let cn = |ch: u8| render::CustomNote {
+            channel: ch, start_time: 0.0, pitch: 60, duration: 1.0, velocity: 100,
+        };
+        let notes = vec![cn(2), cn(3), cn(2)];
+        // Canal 2 exclu → seules les notes du canal 3 restent.
+        let out = filter_excluded(notes.clone(), Some(2));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].channel, 3, "le canal exclu ne doit pas être joué");
+        // Sans exclusion : toutes les notes sortent, ordre conservé.
+        let out = filter_excluded(notes.clone(), None);
+        assert_eq!(out.len(), 3);
+        // Le canal drums (9) peut aussi être exclu (piste drums enregistrée).
+        let out = filter_excluded(notes, Some(9));
+        assert_eq!(out.len(), 3, "pas de canal 9 ici → rien d'exclu");
     }
 
     /// select_notes : une note avant le locator gauche reste dans la liste
