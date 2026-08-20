@@ -421,15 +421,16 @@ pub fn render_wav_with_engine(
             Engine::Sfz(p) => render_sfz(&notes, tempo, p.as_str(), duration_sec)?,
             Engine::Vst3(p) => render_vst3(&notes, tempo, p.as_str(), duration_sec)?,
         };
-        // Les banques SFZ (ex. piano Salamander) et les patches VST3 sont
-        // souvent échantillonnés en douceur — bien plus faibles que les
-        // instruments GM de FluidSynth. Gain fixe de compensation (+6 dB)
-        // sur les pistes SFZ/VST3, pour un niveau de présence comparable.
-        // (Pas de normalisation par piste : elle s'additionnerait au pic du
-        // mix et ferait tout redescendre à la normalisation finale.)
+        // Les banques SFZ (ex. piano Salamander, cymbales enregistrées en
+        // douceur) et les patches VST3 ont des niveaux internes très variables.
+        // Normalisation RMS par piste (-20 dBFS) : chaque instrument externe
+        // sort avec un niveau PERÇU comparable, quelle que soit la douceur de
+        // ses samples — la balance entre pistes devient prévisible (le volume
+        // de piste reste le réglage fin). Soft clip tanh contre les transients.
+        // (Le mix final re-normalise au pic — la balance RMS est conservée.)
         let wav = match &engine {
             Engine::FluidSynth => wav,
-            Engine::Sfz(_) | Engine::Vst3(_) => apply_gain_linear(&wav, 2.0),
+            Engine::Sfz(_) | Engine::Vst3(_) => normalize_rms(&wav, -20.0),
         };
         let wav = if t.fx.is_off() {
             wav
@@ -516,9 +517,10 @@ pub fn mix_tracks(tracks: &[crate::render::RenderedTrack], master_vol: u8) -> Re
     Ok(crate::render::fade_out_wav(&buf, 30))
 }
 
-/// Applique un gain linéaire uniforme à un WAV PCM i16 (avec saturation
-/// douce tanh au-delà de 1.0 — pas de clipping dur). Spec conservée.
-pub fn apply_gain_linear(wav: &[u8], gain: f32) -> Vec<u8> {
+/// Normalise un WAV PCM i16 à un niveau RMS cible (dBFS, négatif) — gain
+/// uniforme + saturation douce tanh (les transients ne clippent pas dur).
+/// Spec conservée. WAV invalide/silencieux → renvoyé tel quel.
+pub fn normalize_rms(wav: &[u8], target_db: f32) -> Vec<u8> {
     use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
     let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
         return wav.to_vec();
@@ -528,6 +530,14 @@ pub fn apply_gain_linear(wav: &[u8], gain: f32) -> Vec<u8> {
     if samples.is_empty() {
         return wav.to_vec();
     }
+    let sum_sq: f64 = samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum();
+    let rms = (sum_sq / samples.len() as f64).sqrt() as f32;
+    if rms < 1.0 {
+        return wav.to_vec();
+    }
+    let target = 10f32.powf(target_db / 20.0) * 32767.0; // cible en unités i16
+    let gain = target / rms;
+
     let out_spec = WavSpec {
         channels: spec.channels,
         sample_rate: spec.sample_rate,
@@ -538,7 +548,6 @@ pub fn apply_gain_linear(wav: &[u8], gain: f32) -> Vec<u8> {
     if let Ok(mut w) = WavWriter::new(std::io::Cursor::new(&mut out), out_spec) {
         for &s in &samples {
             let v = (s as f32 / 32767.0) * gain;
-            // Saturation douce (tanh) au-delà de ±1 — garde la tête propre.
             let v = if v.abs() > 1.0 { v.tanh() } else { v };
             let _ = w.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16);
         }
