@@ -114,7 +114,11 @@ impl Default for MpeState {
             bend: BEND_CENTER,
             pressure: 0,
             timbre: TIMBRE_CENTER,
-            pitch_range_st: 48,
+            // Range par défaut ±2 : le bend musical classique (pitch wheel).
+            // Le Roland ignore le RPN (fixe ±2) → le mode Auto est subtil ;
+            // FluidSynth, lui, l'applique → ±48 rendait le mode PC violent
+            // (8 octaves sur le strip). Réglable ±2..±48 (slides MPE).
+            pitch_range_st: 2,
             lfo: Lfo::default(),
             target: MpeTarget::Auto,
             program: 0,
@@ -356,9 +360,10 @@ mod tests {
     #[test]
     fn effective_bend_borne_entre_0_et_16383() {
         let mut st = MpeState::default();
+        st.pitch_range_st = 48; // range explicite pour le test
         st.bend = 0; // bend au plus bas
         st.lfo = Lfo { freq: 1.0, depth_st: 48.0, shape: LfoShape::Square };
-        // t=0 → +8192 → clamp à 16383 (0 + 8192 = 8192, pas de dépassement)
+        // t=0 → +8192 → 0 + 8192 = 8192
         assert_eq!(effective_bend(&st, 0), 8192);
         st.bend = 10000;
         st.lfo = Lfo { freq: 1.0, depth_st: 24.0, shape: LfoShape::Square };

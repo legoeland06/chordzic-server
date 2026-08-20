@@ -254,20 +254,37 @@ struct AppState {
     live_input: Arc<live_input::LiveInputState>,
 }
 
+/// Ports MIDI disponibles, en cache (TTL ~250 ms) : l'énumération ALSA via
+/// PipeWire est coûteuse (~ms) et le flux MPE envoie ~180 messages/s — la
+/// re-scan à chaque message ferait s'empiler les gestes (bend saccadé).
+static PORT_SCAN_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PORT_SCAN_CACHE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+fn available_ports_cached() -> Vec<String> {
+    let now = epoch_ms();
+    let mut cache = PORT_SCAN_CACHE.lock().unwrap();
+    if cache.is_none() || now.saturating_sub(PORT_SCAN_LAST.load(std::sync::atomic::Ordering::Relaxed)) > 250 {
+        let fresh = MidiOutput::new("chords-server-rs")
+            .map(|mo| mo.ports().iter().filter_map(|x| mo.port_name(x).ok()).collect())
+            .unwrap_or_default();
+        PORT_SCAN_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+        *cache = Some(fresh);
+    }
+    cache.clone().unwrap_or_default()
+}
+
 /// Envoie un message MIDI vers la sortie live, avec reconnexion automatique.
 ///
 /// midir ne signale PAS d'erreur quand le port ALSA a disparu (FluidSynth
 /// redémarré) : le message partirait dans le vide. On compare donc le nom du
-/// port connecté à la liste des ports actuellement disponibles — s'il n'y est
-/// plus, on rouvre une connexion (init_midi) avant d'envoyer.
+/// port connecté à la liste des ports actuellement disponibles (cache TTL
+/// 250 ms — voir `available_ports_cached`) — s'il n'y est plus, on rouvre
+/// une connexion (init_midi) avant d'envoyer.
 /// Retourne true si le message est parti.
 fn midi_send_raw(midi: &Arc<Mutex<Option<MidiLink>>>, msg: &[u8]) -> bool {
     let mut guard = midi.lock().unwrap();
 
-    // Ports actuellement disponibles (énumération légère, ~µs)
-    let available: Vec<String> = MidiOutput::new("chords-server-rs")
-        .map(|mo| mo.ports().iter().filter_map(|x| mo.port_name(x).ok()).collect())
-        .unwrap_or_default();
+    let available = available_ports_cached();
 
     // Connexion absente ou port disparu → (re)connecter
     let stale = match guard.as_ref() {
@@ -3160,7 +3177,7 @@ mod tests {
         assert_eq!(v["bend"], 10000);
         assert_eq!(v["pressure"], 60);
         assert_eq!(v["timbre"], 30);
-        assert_eq!(v["pitch_range_st"], 48);
+        assert_eq!(v["pitch_range_st"], 2, "range par défaut ±2 (bend musical)");
         assert_eq!(v["target_channel"], 0, "canal par défaut = 0 (canal de jeu 1, 0-indexé)");
         assert_eq!(v["lfo_freq"], 0.0);
 
