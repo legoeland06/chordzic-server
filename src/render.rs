@@ -597,7 +597,7 @@ pub fn apply_gain(wav: &[u8], master_vol: u8) -> Vec<u8> {
 /// la boucle reste synchrone), mais les queues de notes/réverbération
 /// dépassent → coupure nette (clic) à la boucle. Un fade-out court
 /// (80 ms) rend la transition douce sans créer de silence perceptible.
-fn fade_out_wav(wav: &[u8], fade_ms: u64) -> Vec<u8> {
+pub(crate) fn fade_out_wav(wav: &[u8], fade_ms: u64) -> Vec<u8> {
     use hound::WavReader;
     let Ok(mut reader) = WavReader::new(std::io::Cursor::new(wav)) else {
         return wav.to_vec();

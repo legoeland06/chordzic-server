@@ -26,6 +26,7 @@
 /// - `grilles`  : sauvegarde/chargement des grilles en JSON
 mod click;
 mod dsp;
+mod engine;
 mod external_render;
 mod grilles;
 mod live_input;
@@ -406,6 +407,14 @@ struct PlayReq {
     #[serde(default)]
     rec_after_beats: Option<f64>,    // Décompte REC : active l'enregistrement
                                      // après N beats (même horloge que la lecture)
+    /// Moteur de rendu pour /render-wav : "fluidsynth" (défaut) | "sfz" | "vst3".
+    #[serde(default)]
+    engine: Option<String>,
+    /// Instruments par canal pour le rendu non-FluidSynth :
+    /// { canal: chemin du fichier .sfz ou du bundle .vst3 }.
+    /// Exemple : {"9": "/chemin/ALL.sfz", "0": "/chemin/Piano.sfz"}.
+    #[serde(default)]
+    instruments: Option<std::collections::HashMap<u8, String>>,
 }
 
 /// Réponse standardisée du serveur.
@@ -889,12 +898,44 @@ async fn render_wav(
         .unwrap_or(total_beats);
     let duration_sec = end_beats * 60.0 / tempo_f;
 
-    // ── Rendu : simple (1 passe, rapide) ou par piste (si effets actifs) ──
+    // ── Rendu : moteur FluidSynth (historique) ou instruments libres ──
+    // (`engine`: "fluidsynth" défaut | "sfz" | "vst3` ; `instruments`:
+    // canal → chemin .sfz ou .vst3 — les canaux absents tombent en FluidSynth).
+    let mode = b.engine.as_deref().unwrap_or("fluidsynth");
     let has_fx = rcfg.tracks.iter().any(|t| !t.fx.is_off());
-    let render_result = if has_fx {
-        render::render_wav_mixed(&all_notes, &rcfg, sf_path, duration_sec, b.master_vol)
+    let render_result = if mode == "fluidsynth" {
+        if has_fx {
+            render::render_wav_mixed(&all_notes, &rcfg, sf_path, duration_sec, b.master_vol)
+        } else {
+            render::render_wav(&smf, sf_path, duration_sec, b.master_vol)
+        }
     } else {
-        render::render_wav(&smf, sf_path, duration_sec, b.master_vol)
+        let Some(insts) = b.instruments.as_ref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Moteur '{mode}' : fournis `instruments` (canal → chemin .sfz/.vst3)"),
+            )
+                .into_response();
+        };
+        let emap: std::collections::HashMap<u8, engine::Engine> = insts
+            .iter()
+            .map(|(ch, p)| {
+                let e = match mode {
+                    "sfz" => engine::Engine::Sfz(p.clone()),
+                    "vst3" => engine::Engine::Vst3(p.clone()),
+                    _ => engine::Engine::FluidSynth,
+                };
+                (*ch, e)
+            })
+            .collect();
+        engine::render_wav_with_engine(
+            &all_notes,
+            &rcfg,
+            &emap,
+            duration_sec,
+            b.master_vol,
+            sf_path,
+        )
     };
 
     match render_result {
@@ -2694,6 +2735,53 @@ async fn pad_stop(State(s): State<AppState>) -> impl IntoResponse {
 
 /// Construit le routeur Axum complet (routes API + fallback frontend).
 /// Séparé de `main` pour être testable : les tests d'intégration HTTP
+/// GET /instruments-list — Liste les instruments disponibles pour le rendu
+/// hors-FluidSynth : banques SFZ (scan `~/Dev/zic_dev/dev/vst3_instruments`)
+/// + plugins VST3 natifs (scan `~/.vst3` via vst3-host).
+async fn instruments_list() -> impl IntoResponse {
+    #[derive(serde::Serialize)]
+    struct Instrument {
+        name: String,
+        path: String,
+        kind: String, // "sfz" | "vst3"
+    }
+    let mut out: Vec<Instrument> = Vec::new();
+
+    // SFZ : dossier d'instruments libres
+    let home = std::env::var("HOME").unwrap_or_default();
+    let root = std::path::PathBuf::from(&home).join("Dev/zic_dev/dev/vst3_instruments");
+    if root.exists() {
+        for (name, path) in engine::scan_sfz_instruments(&root) {
+            out.push(Instrument {
+                name,
+                path,
+                kind: "sfz".into(),
+            });
+        }
+    }
+
+    // VST3 : scan ~/.vst3 (in-process)
+    let vst3_dir = std::path::PathBuf::from(&home).join(".vst3");
+    match vst3_host::Vst3Host::builder()
+        .add_scan_path(vst3_dir)
+        .build()
+        .and_then(|mut h| h.discover_plugins())
+    {
+        Ok(plugins) => {
+            for p in plugins {
+                out.push(Instrument {
+                    name: p.name,
+                    path: p.path.display().to_string(),
+                    kind: "vst3".into(),
+                });
+            }
+        }
+        Err(e) => eprintln!("Scan VST3 impossible : {e}"),
+    }
+
+    axum::Json(out)
+}
+
 /// montent l'app en mémoire (tower::ServiceExt::oneshot) sans socket.
 ///
 /// En mode standalone, les routes du frontend sont servies par
@@ -2705,6 +2793,7 @@ fn build_app(state: AppState) -> Router {
         .route("/config", post(conf))
         .route("/stop", post(stop))
         .route("/render-wav", post(render_wav))
+        .route("/instruments-list", get(instruments_list))
         .route("/render-external", post(render_external))
         .route("/render-tracks", post(render_tracks))
         .route("/render-notes", post(render_notes))

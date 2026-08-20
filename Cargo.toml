@@ -17,6 +17,8 @@ midir = "0.9"
 rodio = "0.18"
 cpal = "0.15"
 hound = "3.5"
+midly = "0.5"
+vst3-host = { version = "0.4", default-features = false }
 ureq = "2"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
