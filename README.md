@@ -95,6 +95,7 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 | POST | `/render-notes` | Notes isolées (pré-remplissage piano roll) |
 | GET | `/live-input` | Notes tenues sur le clavier du pianiste (ordre d'arrivée) |
 | POST | `/live-echo` | Écho MIDI + program change de la piste sélectionnée |
+| POST | `/piano-note` | LivePiano cliquable : note-on/off vers le Roland (canal piste cible, sinon écho/1) |
 | POST | `/rec-midi` · GET `/rec-midi-state` | Enregistrement MIDI horodaté (mode Navig) |
 | POST | `/tts` | Synthèse vocale Piper (proxy, renvoie un WAV) |
 | GET | `/samples-list` · `/sample-file/:name` | Échantillons |
@@ -104,7 +105,7 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 | GET/POST | `/click` | Configuration / état du métronome |
 | POST | `/navig-click-start` / `/navig-click-stop` | Métronome en mode navigation |
 | POST | `/navig-play` | Lecture navigation (double canaux) |
-| POST | `/navig-play-midi` / `/navig-stop-midi` | Lecture MIDI de toutes les pistes (`exclude_channel` = play-along REC : la piste enregistrée ne joue pas) |
+| POST | `/navig-play-midi` / `/navig-stop-midi` | Lecture MIDI de toutes les pistes (`exclude_channel` = play-along REC, `rec_after_beats` = décompte intégré avant l'enregistrement) |
 | POST | `/save` · GET `/grilles` · DELETE `/grilles/:name` | Persistance des grilles |
 
 ## Tracks MIDI par défaut
