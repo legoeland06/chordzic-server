@@ -11,6 +11,8 @@
 use midir::{MidiInput, MidiInputConnection};
 use std::sync::{Arc, Mutex};
 
+use crate::mpe::{self, MpeState};
+
 /// Canal drums GM (10 en 1-indexé = 9 en 0-indexé) — jamais pris en compte
 /// pour la reconnaissance d'accords (percussions ≠ accords).
 pub const DRUM_CHANNEL: u8 = 9;
@@ -52,11 +54,18 @@ pub struct RecSession {
     pub notes: Vec<RecNote>,
     /// pitch → index dans `notes` (retrouver la note à la relâche).
     pub held: std::collections::HashMap<u8, usize>,
+    /// Événements d'expression MPE horodatés (gestes de la modal 🎛).
+    pub expr: Vec<mpe::RecExpr>,
 }
 
 impl RecSession {
     pub fn new() -> Self {
-        Self { start: std::time::Instant::now(), notes: Vec::new(), held: std::collections::HashMap::new() }
+        Self {
+            start: std::time::Instant::now(),
+            notes: Vec::new(),
+            held: std::collections::HashMap::new(),
+            expr: Vec::new(),
+        }
     }
 
     /// ms écoulées depuis le début de la session.
@@ -121,6 +130,59 @@ pub fn echo_message(msg: &[u8], echo: &EchoConfig) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Canal cible des modulations MPE : canal de l'écho ✨ si actif, sinon canal
+/// explicite de la modal, sinon canal 1 (canal de jeu par défaut du piano).
+/// Fonction pure (testable sans matériel).
+pub fn resolve_mpe_channel(mpe: &MpeState, echo: &EchoConfig) -> u8 {
+    if echo.enabled {
+        if let Some(ch) = echo.channel {
+            return ch;
+        }
+    }
+    mpe.channel.unwrap_or(1)
+}
+
+/// Monitoring MPE : quand la modal 🎛 est ouverte (et qu'aucun écho ✨ n'est
+/// déjà actif), les notes du pianiste et la pédale sont renvoyées sur le canal
+/// cible MPE — le serveur redevient maître du son (Local Control OFF) et peut
+/// y injecter les modulations. Retourne None si rien à relayer.
+/// Fonction pure (testable sans matériel).
+pub fn monitor_message(msg: &[u8], mpe: &MpeState, echo: &EchoConfig) -> Option<Vec<u8>> {
+    // Écho ✨ prioritaire : il relaie déjà notes + sustain sur le canal piste.
+    if echo.enabled {
+        return echo_message(msg, echo);
+    }
+    if !mpe.enabled || msg.len() < 2 {
+        return None;
+    }
+    let channel = resolve_mpe_channel(mpe, echo);
+    let high = msg[0] & 0xF0;
+    let is_note = high == 0x90 || high == 0x80;
+    let is_sustain = high == 0xB0 && msg.len() >= 3 && msg[1] == 64;
+    if !is_note && !is_sustain {
+        return None;
+    }
+    let mut out = msg.to_vec();
+    out[0] = high | (channel & 0x0F);
+    Some(out)
+}
+
+/// Messages d'expression MPE à envoyer sur le canal cible (bend effectif LFO
+/// inclus, aftertouch, timbre) — appelé après chaque note relayée pour que la
+/// modulation s'applique dès l'appui, et par le ticker LFO en continu.
+/// `t_ms` : instant courant (pour la phase du LFO). Fonction pure.
+pub fn mpe_expression_out(mpe: &MpeState, echo: &EchoConfig, t_ms: u64) -> Vec<Vec<u8>> {
+    if !mpe.enabled {
+        return Vec::new();
+    }
+    let ch = resolve_mpe_channel(mpe, echo);
+    vec![
+        mpe::pitch_bend_message(ch, mpe::effective_bend(mpe, t_ms)),
+        mpe::channel_pressure_message(ch, mpe.pressure),
+        mpe::timbre_message(ch, mpe.timbre),
+    ]
+}
+
 /// Messages à envoyer pour une note jouée au clic sur le LivePiano :
 /// note-on (vel > 0) ou note-off (0x80) sur le canal cible.
 /// Fonction pure (testable sans matériel).
@@ -179,6 +241,9 @@ pub struct LiveInputState {
     pub rec_comp_ms: std::sync::atomic::AtomicU64,
     /// Émetteur MIDI (configuré par main.rs avec la sortie réelle).
     sender: Mutex<Option<Box<dyn Fn(&[u8]) + Send + Sync>>>,
+    /// État MPE (modal 🎛) : monitoring des notes + modulations d'expression
+    /// (bend / aftertouch / timbre) injectées dans le flux renvoyé au clavier.
+    pub mpe: Mutex<MpeState>,
 }
 
 impl LiveInputState {
@@ -192,6 +257,7 @@ impl LiveInputState {
             rec: Arc::new(Mutex::new(None)),
             rec_comp_ms: std::sync::atomic::AtomicU64::new(2),
             sender: Mutex::new(None),
+            mpe: Mutex::new(MpeState::default()),
         })
     }
 }
@@ -277,13 +343,27 @@ pub fn start(shared: &Arc<LiveInputState>) {
             if msg.len() >= 3 && (msg[0] & 0xF0) == 0xB0 && msg[1] == 64 {
                 shared2.sustain.store(msg[2] >= 64, std::sync::atomic::Ordering::Relaxed);
             }
-            // Écho vers la sortie (mode Navig ✨) : le pianiste entend le son
-            // (program) de la piste sélectionnée sur le canal de celle-ci —
-            // notes ET pédale de sustain (les notes écho durent avec la pédale).
+            // Écho vers la sortie (mode Navig ✨) OU monitoring MPE (modal 🎛) :
+            // le pianiste entend le son renvoyé (notes + pédale) — avec le
+            // program de la piste (écho) ou le son du canal cible (MPE).
             let cfg = shared2.echo.lock().unwrap();
-            if let Some(out) = echo_message(msg, &cfg) {
+            let mpe_state = shared2.mpe.lock().unwrap();
+            if let Some(out) = monitor_message(msg, &mpe_state, &cfg) {
                 if let Some(sender) = shared2.sender.lock().unwrap().as_ref() {
                     sender(&out);
+                }
+            }
+            // Modulations MPE injectées dès l'appui (bend effectif LFO inclus,
+            // aftertouch, timbre) — le son entendu est modulé en direct.
+            if mpe_state.enabled {
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                for expr in mpe_expression_out(&mpe_state, &cfg, t) {
+                    if let Some(sender) = shared2.sender.lock().unwrap().as_ref() {
+                        sender(&expr);
+                    }
                 }
             }
             // Enregistrement MIDI (mode Navig, Rec) : les notes jouées sont
@@ -481,5 +561,87 @@ mod tests {
     #[test]
     fn program_change_drums_sans_banque_vide() {
         assert_eq!(program_change_messages(9, 1, 0, 0), Vec::<Vec<u8>>::new());
+    }
+
+    // ── MPE : monitoring + modulations ──
+
+    fn mpe_on(channel: Option<u8>) -> MpeState {
+        MpeState { enabled: true, channel, ..Default::default() }
+    }
+
+    #[test]
+    fn resolve_canal_echo_puis_mpe_puis_1() {
+        let echo_on = EchoConfig { enabled: true, channel: Some(5) };
+        let echo_off = EchoConfig { enabled: false, channel: None };
+        // Écho actif → canal de la piste
+        assert_eq!(resolve_mpe_channel(&mpe_on(None), &echo_on), 5);
+        // Pas d'écho → canal explicite de la modal
+        assert_eq!(resolve_mpe_channel(&mpe_on(Some(3)), &echo_off), 3);
+        // Rien → canal 1 (jeu par défaut)
+        assert_eq!(resolve_mpe_channel(&mpe_on(None), &echo_off), 1);
+        // MPE désactivé → canal 1 par défaut
+        assert_eq!(resolve_mpe_channel(&MpeState::default(), &echo_off), 1);
+    }
+
+    #[test]
+    fn monitor_sans_echo_relaie_notes_et_sustain_sur_canal_mpe() {
+        let echo_off = EchoConfig::default();
+        let m = mpe_on(None); // canal cible = 1
+        let on = monitor_message(&[0x90, 60, 100], &m, &echo_off).unwrap();
+        assert_eq!(on, vec![0x91, 60, 100]); // remappé sur le canal 1
+        let off = monitor_message(&[0x80, 64, 64], &m, &echo_off).unwrap();
+        assert_eq!(off, vec![0x81, 64, 64]);
+        let sus = monitor_message(&[0xB0, 64, 127], &m, &echo_off).unwrap();
+        assert_eq!(sus, vec![0xB1, 64, 127]);
+    }
+
+    #[test]
+    fn monitor_mpe_desactive_ou_sur_non_note_ne_relaie_rien() {
+        let echo_off = EchoConfig::default();
+        let off = MpeState::default(); // disabled
+        assert_eq!(monitor_message(&[0x90, 60, 100], &off, &echo_off), None);
+        let m = mpe_on(None);
+        assert_eq!(monitor_message(&[0xB0, 7, 100], &m, &echo_off), None); // CC volume
+        assert_eq!(monitor_message(&[0xC0, 5], &m, &echo_off), None); // PC
+        assert_eq!(monitor_message(&[0x90], &m, &echo_off), None); // trop court
+    }
+
+    #[test]
+    fn monitor_echo_prioritaire_sur_mpe() {
+        let echo_on = EchoConfig { enabled: true, channel: Some(5) };
+        let m = mpe_on(None);
+        let out = monitor_message(&[0x90, 60, 100], &m, &echo_on).unwrap();
+        assert_eq!(out, vec![0x95, 60, 100]); // canal de la piste, pas le MPE
+    }
+
+    #[test]
+    fn expression_out_envoie_bend_at_timbre_sur_le_bon_canal() {
+        let echo_off = EchoConfig::default();
+        let mut m = mpe_on(None);
+        m.bend = 9000;
+        m.pressure = 80;
+        m.timbre = 30;
+        let out = mpe_expression_out(&m, &echo_off, 0);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], vec![0xE1, (9000 & 0x7F) as u8, ((9000 >> 7) & 0x7F) as u8]); // bend canal 1
+        assert_eq!(out[1], vec![0xD1, 80]); // aftertouch
+        assert_eq!(out[2], vec![0xB1, 74, 30]); // timbre
+    }
+
+    #[test]
+    fn expression_out_sur_canal_de_echo() {
+        let echo_on = EchoConfig { enabled: true, channel: Some(7) };
+        let m = mpe_on(None);
+        let out = mpe_expression_out(&m, &echo_on, 0);
+        assert_eq!(out[0][0], 0xE7); // bend sur le canal 7
+        assert_eq!(out[1][0], 0xD7);
+        assert_eq!(out[2][0], 0xB7);
+    }
+
+    #[test]
+    fn expression_out_desactive_si_mpe_off() {
+        let echo_off = EchoConfig::default();
+        let off = MpeState::default();
+        assert_eq!(mpe_expression_out(&off, &echo_off, 0), Vec::<Vec<u8>>::new());
     }
 }

@@ -30,6 +30,7 @@ mod external_render;
 mod grilles;
 mod live_input;
 mod midi;
+mod mpe;
 mod patterns;
 mod render;
 mod samples;
@@ -2226,8 +2227,8 @@ async fn rec_midi(State(s): State<AppState>, Json(b): Json<RecMidiReq>) -> impl 
         axum::Json(serde_json::json!({ "ok": true }))
     } else {
         let started = rec.is_some(); // session activée par le décompte serveur ?
-        let notes = rec.take().map(|sess| sess.notes).unwrap_or_default();
-        axum::Json(serde_json::json!({ "ok": true, "notes": notes, "started": started }))
+        let (notes, expr) = rec.take().map(|sess| (sess.notes, sess.expr)).unwrap_or_default();
+        axum::Json(serde_json::json!({ "ok": true, "notes": notes, "expr": expr, "started": started }))
     }
 }
 
@@ -2262,6 +2263,192 @@ async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> imp
         enabled: b.enabled,
         channel: b.channel,
     };
+    axum::Json(serde_json::json!({ "ok": true }))
+}
+
+// ─── Modal MPE (🎛) — simulation de contrôleur MPE ───────────────────────
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// POST /mpe — contrôle de la modal MPE : active le monitoring des notes du
+/// pianiste (relais sur le canal cible, son maîtrisé par le serveur — Local
+/// Control OFF), met à jour les modulations (bend / aftertouch / timbre /
+/// LFO) et les envoie IMMÉDIATEMENT au récepteur. Si une session Rec MIDI
+/// tourne, chaque geste est horodaté (RecExpr) pour être réappliqué au rendu.
+#[derive(Deserialize)]
+struct MpeReq {
+    /// Monitoring MPE actif ? (modal ouverte)
+    enabled: bool,
+    /// Pitch bend manuel (0-16383, centre 8192).
+    bend: Option<u16>,
+    /// Channel pressure (0-127).
+    pressure: Option<u8>,
+    /// Timbre CC74 (0-127).
+    timbre: Option<u8>,
+    /// Range de bend en demi-tons (RPN 0), défaut 48.
+    pitch_range_st: Option<u8>,
+    /// Fréquence LFO en Hz (0 = off).
+    lfo_freq: Option<f32>,
+    /// Profondeur LFO en demi-tons.
+    lfo_depth_st: Option<f32>,
+    /// Forme d'onde du LFO.
+    lfo_shape: Option<mpe::LfoShape>,
+    /// Canal cible explicite (None = auto : écho ✨ sinon 1).
+    channel: Option<u8>,
+}
+
+async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoResponse {
+    let was_enabled;
+    let mut st;
+    {
+        let m = s.live_input.mpe.lock().unwrap();
+        was_enabled = m.enabled;
+        st = *m; // Copy — jamais de lock mpe+echo simultanés (deadlock)
+    }
+
+    // Appliquer les changements demandés par la modal
+    st.enabled = b.enabled;
+    if let Some(v) = b.bend {
+        st.bend = v;
+    }
+    if let Some(v) = b.pressure {
+        st.pressure = v;
+    }
+    if let Some(v) = b.timbre {
+        st.timbre = v;
+    }
+    if let Some(v) = b.pitch_range_st {
+        st.pitch_range_st = v;
+    }
+    if let Some(v) = b.lfo_freq {
+        st.lfo.freq = v;
+    }
+    if let Some(v) = b.lfo_depth_st {
+        st.lfo.depth_st = v;
+    }
+    if let Some(v) = b.lfo_shape {
+        st.lfo.shape = v;
+    }
+    if b.channel.is_some() {
+        st.channel = b.channel;
+    }
+
+    // Canal cible (copies — echo locké seul)
+    let ch = {
+        let e = s.live_input.echo.lock().unwrap();
+        live_input::resolve_mpe_channel(&st, &e)
+    };
+
+    if st.enabled && !was_enabled {
+        // Activation : préparer le récepteur (RPN range + état courant) et
+        // relancer la pédale de sustain (comme live-echo).
+        for msg in mpe::rpn_pitch_range_messages(ch, st.pitch_range_st) {
+            midi_send(&s, &msg);
+        }
+        for msg in mpe::expression_messages(ch, st.bend, st.pressure, st.timbre, None) {
+            midi_send(&s, &msg);
+        }
+        let sustain = s.live_input.sustain.load(std::sync::atomic::Ordering::Relaxed);
+        midi_send(&s, &[0xB0 | ch, 64, if sustain { 127 } else { 0 }]);
+    } else if st.enabled {
+        // Geste : envoi immédiat (bend effectif LFO inclus, AT, timbre)
+        let t = epoch_ms();
+        midi_send(&s, &mpe::pitch_bend_message(ch, mpe::effective_bend(&st, t)));
+        midi_send(&s, &mpe::channel_pressure_message(ch, st.pressure));
+        midi_send(&s, &mpe::timbre_message(ch, st.timbre));
+        // Changement de range : re-poser le RPN 0
+        if let Some(r) = b.pitch_range_st {
+            for msg in mpe::rpn_pitch_range_messages(ch, r) {
+                midi_send(&s, &msg);
+            }
+        }
+    } else if was_enabled {
+        // Fermeture : remettre l'expression à zéro (bend centre, AT 0,
+        // timbre neutre) — sinon les notes suivantes gardent le bend.
+        for msg in mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None) {
+            midi_send(&s, &msg);
+        }
+    }
+
+    // Enregistrer le nouvel état (même si désactivé)
+    *s.live_input.mpe.lock().unwrap() = st;
+
+    // N2 — capture du geste si une session Rec MIDI tourne
+    let gesture = b.bend.is_some()
+        || b.pressure.is_some()
+        || b.timbre.is_some()
+        || b.pitch_range_st.is_some()
+        || b.lfo_freq.is_some()
+        || b.lfo_depth_st.is_some()
+        || b.lfo_shape.is_some();
+    if gesture {
+        if let Ok(mut rec) = s.live_input.rec.lock() {
+            if let Some(session) = rec.as_mut() {
+                let comp = s.live_input.rec_comp_ms.load(std::sync::atomic::Ordering::Relaxed) as u64;
+                let now = session.now_ms().saturating_sub(comp);
+                session.expr.push(mpe::RecExpr {
+                    t_ms: now,
+                    bend: b.bend,
+                    pressure: b.pressure,
+                    timbre: b.timbre,
+                    pitch_range_st: b.pitch_range_st,
+                    lfo: if b.lfo_freq.is_some() || b.lfo_depth_st.is_some() || b.lfo_shape.is_some() {
+                        Some((st.lfo.freq, st.lfo.depth_st))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+    }
+
+    axum::Json(serde_json::json!({ "ok": true }))
+}
+
+/// GET /mpe-state — état courant de la modal MPE + notes tenues + canal
+/// cible résolu + session Rec active (affichage temps réel de la modal).
+async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
+    let mpe = *s.live_input.mpe.lock().unwrap();
+    let echo = *s.live_input.echo.lock().unwrap();
+    let ch = live_input::resolve_mpe_channel(&mpe, &echo);
+    let active = s.live_input.active.lock().unwrap().clone();
+    let rec_active = s.live_input.rec.lock().unwrap().is_some();
+    axum::Json(serde_json::json!({
+        "enabled": mpe.enabled,
+        "bend": mpe.bend,
+        "pressure": mpe.pressure,
+        "timbre": mpe.timbre,
+        "pitch_range_st": mpe.pitch_range_st,
+        "lfo_freq": mpe.lfo.freq,
+        "lfo_depth_st": mpe.lfo.depth_st,
+        "lfo_shape": mpe.lfo.shape,
+        "channel": mpe.channel,
+        "target_channel": ch,
+        "echo_active": echo.enabled,
+        "notes": active,
+        "rec_active": rec_active,
+        "effective_bend": mpe::effective_bend(&mpe, epoch_ms()),
+    }))
+}
+
+/// POST /mpe-reset — remet l'expression à zéro (bend centre, AT 0, CC74
+/// neutre) et l'envoie au récepteur. Évite les notes « bloquées » en bend.
+async fn mpe_reset(State(s): State<AppState>) -> impl IntoResponse {
+    let ch;
+    {
+        let mut m = s.live_input.mpe.lock().unwrap();
+        m.reset();
+        let e = s.live_input.echo.lock().unwrap();
+        ch = live_input::resolve_mpe_channel(&m, &e);
+    }
+    for msg in mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None) {
+        midi_send(&s, &msg);
+    }
     axum::Json(serde_json::json!({ "ok": true }))
 }
 
@@ -2313,6 +2500,9 @@ fn build_app(state: AppState) -> Router {
         .route("/midi-port", post(midi_port))
         .route("/live-input", get(live_input))
         .route("/live-echo", post(live_echo))
+        .route("/mpe", post(mpe))
+        .route("/mpe-state", get(mpe_state))
+        .route("/mpe-reset", post(mpe_reset))
         .route("/rec-midi", post(rec_midi))
         .route("/rec-midi-state", get(rec_midi_state))
         .route("/tts", post(tts))
@@ -2418,6 +2608,54 @@ async fn main() {
     live_input::set_echo_sender(&state.live_input, Box::new(move |msg: &[u8]| {
         midi_send_raw(&midi_out, msg);
     }));
+
+    // Ticker MPE (modal 🎛) : rafraîchit le bend LFO en continu (~20 ms) tant
+    // que le monitoring est actif — le vibrato auto oscille même sans geste
+    // manuel. N'envoie que lorsque la valeur effective change (pas de spam).
+    let ticker_input = state.live_input.clone();
+    let ticker_midi = state.midi.clone();
+    std::thread::spawn(move || {
+        let mut last_bend: Option<u16> = None;
+        let mut last_pressure: Option<u8> = None;
+        let mut last_timbre: Option<u8> = None;
+        let mut last_ch: Option<u8> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let t = epoch_ms();
+            let (ch, bend, pressure, timbre) = {
+                let m = ticker_input.mpe.lock().unwrap();
+                let e = ticker_input.echo.lock().unwrap();
+                if !m.enabled {
+                    last_bend = None;
+                    last_pressure = None;
+                    last_timbre = None;
+                    last_ch = None;
+                    continue;
+                }
+                (
+                    live_input::resolve_mpe_channel(&m, &e),
+                    mpe::effective_bend(&m, t),
+                    m.pressure,
+                    m.timbre,
+                )
+            };
+            if last_ch != Some(ch) {
+                last_ch = Some(ch);
+                last_bend = None; // canal changé → force le renvoi
+                last_pressure = None;
+                last_timbre = None;
+            }
+            if last_bend == Some(bend) && last_pressure == Some(pressure) && last_timbre == Some(timbre) {
+                continue;
+            }
+            last_bend = Some(bend);
+            last_pressure = Some(pressure);
+            last_timbre = Some(timbre);
+            midi_send_raw(&ticker_midi, &mpe::pitch_bend_message(ch, bend));
+            midi_send_raw(&ticker_midi, &mpe::channel_pressure_message(ch, pressure));
+            midi_send_raw(&ticker_midi, &mpe::timbre_message(ch, timbre));
+        }
+    });
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "4000".to_string());
 
@@ -2778,6 +3016,68 @@ mod tests {
         for key in ["volume", "accent", "sound", "in_render", "delay_ms", "sounds"] {
             assert!(v.get(key).is_some(), "GET /click doit contenir {key}");
         }
+    }
+
+    /// POST /mpe (modal 🎛) : activation + geste → l'état est mis à jour et
+    /// GET /mpe-state le reflète (canal cible résolu) ; POST /mpe-reset
+    /// remet l'expression à zéro ; la désactivation coupe le monitoring.
+    #[tokio::test]
+    async fn api_mpe_cycle_activation_geste_reset() {
+        let app = build_app(test_state());
+
+        // Activation + geste (bend 10000, pression 60, timbre 30)
+        let (s, _) = req(
+            &app,
+            "POST",
+            "/mpe",
+            Some(serde_json::json!({"enabled": true, "bend": 10000, "pressure": 60, "timbre": 30})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+
+        // L'état reflète le geste
+        let (s, body) = req(&app, "GET", "/mpe-state", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["bend"], 10000);
+        assert_eq!(v["pressure"], 60);
+        assert_eq!(v["timbre"], 30);
+        assert_eq!(v["pitch_range_st"], 48);
+        assert_eq!(v["target_channel"], 1, "canal par défaut = 1 (jeu)");
+        assert_eq!(v["lfo_freq"], 0.0);
+
+        // LFO + canal explicite
+        let (s, _) = req(
+            &app,
+            "POST",
+            "/mpe",
+            Some(serde_json::json!({"enabled": true, "lfo_freq": 5.0, "lfo_depth_st": 2.0, "lfo_shape": "triangle", "channel": 3})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, body) = req(&app, "GET", "/mpe-state", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["lfo_freq"], 5.0);
+        assert_eq!(v["lfo_shape"], "triangle");
+        assert_eq!(v["channel"], 3);
+        assert_eq!(v["target_channel"], 3, "canal explicite prioritaire (pas d'écho)");
+
+        // Reset → valeurs neutres
+        let (s, _) = req(&app, "POST", "/mpe-reset", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, body) = req(&app, "GET", "/mpe-state", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["bend"], 8192);
+        assert_eq!(v["pressure"], 0);
+        assert_eq!(v["timbre"], 64);
+
+        // Désactivation → monitoring coupé
+        let (s, _) = req(&app, "POST", "/mpe", Some(serde_json::json!({"enabled": false}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, body) = req(&app, "GET", "/mpe-state", None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["enabled"], false);
     }
 
     /// GET /sample-file : nom avec chemin → 400 (sécurité), inconnu → 404.
