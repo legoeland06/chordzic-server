@@ -953,24 +953,29 @@ async fn render_wav(
             .iter()
             .map(|(ch, v)| {
                 let e = if let Some(obj) = v.as_object() {
-                    // Forme étendue : {"engine": "sfz"|"vst3", "path": ...}
+                    // Forme étendue : {"engine": "sfz"|"vst3"|"sf2", "path": ...}
                     let eng = obj
                         .get("engine")
                         .and_then(|e| e.as_str())
                         .unwrap_or(mode);
-                    let path = obj.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    let raw = obj.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    // Chemins normalisés : ~/ expandu, .fxp relatif résolu
+                    // dans patches_factory (le frontend peut envoyer un
+                    // chemin relatif au HOME).
+                    let path = live_instrument::resolve_instrument_path(eng, raw);
                     match eng {
-                        "sfz" => engine::Engine::Sfz(path.to_string()),
-                        "vst3" => engine::Engine::Vst3(path.to_string()),
-                        "sf2" => engine::Engine::Sf2(path.to_string()),
+                        "sfz" => engine::Engine::Sfz(path),
+                        "vst3" => engine::Engine::Vst3(path),
+                        "sf2" => engine::Engine::Sf2(path),
                         _ => engine::Engine::FluidSynth,
                     }
                 } else if let Some(s) = v.as_str() {
                     // Forme simple : chemin seul → moteur global `mode`
+                    let path = live_instrument::resolve_instrument_path(mode, s);
                     match mode {
-                        "sfz" => engine::Engine::Sfz(s.to_string()),
-                        "vst3" => engine::Engine::Vst3(s.to_string()),
-                        "sf2" => engine::Engine::Sf2(s.to_string()),
+                        "sfz" => engine::Engine::Sfz(path),
+                        "vst3" => engine::Engine::Vst3(path),
+                        "sf2" => engine::Engine::Sf2(path),
                         _ => engine::Engine::FluidSynth,
                     }
                 } else {

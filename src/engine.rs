@@ -245,6 +245,11 @@ pub fn render_sfz(
 
 /// Rendu VST3 : notes → événements datés (frames) → plugin → WAV.
 ///
+/// Le chemin peut être un bundle `.vst3` (rendu avec le patch du plugin)
+/// OU un preset Surge `.fxp` (le plugin Surge XT est chargé puis le state
+/// XML du preset est appliqué — `load_preset` refuse le .fxp Surge, il faut
+/// extraire le XML depuis `<?xml` et passer par `load_state`).
+///
 /// Scheduling maison (la 0.4.2 publiée n'a pas `transport::Timeline`) :
 /// chaque événement est envoyé avec son offset sample exact dans le block,
 /// via `Plugin::send_midi_event_at`.
@@ -261,14 +266,33 @@ pub fn render_vst3(
     let sample_rate = 44_100.0f64;
     let block = 512usize;
 
+    // Chemin .fxp → preset Surge : le plugin réel est Surge XT, le .fxp
+    // n'est que le state à appliquer.
+    let is_preset = plugin_path.to_lowercase().ends_with(".fxp");
+    let actual_plugin = if is_preset {
+        crate::live_instrument::find_surge_plugin()?
+    } else {
+        plugin_path.to_string()
+    };
+
     let mut host = Vst3Host::builder()
         .sample_rate(sample_rate)
         .block_size(block)
         .build()
         .map_err(|e| format!("Création de l'hôte VST3 impossible : {e}"))?;
     let mut plugin = host
-        .load_plugin(plugin_path)
+        .load_plugin(&actual_plugin)
         .map_err(|e| format!("Chargement du plugin VST3 impossible : {e}"))?;
+
+    if is_preset {
+        let data = std::fs::read(plugin_path)
+            .map_err(|e| format!("Lecture du preset impossible : {e}"))?;
+        let xml = crate::live_instrument::extract_xml_state(&data)
+            .ok_or_else(|| format!("Pas de XML trouvé dans {plugin_path}"))?;
+        plugin
+            .load_state(xml)
+            .map_err(|e| format!("Application du preset impossible : {e}"))?;
+    }
 
     let out_channels = plugin.output_channel_count().max(1);
     let total_frames = (duration_sec * sample_rate).round() as usize;

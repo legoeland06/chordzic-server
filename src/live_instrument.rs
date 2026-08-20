@@ -303,8 +303,9 @@ pub fn find_surge_plugin() -> Result<String, String> {
     Err("Plugin Surge XT introuvable dans ~/.vst3 (installé ?)".into())
 }
 
-/// Résout un preset : chemin direct existant, sinon recherche par nom partiel
-/// dans patches_factory. Retourne (chemin, nom lisible).
+/// Résout un preset : chemin direct existant, sinon recherche dans
+/// patches_factory — d'abord par NOM DE FICHIER exact (le frontend peut
+/// envoyer un chemin relatif), puis par nom partiel. Retourne (chemin, nom).
 pub fn resolve_preset(arg: &str) -> Result<(String, String), String> {
     let path = std::path::Path::new(arg);
     if path.exists() {
@@ -315,6 +316,17 @@ pub fn resolve_preset(arg: &str) -> Result<(String, String), String> {
             .into_owned();
         return Ok((path.display().to_string(), name));
     }
+    // Nom de fichier exact (même derrière un chemin relatif) :
+    // « …/MPE/Pad Plink 'n' Move.fxp » → cherche « Pad Plink 'n' Move ».
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    if !stem.is_empty() {
+        for p in list_presets() {
+            if p.name == stem {
+                return Ok((p.path.clone(), p.name));
+            }
+        }
+    }
+    // Recherche par nom partiel (comportement historique)
     let lower = arg.to_lowercase();
     for p in list_presets() {
         if p.name.to_lowercase().contains(&lower) {
@@ -322,6 +334,30 @@ pub fn resolve_preset(arg: &str) -> Result<(String, String), String> {
         }
     }
     Err(format!("Preset « {arg} » introuvable dans {}", patches_root().display()))
+}
+
+/// Normalise un chemin d'instrument envoyé par le frontend (rendu WAV) :
+/// - chemin absolu existant → conservé ;
+/// - `~/…` → expandu avec HOME ;
+/// - preset Surge `.fxp` relatif → résolu par nom de fichier dans
+///   patches_factory (le frontend peut envoyer « .local/share/…/X.fxp ») ;
+/// - autre chemin relatif (sfz/sf2/vst3) → préfixé par HOME.
+pub fn resolve_instrument_path(kind: &str, path: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let p = path.trim();
+    if p.starts_with("~/") {
+        return format!("{}/{}", home, &p[2..]);
+    }
+    let abs = std::path::Path::new(p);
+    if abs.is_absolute() {
+        return p.to_string();
+    }
+    if kind == "vst3" && p.to_lowercase().ends_with(".fxp") {
+        if let Ok((full, _)) = resolve_preset(p) {
+            return full;
+        }
+    }
+    format!("{}/{}", home, p)
 }
 
 /// Applique un preset .fxp Surge au plugin (extraction XML + load_state).
@@ -812,5 +848,33 @@ mod tests {
         assert_eq!(LiveSource::from_str("autre"), None);
         assert_eq!(LiveSource::Thru.as_str(), "thru");
         assert_eq!(LiveSource::Fluid.as_str(), "fluid");
+    }
+
+    #[test]
+    fn resolution_chemins_instruments() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        // Chemin absolu conservé
+        let abs = format!("{home}/.local/share/Surge XT/patches_factory/Keys/DX EP.fxp");
+        assert_eq!(resolve_instrument_path("vst3", &abs), abs);
+        // Tilde expandu
+        assert_eq!(
+            resolve_instrument_path("sfz", "~/Dev/banque/Test.sfz"),
+            format!("{home}/Dev/banque/Test.sfz")
+        );
+        // Preset .fxp relatif → résolu par nom de fichier dans patches_factory
+        // (le cas du bug : « .local/share/Surge XT/patches_factory/MPE/…fxp »)
+        let rel = ".local/share/Surge XT/patches_factory/MPE/Pad Plink 'n' Move.fxp";
+        let resolved = resolve_instrument_path("vst3", rel);
+        assert!(resolved.ends_with("MPE/Pad Plink 'n' Move.fxp"), "{resolved}");
+        assert!(resolved.starts_with("/"), "doit être absolu : {resolved}");
+        assert!(std::path::Path::new(&resolved).exists(), "{resolved}");
+        // Preset .fxp par nom seul
+        let by_name = resolve_instrument_path("vst3", "Pad Plink 'n' Move.fxp");
+        assert_eq!(by_name, resolved);
+        // Chemin relatif simple (sfz) → préfixé par HOME
+        assert_eq!(
+            resolve_instrument_path("sfz", "Dev/banque/Test.sfz"),
+            format!("{home}/Dev/banque/Test.sfz")
+        );
     }
 }
