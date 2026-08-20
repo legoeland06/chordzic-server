@@ -410,11 +410,12 @@ struct PlayReq {
     /// Moteur de rendu pour /render-wav : "fluidsynth" (défaut) | "sfz" | "vst3".
     #[serde(default)]
     engine: Option<String>,
-    /// Instruments par canal pour le rendu non-FluidSynth :
-    /// { canal: chemin du fichier .sfz ou du bundle .vst3 }.
-    /// Exemple : {"9": "/chemin/ALL.sfz", "0": "/chemin/Piano.sfz"}.
+    /// Instruments par canal pour le rendu non-FluidSynth.
+    /// Format accepté : "chemin" (moteur = `engine` global) OU
+    /// {"engine": "sfz"|"vst3", "path": "chemin"} (moteur par canal).
+    /// Exemple : {"9": {"engine":"sfz", "path":"/chemin/ALL.sfz"}}.
     #[serde(default)]
-    instruments: Option<std::collections::HashMap<u8, String>>,
+    instruments: Option<std::collections::HashMap<u8, serde_json::Value>>,
 }
 
 /// Réponse standardisée du serveur.
@@ -919,11 +920,28 @@ async fn render_wav(
         };
         let emap: std::collections::HashMap<u8, engine::Engine> = insts
             .iter()
-            .map(|(ch, p)| {
-                let e = match mode {
-                    "sfz" => engine::Engine::Sfz(p.clone()),
-                    "vst3" => engine::Engine::Vst3(p.clone()),
-                    _ => engine::Engine::FluidSynth,
+            .map(|(ch, v)| {
+                let e = if let Some(obj) = v.as_object() {
+                    // Forme étendue : {"engine": "sfz"|"vst3", "path": ...}
+                    let eng = obj
+                        .get("engine")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or(mode);
+                    let path = obj.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                    match eng {
+                        "sfz" => engine::Engine::Sfz(path.to_string()),
+                        "vst3" => engine::Engine::Vst3(path.to_string()),
+                        _ => engine::Engine::FluidSynth,
+                    }
+                } else if let Some(s) = v.as_str() {
+                    // Forme simple : chemin seul → moteur global `mode`
+                    match mode {
+                        "sfz" => engine::Engine::Sfz(s.to_string()),
+                        "vst3" => engine::Engine::Vst3(s.to_string()),
+                        _ => engine::Engine::FluidSynth,
+                    }
+                } else {
+                    engine::Engine::FluidSynth
                 };
                 (*ch, e)
             })
