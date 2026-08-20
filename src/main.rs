@@ -2300,6 +2300,8 @@ struct MpeReq {
     lfo_shape: Option<mpe::LfoShape>,
     /// Canal cible explicite (None = auto : écho ✨ sinon 1).
     channel: Option<u8>,
+    /// Cible du son pendant le monitoring : auto / roland / fluid.
+    target: Option<mpe::MpeTarget>,
 }
 
 async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoResponse {
@@ -2334,6 +2336,9 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
     if let Some(v) = b.lfo_shape {
         st.lfo.shape = v;
     }
+    if let Some(v) = b.target {
+        st.target = v;
+    }
     if b.channel.is_some() {
         st.channel = b.channel;
     }
@@ -2344,35 +2349,55 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
         live_input::resolve_mpe_channel(&st, &e)
     };
 
+    // Envoi des messages MPE vers la sortie choisie (FluidSynth si la cible
+    // est « fluid », sinon la sortie principale — Roland). Aucun verrou
+    // d'état tenu pendant l'envoi.
+    let send_mpe_msgs = |s: &AppState, msgs: &[Vec<u8>]| {
+        if st.enabled && st.target == mpe::MpeTarget::Fluid {
+            let guard = s.live_input.fluid_sender.lock().unwrap();
+            if let Some(sender) = guard.as_ref() {
+                for msg in msgs {
+                    sender(msg);
+                }
+                return;
+            }
+            // FluidSynth indisponible → repli sur la sortie principale
+        }
+        for msg in msgs {
+            midi_send(s, msg);
+        }
+    };
+
     if st.enabled && !was_enabled {
         // Activation : préparer le récepteur (RPN range + état courant) et
         // relancer la pédale de sustain (comme live-echo).
-        for msg in mpe::rpn_pitch_range_messages(ch, st.pitch_range_st) {
-            midi_send(&s, &msg);
+        let mut setup = mpe::rpn_pitch_range_messages(ch, st.pitch_range_st);
+        // FluidSynth : poser un instrument (piano GM) pour que les notes
+        // renvoyées aient un son.
+        if st.target == mpe::MpeTarget::Fluid {
+            setup.push(vec![0xC0 | ch, 0]);
         }
-        for msg in mpe::expression_messages(ch, st.bend, st.pressure, st.timbre, None) {
-            midi_send(&s, &msg);
-        }
+        setup.extend(mpe::expression_messages(ch, st.bend, st.pressure, st.timbre, None));
         let sustain = s.live_input.sustain.load(std::sync::atomic::Ordering::Relaxed);
-        midi_send(&s, &[0xB0 | ch, 64, if sustain { 127 } else { 0 }]);
+        setup.push(vec![0xB0 | ch, 64, if sustain { 127 } else { 0 }]);
+        send_mpe_msgs(&s, &setup);
     } else if st.enabled {
         // Geste : envoi immédiat (bend effectif LFO inclus, AT, timbre)
         let t = epoch_ms();
-        midi_send(&s, &mpe::pitch_bend_message(ch, mpe::effective_bend(&st, t)));
-        midi_send(&s, &mpe::channel_pressure_message(ch, st.pressure));
-        midi_send(&s, &mpe::timbre_message(ch, st.timbre));
+        let mut msgs = vec![
+            mpe::pitch_bend_message(ch, mpe::effective_bend(&st, t)),
+            mpe::channel_pressure_message(ch, st.pressure),
+            mpe::timbre_message(ch, st.timbre),
+        ];
         // Changement de range : re-poser le RPN 0
         if let Some(r) = b.pitch_range_st {
-            for msg in mpe::rpn_pitch_range_messages(ch, r) {
-                midi_send(&s, &msg);
-            }
+            msgs.extend(mpe::rpn_pitch_range_messages(ch, r));
         }
+        send_mpe_msgs(&s, &msgs);
     } else if was_enabled {
         // Fermeture : remettre l'expression à zéro (bend centre, AT 0,
         // timbre neutre) — sinon les notes suivantes gardent le bend.
-        for msg in mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None) {
-            midi_send(&s, &msg);
-        }
+        send_mpe_msgs(&s, &mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None));
     }
 
     // Enregistrer le nouvel état (même si désactivé)
@@ -2416,8 +2441,15 @@ async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
     let mpe = *s.live_input.mpe.lock().unwrap();
     let echo = *s.live_input.echo.lock().unwrap();
     let ch = live_input::resolve_mpe_channel(&mpe, &echo);
+    let route = live_input::monitor_output_target(&mpe, &echo);
     let active = s.live_input.active.lock().unwrap().clone();
     let rec_active = s.live_input.rec.lock().unwrap().is_some();
+    let fluid_ok = s.live_input.fluid_sender.lock().unwrap().is_some();
+    let route_str = match route {
+        live_input::OutputTarget::Fluid => "fluid",
+        live_input::OutputTarget::Main => "main",
+        live_input::OutputTarget::None => "none",
+    };
     axum::Json(serde_json::json!({
         "enabled": mpe.enabled,
         "bend": mpe.bend,
@@ -2427,9 +2459,12 @@ async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
         "lfo_freq": mpe.lfo.freq,
         "lfo_depth_st": mpe.lfo.depth_st,
         "lfo_shape": mpe.lfo.shape,
+        "target": mpe.target,
         "channel": mpe.channel,
         "target_channel": ch,
+        "route": route_str,
         "echo_active": echo.enabled,
+        "fluid_ok": fluid_ok,
         "notes": active,
         "rec_active": rec_active,
         "effective_bend": mpe::effective_bend(&mpe, epoch_ms()),
@@ -2609,9 +2644,26 @@ async fn main() {
         midi_send_raw(&midi_out, msg);
     }));
 
+    // Émetteur MPE vers FluidSynth (cible « PC » de la modal 🎛) : connexion
+    // séparée — les modulations y sont toujours audibles. Repli sur la sortie
+    // principale si FluidSynth est absent (géré par monitor_output_target et
+    // les points d'envoi).
+    if let Some(fluid_handle) = midi::open_by_name("fluid") {
+        live_input::set_fluid_sender(&state.live_input, Box::new(move |msg: &[u8]| {
+            if let Ok(mut c) = fluid_handle.lock() {
+                midi::snd(&mut c, msg);
+            }
+        }));
+        println!("🎛 MPE : cible FluidSynth disponible (son PC)");
+    } else {
+        println!("⚠️ MPE : FluidSynth introuvable — cible PC indisponible");
+    }
+
     // Ticker MPE (modal 🎛) : rafraîchit le bend LFO en continu (~20 ms) tant
     // que le monitoring est actif — le vibrato auto oscille même sans geste
     // manuel. N'envoie que lorsque la valeur effective change (pas de spam).
+    // ⚠️ Ordre des verrous : echo PUIS mpe (jamais l'inverse) — même ordre
+    // que le callback MIDI IN → aucun deadlock possible.
     let ticker_input = state.live_input.clone();
     let ticker_midi = state.midi.clone();
     std::thread::spawn(move || {
@@ -2622,9 +2674,10 @@ async fn main() {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(20));
             let t = epoch_ms();
-            let (ch, bend, pressure, timbre) = {
-                let m = ticker_input.mpe.lock().unwrap();
+            // Copie des états (verrous relâchés avant l'envoi)
+            let (ch, bend, pressure, timbre, fluid) = {
                 let e = ticker_input.echo.lock().unwrap();
+                let m = ticker_input.mpe.lock().unwrap();
                 if !m.enabled {
                     last_bend = None;
                     last_pressure = None;
@@ -2637,6 +2690,7 @@ async fn main() {
                     mpe::effective_bend(&m, t),
                     m.pressure,
                     m.timbre,
+                    m.target == mpe::MpeTarget::Fluid,
                 )
             };
             if last_ch != Some(ch) {
@@ -2651,9 +2705,23 @@ async fn main() {
             last_bend = Some(bend);
             last_pressure = Some(pressure);
             last_timbre = Some(timbre);
-            midi_send_raw(&ticker_midi, &mpe::pitch_bend_message(ch, bend));
-            midi_send_raw(&ticker_midi, &mpe::channel_pressure_message(ch, pressure));
-            midi_send_raw(&ticker_midi, &mpe::timbre_message(ch, timbre));
+            let msgs = vec![
+                mpe::pitch_bend_message(ch, bend),
+                mpe::channel_pressure_message(ch, pressure),
+                mpe::timbre_message(ch, timbre),
+            ];
+            if fluid {
+                let guard = ticker_input.fluid_sender.lock().unwrap();
+                if let Some(sender) = guard.as_ref() {
+                    for msg in &msgs {
+                        sender(msg);
+                    }
+                    continue;
+                }
+            }
+            for msg in &msgs {
+                midi_send_raw(&ticker_midi, msg);
+            }
         }
     });
 
@@ -3044,7 +3112,7 @@ mod tests {
         assert_eq!(v["pressure"], 60);
         assert_eq!(v["timbre"], 30);
         assert_eq!(v["pitch_range_st"], 48);
-        assert_eq!(v["target_channel"], 1, "canal par défaut = 1 (jeu)");
+        assert_eq!(v["target_channel"], 0, "canal par défaut = 0 (canal de jeu 1, 0-indexé)");
         assert_eq!(v["lfo_freq"], 0.0);
 
         // LFO + canal explicite

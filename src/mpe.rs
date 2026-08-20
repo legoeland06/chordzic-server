@@ -37,6 +37,27 @@ impl Default for LfoShape {
     }
 }
 
+/// Cible du son pendant le monitoring MPE (modal ouverte).
+/// - `auto`   : écho ✨ de la piste si actif (canal piste), sinon sortie
+///              principale (Roland si branché) sur le canal de jeu ;
+/// - `roland` : sortie principale uniquement (canal explicite sinon jeu) ;
+/// - `fluid`  : FluidSynth (le son sort du PC) — les modulations y sont
+///              TOUJOURS audibles (contrairement à certains pianos
+///              numériques qui ignorent le bend sur les sons acoustiques).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MpeTarget {
+    Auto,
+    Roland,
+    Fluid,
+}
+
+impl Default for MpeTarget {
+    fn default() -> Self {
+        MpeTarget::Auto
+    }
+}
+
 /// Configuration du LFO (vibrato auto sur le bend). Désactivé si freq = 0.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Lfo {
@@ -76,7 +97,10 @@ pub struct MpeState {
     pub pitch_range_st: u8,
     /// LFO (vibrato auto).
     pub lfo: Lfo,
-    /// Canal cible explicite (None = auto : canal d'écho ✨ si actif, sinon 1).
+    /// Cible du son pendant le monitoring (Auto / Roland / FluidSynth).
+    pub target: MpeTarget,
+    /// Canal cible explicite (None = auto : écho ✨ si actif, sinon canal 0
+    /// — le canal de jeu 1 du pianiste, 0-indexé).
     pub channel: Option<u8>,
 }
 
@@ -89,6 +113,7 @@ impl Default for MpeState {
             timbre: TIMBRE_CENTER,
             pitch_range_st: 48,
             lfo: Lfo::default(),
+            target: MpeTarget::Auto,
             channel: None,
         }
     }
