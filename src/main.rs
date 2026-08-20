@@ -31,6 +31,7 @@ mod grilles;
 mod live_input;
 mod midi;
 mod mpe;
+mod pads;
 mod patterns;
 mod render;
 mod samples;
@@ -2574,6 +2575,56 @@ async fn sample_file(axum::extract::Path(name): axum::extract::Path<String>) -> 
     }
 }
 
+// ─── Pads Push 3 (🥁) — banque de samples déclenchables ────────────────
+
+/// POST /pad-sample — import d'un sample (wav/mp3/ogg/flac/m4a/aiff) pour
+/// les pads. Body BRUT (les octets du fichier), nom d'origine dans le
+/// header `x-filename` (utilisé pour l'extension). Retourne le nom stocké.
+async fn pad_upload(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let fname = headers
+        .get("x-filename")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("sample.wav")
+        .to_string();
+    let ext = std::path::Path::new(&fname)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav")
+        .to_string();
+    match pads::save(&body, &ext) {
+        Ok(name) => (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true, "name": name }))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// GET /pad-samples — liste des samples importés pour les pads.
+async fn pad_samples() -> impl IntoResponse {
+    axum::Json(serde_json::json!(pads::list()))
+}
+
+/// GET /pad-sample/<name> — sert un sample de pad (content-type selon
+/// l'extension).
+async fn pad_sample(axum::extract::Path(name): axum::extract::Path<String>) -> impl IntoResponse {
+    let Some(path) = pads::path_for(&name) else {
+        return (StatusCode::BAD_REQUEST, "nom de fichier invalide").into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(data) => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("wav");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, pads::content_type(ext))],
+                data,
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "sample introuvable").into_response(),
+    }
+}
+
 /// Construit le routeur Axum complet (routes API + fallback frontend).
 /// Séparé de `main` pour être testable : les tests d'intégration HTTP
 /// montent l'app en mémoire (tower::ServiceExt::oneshot) sans socket.
@@ -2594,6 +2645,9 @@ fn build_app(state: AppState) -> Router {
         .route("/piano-note", post(piano_note))
         .route("/samples-list", get(samples_list))
         .route("/sample-file/:name", get(sample_file))
+        .route("/pad-sample", post(pad_upload).layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024)))
+        .route("/pad-samples", get(pad_samples))
+        .route("/pad-sample/:name", get(pad_sample))
         .route("/rendered/:file", get(serve_rendered))
         .route("/audio-devices", get(audio_devices))
         .route("/audio-device", post(audio_device))
@@ -3254,6 +3308,59 @@ mod tests {
         assert_eq!(s, StatusCode::BAD_REQUEST, "path traversal refusé");
         let (s, _) = req(&app, "GET", "/sample-file/inexistant_xyz.wav", None).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "sample inconnu → 404");
+    }
+
+    /// Pads Push 3 : upload brut (wav) → listé, servi avec le bon
+    /// content-type ; extensions refusées ; traversée de chemin bloquée.
+    #[tokio::test]
+    async fn api_pads_upload_liste_service() {
+        let app = build_app(test_state());
+        // Upload d'un faux WAV (octets arbitraires — le serveur ne décode pas)
+        let mut rb = axum::http::Request::builder()
+            .method("POST")
+            .uri("/pad-sample")
+            .header("content-type", "application/octet-stream")
+            .header("x-filename", "kick.wav");
+        let body = axum::body::Body::from(vec![0u8; 512]);
+        let resp = app.clone().oneshot(rb.body(body).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let name = v["name"].as_str().unwrap().to_string();
+        assert!(name.starts_with("pad_"), "nom unique pad_* : {name}");
+        assert!(name.ends_with(".wav"));
+
+        // Liste : le sample y est
+        let (s, body) = req(&app, "GET", "/pad-samples", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["name"].as_str())
+            .collect();
+        assert!(names.contains(&name.as_str()), "sample listé");
+
+        // Service : content-type audio/wav
+        let (s, body) = req(&app, "GET", &format!("/pad-sample/{name}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(body.len(), 512);
+
+        // Sécurité : traversée refusée, préfixe pad_ exigé
+        let (s, _) = req(&app, "GET", "/pad-sample/..%2F..%2Fsecret.wav", None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = req(&app, "GET", "/pad-sample/autre.wav", None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+
+        // Extension refusée
+        let mut rb = axum::http::Request::builder()
+            .method("POST")
+            .uri("/pad-sample")
+            .header("content-type", "application/octet-stream")
+            .header("x-filename", "malware.exe");
+        let resp = app.clone().oneshot(rb.body(axum::body::Body::from(vec![0u8; 10])).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "exe refusé");
     }
 
     /// POST /render-wav avec une séquence valide : rendu WAV réel (via
