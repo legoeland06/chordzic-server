@@ -49,6 +49,7 @@ use axum::response::Html;
 use midir::MidiOutput;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicBool;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 use patterns::pat;
@@ -253,6 +254,9 @@ struct AppState {
     /// Entrée MIDI live (notes tenues sur le clavier du pianiste) — sert la
     /// reconnaissance d'accords en mode Live (route GET /live-input).
     live_input: Arc<live_input::LiveInputState>,
+    /// Lectures serveur des pads en cours (fichier → process ffplay) —
+    /// route POST /pad-trigger (retrigger) ; POST /pad-stop coupe tout.
+    pad_players: Arc<Mutex<HashMap<String, std::process::Child>>>,
 }
 
 /// Ports MIDI disponibles, en cache (TTL ~250 ms) : l'énumération ALSA via
@@ -2656,6 +2660,34 @@ async fn pad_sample(axum::extract::Path(name): axum::extract::Path<String>) -> i
     }
 }
 
+/// POST /pad-trigger — joue un sample de pad côté SERVEUR (ffplay, tous
+/// formats, sortie audio du PC). Retrigger : le process du même fichier est
+/// tué avant le nouveau spawn. Le frontend choisit le chemin de lecture
+/// (navigateur Web Audio ou serveur) ; la quantification reste gérée par le
+/// métronome navigateur (le serveur ne fait que jouer).
+#[derive(serde::Deserialize)]
+struct PadTriggerReq {
+    /// Nom du sample stocké (pad_*.ext) — validé côté serveur.
+    file: String,
+    /// Volume 0-100 (ffplay -volume).
+    volume: Option<u8>,
+}
+
+async fn pad_trigger(State(s): State<AppState>, Json(b): Json<PadTriggerReq>) -> impl IntoResponse {
+    match pads::trigger_pad(&b.file, b.volume.unwrap_or(100), &s.pad_players) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(pads::PadPlayError::BadName) => (StatusCode::BAD_REQUEST, "nom de fichier invalide").into_response(),
+        Err(pads::PadPlayError::NotFound) => (StatusCode::NOT_FOUND, "sample introuvable").into_response(),
+        Err(pads::PadPlayError::Spawn(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("lecture impossible : {e}")).into_response(),
+    }
+}
+
+/// POST /pad-stop — coupe toutes les lectures serveur en cours (■ Stop).
+async fn pad_stop(State(s): State<AppState>) -> impl IntoResponse {
+    pads::stop_all_pads(&s.pad_players);
+    StatusCode::OK.into_response()
+}
+
 /// Construit le routeur Axum complet (routes API + fallback frontend).
 /// Séparé de `main` pour être testable : les tests d'intégration HTTP
 /// montent l'app en mémoire (tower::ServiceExt::oneshot) sans socket.
@@ -2679,6 +2711,8 @@ fn build_app(state: AppState) -> Router {
         .route("/pad-sample", post(pad_upload).layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024)))
         .route("/pad-samples", get(pad_samples))
         .route("/pad-sample/:name", get(pad_sample))
+        .route("/pad-trigger", post(pad_trigger))
+        .route("/pad-stop", post(pad_stop))
         .route("/rendered/:file", get(serve_rendered))
         .route("/audio-devices", get(audio_devices))
         .route("/audio-device", post(audio_device))
@@ -2738,6 +2772,7 @@ async fn main() {
         midi,
         midi_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         soundfont,
+        pad_players: Arc::new(Mutex::new(HashMap::new())),
         live: Arc::new(Live {
             tracks: Mutex::new(vec![
                 LiveTrack::new(0, 51, 60),
@@ -3170,6 +3205,7 @@ mod tests {
             midi: Arc::new(Mutex::new(None)),
             midi_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             soundfont: None,
+            pad_players: Arc::new(Mutex::new(HashMap::new())),
             live: Arc::new(Live {
                 tracks: Mutex::new(vec![
                     LiveTrack::new(0, 51, 60),
@@ -3392,6 +3428,37 @@ mod tests {
             .header("x-filename", "malware.exe");
         let resp = app.clone().oneshot(rb.body(axum::body::Body::from(vec![0u8; 10])).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "exe refusé");
+    }
+
+    /// Pads : LECTURE SERVEUR — trigger (ffplay, retrigger) puis stop ;
+    /// noms invalides → 400, fichiers absents → 404.
+    ///
+    /// Isolation : PADS_DIR est figé vers un dossier de test (PADS_DIR a
+    /// priorité sur HOME) — évite la course avec `api_grilles_cycle_de_vie`
+    /// qui change HOME globalement pendant que les tests tournent.
+    #[tokio::test]
+    async fn api_pads_trigger_et_stop() {
+        let test_dir = std::env::temp_dir().join("chordj_pads_test");
+        let _ = std::fs::create_dir_all(&test_dir);
+        std::env::set_var("PADS_DIR", &test_dir);
+        let app = build_app(test_state());
+        // Fichier de test direct (pas d'upload nécessaire)
+        let name = format!("pad_{}_trigger.wav", std::process::id());
+        std::fs::write(test_dir.join(&name), vec![0u8; 64]).unwrap();
+
+        // Trigger (ffplay spawn) : 200, retrigger : 200
+        let (s, _) = req(&app, "POST", "/pad-trigger", Some(serde_json::json!({ "file": name, "volume": 80 }))).await;
+        assert_eq!(s, StatusCode::OK, "trigger serveur");
+        let (s, _) = req(&app, "POST", "/pad-trigger", Some(serde_json::json!({ "file": name }))).await;
+        assert_eq!(s, StatusCode::OK, "retrigger (kill + respawn)");
+        // Stop : 200
+        let (s, _) = req(&app, "POST", "/pad-stop", None).await;
+        assert_eq!(s, StatusCode::OK, "stop serveur");
+        // Sécurité
+        let (s, _) = req(&app, "POST", "/pad-trigger", Some(serde_json::json!({ "file": "autre.wav" }))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "préfixe pad_ exigé");
+        let (s, _) = req(&app, "POST", "/pad-trigger", Some(serde_json::json!({ "file": "pad_absent_xyz.wav" }))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "fichier absent → 404");
     }
 
     /// POST /render-wav avec une séquence valide : rendu WAV réel (via

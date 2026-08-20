@@ -4,11 +4,16 @@
 //! aiff) importé par l'utilisateur : à chaque appui, le son s'ARRÊTE et se
 //! REDÉCLENCHE sans délai (retrigger — comportement drum machine).
 //!
-//! Le backend ne fait que stocker et servir les fichiers (dossier
-//! `$PADS_DIR` ou `~/samples/pads/`) ; la lecture est côté navigateur
-//! (Web Audio), comme la boucle sample du mode Navig.
+//! L'utilisateur choisit le chemin de LECTURE : navigateur (Web Audio) ou
+//! serveur — le backend stocke et sert les fichiers (dossier `$PADS_DIR` ou
+//! `~/samples/pads/`) et peut les JOUER via `ffplay` (tous formats, sortie
+//! audio du PC) : `POST /pad-trigger` (retrigger par fichier) et
+//! `POST /pad-stop` (coupe toutes les lectures serveur).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::sync::Mutex;
 
 /// Taille maximale d'un sample importé (25 Mo — les MP3 longs sont lourds).
 pub const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -120,9 +125,86 @@ pub fn content_type(ext: &str) -> &'static str {
     }
 }
 
+// ── Lecture côté SERVEUR (ffplay) ──────────────────────────────────────
+
+/// Erreurs de déclenchement d'une lecture serveur.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PadPlayError {
+    /// Nom de fichier invalide (traversée, mauvais préfixe…).
+    BadName,
+    /// Fichier présent côté navigateur mais absent du serveur.
+    NotFound,
+    /// ffplay introuvable ou refusé de démarrer.
+    Spawn(String),
+}
+
+/// Args ffplay : sans fenêtre, auto-exit, volume 0-100.
+pub fn ffplay_args(volume: u8) -> Vec<String> {
+    vec![
+        "-nodisp".to_string(),
+        "-autoexit".to_string(),
+        "-loglevel".to_string(),
+        "quiet".to_string(),
+        "-volume".to_string(),
+        volume.min(100).to_string(),
+    ]
+}
+
+/// Déclenche la lecture d'un sample de pad via ffplay — RETRIGGER : le
+/// process précédent du MÊME fichier est tué avant le nouveau spawn.
+/// `players` : map fichier → process en cours (état partagé du serveur).
+pub fn trigger_pad(file: &str, volume: u8, players: &Mutex<HashMap<String, Child>>) -> Result<(), PadPlayError> {
+    let Some(path) = path_for(file) else { return Err(PadPlayError::BadName); };
+    if !path.is_file() {
+        return Err(PadPlayError::NotFound);
+    }
+    let mut guard = players.lock().unwrap();
+    if let Some(mut old) = guard.remove(file) {
+        let _ = old.kill();
+    }
+    let mut cmd = Command::new("ffplay");
+    cmd.args(ffplay_args(volume));
+    cmd.arg(&path);
+    match cmd.spawn() {
+        Ok(child) => {
+            guard.insert(file.to_string(), child);
+            Ok(())
+        }
+        Err(e) => Err(PadPlayError::Spawn(e.to_string())),
+    }
+}
+
+/// Arrête TOUTES les lectures serveur en cours (bouton ■ Stop).
+pub fn stop_all_pads(players: &Mutex<HashMap<String, Child>>) {
+    let mut guard = players.lock().unwrap();
+    for (_, mut c) in guard.drain() {
+        let _ = c.kill();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffplay_args_volume_borne() {
+        let a = ffplay_args(80);
+        assert_eq!(a[0], "-nodisp");
+        assert!(a.iter().any(|s| s == "-volume"));
+        assert!(a.iter().any(|s| s == "80"));
+        assert!(ffplay_args(200).iter().any(|s| s == "100")); // borné
+        assert!(ffplay_args(0).iter().any(|s| s == "0"));
+    }
+
+    #[test]
+    fn trigger_pad_valide_nom_et_existence() {
+        let players = Mutex::new(HashMap::new());
+        // Nom invalide → BadName (aucun spawn)
+        assert_eq!(trigger_pad("autre.wav", 100, &players), Err(PadPlayError::BadName));
+        assert_eq!(trigger_pad("pad_1/../../x", 100, &players), Err(PadPlayError::BadName));
+        // Nom valide mais fichier absent → NotFound
+        assert_eq!(trigger_pad("pad_zzz_inexistant.wav", 100, &players), Err(PadPlayError::NotFound));
+    }
 
     #[test]
     fn extensions_acceptees_et_refusees() {
