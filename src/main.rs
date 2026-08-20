@@ -36,7 +36,7 @@ mod pads;
 mod patterns;
 mod render;
 mod samples;
-mod vst3_live;
+mod live_instrument;
 mod walking;
 
 use axum::{
@@ -256,10 +256,10 @@ struct AppState {
     /// Entrée MIDI live (notes tenues sur le clavier du pianiste) — sert la
     /// reconnaissance d'accords en mode Live (route GET /live-input).
     live_input: Arc<live_input::LiveInputState>,
-    /// Moteur VST3 live (monitoring des notes du pianiste via Surge XT au
-    /// lieu du thru MIDI) — option : quand il est actif, le monitoring passe
-    /// par le plugin → audio USB → haut-parleurs du Roland.
-    vst3_live: Arc<vst3_live::Vst3LiveState>,
+    /// Moteur live (monitoring des notes du pianiste) — source au choix :
+    /// thru MIDI (Roland GM, défaut), VST3 (Surge XT → audio USB →
+    /// haut-parleurs du Roland) ou FluidSynth (SoundFont GM, son PC).
+    live_instrument: Arc<live_instrument::LiveInstrumentState>,
     /// Lectures serveur des pads en cours (fichier → process ffplay) —
     /// route POST /pad-trigger (retrigger) ; POST /pad-stop coupe tout.
     pad_players: Arc<Mutex<HashMap<String, std::process::Child>>>,
@@ -323,11 +323,22 @@ fn midi_send(state: &AppState, msg: &[u8]) -> bool {
 /// passent toujours par `midi_send` direct — le VST3 live ne capte QUE le
 /// jeu du pianiste.
 fn monitor_send(state: &AppState, msg: &[u8]) -> bool {
-    if state.vst3_live.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-        vst3_live::enqueue(&state.vst3_live, msg);
-        true
-    } else {
-        midi_send(state, msg)
+    match *state.live_instrument.source.lock().unwrap() {
+        live_instrument::LiveSource::Vst3 => {
+            live_instrument::enqueue(&state.live_instrument.vst3, msg);
+            true
+        }
+        live_instrument::LiveSource::Fluid => {
+            let sender = state.live_input.fluid_sender.lock().unwrap();
+            if let Some(sender) = sender.as_ref() {
+                sender(msg);
+                true
+            } else {
+                // FluidSynth indisponible → repli thru MIDI
+                midi_send(state, msg)
+            }
+        }
+        live_instrument::LiveSource::Thru => midi_send(state, msg),
     }
 }
 
@@ -951,6 +962,7 @@ async fn render_wav(
                     match eng {
                         "sfz" => engine::Engine::Sfz(path.to_string()),
                         "vst3" => engine::Engine::Vst3(path.to_string()),
+                        "sf2" => engine::Engine::Sf2(path.to_string()),
                         _ => engine::Engine::FluidSynth,
                     }
                 } else if let Some(s) = v.as_str() {
@@ -958,6 +970,7 @@ async fn render_wav(
                     match mode {
                         "sfz" => engine::Engine::Sfz(s.to_string()),
                         "vst3" => engine::Engine::Vst3(s.to_string()),
+                        "sf2" => engine::Engine::Sf2(s.to_string()),
                         _ => engine::Engine::FluidSynth,
                     }
                 } else {
@@ -2398,19 +2411,128 @@ async fn live_echo(State(s): State<AppState>, Json(b): Json<LiveEchoReq>) -> imp
     axum::Json(serde_json::json!({ "ok": true }))
 }
 
-// ─── Moteur VST3 live (Surge XT → audio USB → haut-parleurs du Roland) ───
+// ─── Moteur live (thru Roland / VST3 Surge / FluidSynth) ────────────────
 
 /// GET /vst3-presets — Liste les presets Surge XT (patches_factory),
-/// catégorisés (Leads, Pads, Basses…) pour le moteur VST3 live.
+/// catégorisés (Leads, Pads, Basses…) ; `best: true` pour le best-of ⭐.
 async fn vst3_presets() -> impl IntoResponse {
-    axum::Json(vst3_live::list_presets())
+    axum::Json(live_instrument::list_presets())
 }
 
-/// POST /live-vst3 — Active/désactive le moteur VST3 live : le monitoring
-/// des notes du pianiste passe par le plugin (Surge XT) → audio USB →
-/// haut-parleurs du Roland au lieu du thru MIDI (Roland GM).
-/// Body : {enabled: bool, preset?: string} — preset = chemin .fxp OU nom
-/// partiel (cherché dans patches_factory).
+/// GET /soundfonts-list — SoundFonts .sf2/.sf3 disponibles (système +
+/// ~/soundfonts), la SoundFont du serveur en premier. Pour le moteur live
+/// FluidSynth et le rendu WAV par piste (engine "sf2").
+async fn soundfonts_list() -> impl IntoResponse {
+    axum::Json(live_instrument::scan_soundfonts())
+}
+
+/// POST /live-instrument — Source du monitoring des notes du pianiste :
+///   {"source": "thru"}                    → Roland GM (défaut)
+///   {"source": "vst3", "preset": …}      → Surge XT → audio USB → Roland
+///   {"source": "fluid", "program": 51}   → FluidSynth (SoundFont GM)
+/// preset = chemin .fxp OU nom partiel. program = instrument GM (0-127).
+#[derive(Deserialize)]
+struct LiveInstrumentReq {
+    source: String,
+    preset: Option<String>,
+    program: Option<u8>,
+    soundfont: Option<String>,
+}
+
+async fn live_instrument(State(s): State<AppState>, Json(b): Json<LiveInstrumentReq>) -> impl IntoResponse {
+    /// Applique le changement de source — fonction interne pour le `?`
+    /// (Result<(), String>) avant la conversion en réponse HTTP.
+    fn apply(s: &AppState, b: &LiveInstrumentReq) -> Result<(), String> {
+        match b.source.as_str() {
+            "thru" => {
+                live_instrument::stop(&s.live_instrument.vst3);
+                *s.live_instrument.source.lock().unwrap() = live_instrument::LiveSource::Thru;
+                Ok(())
+            }
+            "vst3" => {
+                let preset = match b.preset.as_deref() {
+                    Some(p) => p.to_string(),
+                    None => s
+                        .live_instrument
+                        .vst3
+                        .preset_path
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .ok_or_else(|| {
+                            "Aucun preset choisi — sélectionne un preset Surge d'abord".to_string()
+                        })?,
+                };
+                live_instrument::start(&s.live_instrument.vst3, &preset)?;
+                *s.live_instrument.source.lock().unwrap() = live_instrument::LiveSource::Vst3;
+                Ok(())
+            }
+            "fluid" => {
+                live_instrument::stop(&s.live_instrument.vst3);
+                let program = b.program.unwrap_or(0).min(127);
+                // Canal cible (écho ✨ sinon canal de jeu) — copies, verrous
+                // relâchés avant tout envoi (jamais de lock imbriqué).
+                let ch = {
+                    let e = s.live_input.echo.lock().unwrap();
+                    let m = s.live_input.mpe.lock().unwrap();
+                    live_input::resolve_mpe_channel(&m, &e)
+                };
+                let msgs = live_input::program_change_messages(ch, program, 0, 0);
+                let sender = s.live_input.fluid_sender.lock().unwrap();
+                match sender.as_ref() {
+                    Some(sender) => {
+                        for m in &msgs {
+                            sender(m);
+                        }
+                        let sustain = s
+                            .live_input
+                            .sustain
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        sender(&[0xB0 | ch, 64, if sustain { 127 } else { 0 }]);
+                    }
+                    None => {
+                        return Err("FluidSynth indisponible — la cible PC n'est pas branchée"
+                            .to_string());
+                    }
+                }
+                drop(sender);
+                *s.live_instrument.fluid_program.lock().unwrap() = Some(program);
+                *s.live_instrument.fluid_soundfont.lock().unwrap() = b.soundfont.clone();
+                *s.live_instrument.source.lock().unwrap() = live_instrument::LiveSource::Fluid;
+                Ok(())
+            }
+            other => Err(format!("Source inconnue : {other}")),
+        }
+    }
+    match apply(&s, &b) {
+        Ok(()) => {
+            *s.live_instrument.vst3.last_error.lock().unwrap() = None;
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "state": live_instrument::status_live(&s.live_instrument),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            *s.live_instrument.vst3.last_error.lock().unwrap() = Some(e.clone());
+            eprintln!("⚠️ live-instrument : {e}");
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "ok": false, "error": e })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /live-instrument — État courant du moteur live : source, preset
+/// VST3, program FluidSynth.
+async fn live_instrument_state(State(s): State<AppState>) -> impl IntoResponse {
+    axum::Json(live_instrument::status_live(&s.live_instrument))
+}
+
+// ── Compatibilité : /live-vst3 (ancienne API, source vst3 uniquement) ──
+
 #[derive(Deserialize)]
 struct LiveVst3Req {
     enabled: bool,
@@ -2418,36 +2540,41 @@ struct LiveVst3Req {
 }
 
 async fn live_vst3(State(s): State<AppState>, Json(b): Json<LiveVst3Req>) -> impl IntoResponse {
-    let result = if b.enabled {
-        match b.preset.as_deref() {
-            Some(p) => vst3_live::start(&s.vst3_live, p),
-            None => {
-                // Activer sans preset : le dernier connu (réactivation après
-                // un redémarrage du serveur).
-                let last = s.vst3_live.preset_path.lock().unwrap().clone();
-                match last {
-                    Some(p) => vst3_live::start(&s.vst3_live, &p),
-                    None => Err(
-                        "Aucun preset choisi — sélectionne un preset Surge d'abord".into(),
-                    ),
-                }
-            }
+    /// Compat : {enabled, preset} → source vst3 / thru.
+    fn apply(s: &AppState, b: &LiveVst3Req) -> Result<(), String> {
+        if b.enabled {
+            let preset = match b.preset.as_deref() {
+                Some(p) => p.to_string(),
+                None => s
+                    .live_instrument
+                    .vst3
+                    .preset_path
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| {
+                        "Aucun preset choisi — sélectionne un preset Surge d'abord".to_string()
+                    })?,
+            };
+            live_instrument::start(&s.live_instrument.vst3, &preset)?;
+            *s.live_instrument.source.lock().unwrap() = live_instrument::LiveSource::Vst3;
+        } else {
+            live_instrument::stop(&s.live_instrument.vst3);
+            *s.live_instrument.source.lock().unwrap() = live_instrument::LiveSource::Thru;
         }
-    } else {
-        vst3_live::stop(&s.vst3_live);
         Ok(())
-    };
-    match result {
+    }
+    match apply(&s, &b) {
         Ok(()) => {
-            *s.vst3_live.last_error.lock().unwrap() = None;
+            *s.live_instrument.vst3.last_error.lock().unwrap() = None;
             axum::Json(serde_json::json!({
                 "ok": true,
-                "state": vst3_live::status(&s.vst3_live),
+                "state": live_instrument::status(&s.live_instrument.vst3),
             }))
             .into_response()
         }
         Err(e) => {
-            *s.vst3_live.last_error.lock().unwrap() = Some(e.clone());
+            *s.live_instrument.vst3.last_error.lock().unwrap() = Some(e.clone());
             eprintln!("⚠️ live-vst3 : {e}");
             (
                 StatusCode::BAD_REQUEST,
@@ -2458,9 +2585,9 @@ async fn live_vst3(State(s): State<AppState>, Json(b): Json<LiveVst3Req>) -> imp
     }
 }
 
-/// GET /live-vst3 — État courant du moteur VST3 live (actif ? preset ?).
+/// GET /live-vst3 (compat) — État du sous-moteur VST3.
 async fn live_vst3_state(State(s): State<AppState>) -> impl IntoResponse {
-    axum::Json(vst3_live::status(&s.vst3_live))
+    axum::Json(live_instrument::status(&s.live_instrument.vst3))
 }
 
 // ─── Modal MPE (🎛) — simulation de contrôleur MPE ───────────────────────
@@ -2917,6 +3044,8 @@ fn build_app(state: AppState) -> Router {
         .route("/live-input", get(live_input))
         .route("/live-echo", post(live_echo))
         .route("/vst3-presets", get(vst3_presets))
+        .route("/soundfonts-list", get(soundfonts_list))
+        .route("/live-instrument", get(live_instrument_state).post(live_instrument))
         .route("/live-vst3", get(live_vst3_state).post(live_vst3))
         .route("/mpe", post(mpe))
         .route("/mpe-state", get(mpe_state))
@@ -3009,7 +3138,7 @@ async fn main() {
         }),
         rendered_dual: Arc::new(Mutex::new(None)),
         live_input: live_input::LiveInputState::new(),
-        vst3_live: vst3_live::Vst3LiveState::new(),
+        live_instrument: live_instrument::LiveInstrumentState::new(),
     };
     // Compensation de latence MIDI IN (ms) pour l'horodatage Rec :
     // transport USB MIDI (~1 ms) + pile ALSA (~1 ms) — constant matériel.
@@ -3023,17 +3152,27 @@ async fn main() {
     live_input::start(&state.live_input);
 
     // Émetteur d'écho (mode Navig ✨) : les notes du pianiste sont renvoyées
-    // vers la cible de monitoring active — moteur VST3 live si actif (Surge →
-    // audio USB → haut-parleurs du Roland), sinon la sortie MIDI réelle (avec
-    // reconnexion automatique). Le thru MIDI reste le défaut ; le VST3 live
-    // est une OPTION qui remplace l'envoi (pas de double son).
-    let midi_out = state.midi.clone();
-    let vst3 = state.vst3_live.clone();
+    // vers la cible de monitoring active — moteur live (VST3 Surge → audio
+    // USB → haut-parleurs du Roland, ou FluidSynth → son PC), sinon la sortie
+    // MIDI réelle (thru Roland, avec reconnexion automatique). Le thru reste
+    // le défaut ; les autres sources remplacent l'envoi (pas de double son).
+    let st = state.clone();
     live_input::set_echo_sender(&state.live_input, Box::new(move |msg: &[u8]| {
-        if vst3.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            vst3_live::enqueue(&vst3, msg);
-        } else {
-            midi_send_raw(&midi_out, msg);
+        match *st.live_instrument.source.lock().unwrap() {
+            live_instrument::LiveSource::Vst3 => {
+                live_instrument::enqueue(&st.live_instrument.vst3, msg);
+            }
+            live_instrument::LiveSource::Fluid => {
+                let sender = st.live_input.fluid_sender.lock().unwrap();
+                if let Some(sender) = sender.as_ref() {
+                    sender(msg);
+                } else {
+                    midi_send_raw(&st.midi, msg); // repli thru
+                }
+            }
+            live_instrument::LiveSource::Thru => {
+                midi_send_raw(&st.midi, msg);
+            }
         }
     }));
 
@@ -3432,7 +3571,7 @@ mod tests {
             click: Arc::new(click::ClickState::default()),
             rendered_dual: Arc::new(Mutex::new(None)),
             live_input: live_input::LiveInputState::new(),
-            vst3_live: vst3_live::Vst3LiveState::new(),
+            live_instrument: live_instrument::LiveInstrumentState::new(),
         }
     }
 

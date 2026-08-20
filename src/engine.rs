@@ -38,6 +38,8 @@ pub enum Engine {
     Sfz(String),
     /// Plugin VST3 natif (chemin du bundle .vst3).
     Vst3(String),
+    /// FluidSynth avec une SoundFont EXPLICITE (.sf2/.sf3) — par piste.
+    Sf2(String),
 }
 
 impl Engine {
@@ -47,6 +49,7 @@ impl Engine {
             Engine::FluidSynth => "fluidsynth",
             Engine::Sfz(_) => "sfz",
             Engine::Vst3(_) => "vst3",
+            Engine::Sf2(_) => "sf2",
         }
     }
 }
@@ -420,6 +423,10 @@ pub fn render_wav_with_engine(
             }
             Engine::Sfz(p) => render_sfz(&notes, tempo, p.as_str(), duration_sec)?,
             Engine::Vst3(p) => render_vst3(&notes, tempo, p.as_str(), duration_sec)?,
+            Engine::Sf2(p) => {
+                let smf = crate::render::generate_smf_from_custom(&notes, std::slice::from_ref(t), tempo as u16);
+                crate::render::render_wav_raw(&smf, p.as_str(), duration_sec)?
+            }
         };
         // Les banques SFZ (ex. piano Salamander, cymbales enregistrées en
         // douceur) et les patches VST3 ont des niveaux internes très variables.
@@ -428,8 +435,10 @@ pub fn render_wav_with_engine(
         // ses samples — la balance entre pistes devient prévisible (le volume
         // de piste reste le réglage fin). Soft clip tanh contre les transients.
         // (Le mix final re-normalise au pic — la balance RMS est conservée.)
+        // Les SoundFonts GM (FluidSynth / Sf2) sont déjà équilibrées : pas de
+        // normalisation (même comportement que FluidSynth).
         let wav = match &engine {
-            Engine::FluidSynth => wav,
+            Engine::FluidSynth | Engine::Sf2(_) => wav,
             Engine::Sfz(_) | Engine::Vst3(_) => normalize_rms(&wav, -20.0),
         };
         let wav = if t.fx.is_off() {

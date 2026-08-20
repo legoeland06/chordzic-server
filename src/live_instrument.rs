@@ -1,18 +1,18 @@
-//! vst3_live.rs — Moteur VST3 temps réel pour le monitoring du pianiste.
+//! live_instrument.rs — Moteur live multi-source pour le monitoring du pianiste.
 //!
 //! Chemin : notes MIDI (clavier Roland, entrée gérée par `live_input`) →
-//! file → plugin VST3 (Surge XT) → sortie audio USB du Roland (device
-//! ALSA « roland », plug → hw:3,0) → haut-parleurs du Roland.
+//! moteur choisi → son. Trois sources :
 //!
-//! Config validée avec le Roland FP-60X (spike live, 2026-08-20) :
+//! - **Thru** : les notes reviennent au Roland (son GM interne) — DÉFAUT.
+//! - **Vst3** : plugin VST3 (Surge XT) → sortie audio USB du Roland
+//!   (device ALSA « roland », plug → hw:3,0) → haut-parleurs du Roland.
+//! - **Fluid** : FluidSynth (SoundFont GM du serveur) — son PC.
+//!
+//! Config VST3 validée avec le Roland FP-60X (spike live, 2026-08-20) :
 //! **44 100 Hz + buffer 256** — le Roland (carte 3) ne supporte QUE
 //! 44,1 kHz en S24_3LE → le device « roland » de ~/.asoundrc (type plug)
 //! fait la conversion de format. PipeWire ne monitor pas la carte 3 →
 //! ouvrable en direct par ALSA/cpal.
-//!
-//! Le thru MIDI (le Roland joue le son GM) reste le monitoring PAR DÉFAUT —
-//! ce moteur est une OPTION : quand il est actif, les notes du pianiste
-//! vont dans le plugin au lieu de la sortie MIDI (pas de double son).
 //!
 //! # Threads
 //!
@@ -42,6 +42,118 @@ enum Cmd {
     Start { preset: String, reply: Sender<Result<(), String>> },
     SetPreset { preset: String, reply: Sender<Result<(), String>> },
     Stop { reply: Sender<()> },
+}
+
+/// Source du moteur live : où partent les notes du pianiste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSource {
+    /// Thru MIDI : les notes reviennent au Roland (son GM interne) — DÉFAUT.
+    Thru,
+    /// Plugin VST3 (Surge XT) → audio USB → haut-parleurs du Roland.
+    Vst3,
+    /// FluidSynth (SoundFont GM du serveur) — son PC.
+    Fluid,
+}
+
+impl LiveSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LiveSource::Thru => "thru",
+            LiveSource::Vst3 => "vst3",
+            LiveSource::Fluid => "fluid",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "thru" => Some(LiveSource::Thru),
+            "vst3" => Some(LiveSource::Vst3),
+            "fluid" => Some(LiveSource::Fluid),
+            _ => None,
+        }
+    }
+}
+
+/// État agrégé du moteur live : source courante + sous-états.
+pub struct LiveInstrumentState {
+    /// Source active (le routage `monitor_send` la consulte à chaque message).
+    pub source: Mutex<LiveSource>,
+    /// Sous-moteur VST3 (Surge XT).
+    pub vst3: Arc<Vst3LiveState>,
+    /// Instrument GM posé sur FluidSynth (None = pas encore choisi).
+    pub fluid_program: Mutex<Option<u8>>,
+    /// SoundFont choisie pour FluidSynth (None = celle du serveur).
+    pub fluid_soundfont: Mutex<Option<String>>,
+}
+
+impl LiveInstrumentState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            source: Mutex::new(LiveSource::Thru),
+            vst3: Vst3LiveState::new(),
+            fluid_program: Mutex::new(None),
+            fluid_soundfont: Mutex::new(None),
+        })
+    }
+}
+
+/// État courant du moteur live (GET /live-instrument).
+/// `vst3` : {enabled, preset, error} ; `fluid` : {program, soundfont}.
+pub fn status_live(state: &Arc<LiveInstrumentState>) -> serde_json::Value {
+    let source = state.source.lock().unwrap();
+    let vst3 = status(&state.vst3);
+    let fluid_program = state.fluid_program.lock().unwrap().clone();
+    let fluid_soundfont = state.fluid_soundfont.lock().unwrap().clone();
+    serde_json::json!({
+        "source": source.as_str(),
+        "vst3": vst3,
+        "fluid": {
+            "program": fluid_program,
+            "soundfont": fluid_soundfont,
+        },
+    })
+}
+
+// ─── Presets Surge XT ───────────────────────────────────────────────────
+
+/// Presets « best-of » curatés par catégorie (noms vérifiés dans
+/// patches_factory d'usine — voir memory 2026-08-21).
+pub const BEST_PRESETS: &[(&str, &str)] = &[
+    ("Keys", "DX EP"), ("Keys", "Digi Harpsi"), ("Keys", "Church"),
+    ("Keys", "Dirt"), ("Keys", "Artificial 1"), ("Keys", "Circus 1"),
+    ("Keys", "Soft Suitcase"), ("Keys", "Artificial 2"),
+    ("Leads", "Acidofil"), ("Leads", "Agroculture"), ("Leads", "Asymptote"),
+    ("Leads", "Banjo Remains"), ("Leads", "Bee"), ("Leads", "Bitten"),
+    ("Leads", "Banter"), ("Leads", "Bad Childhood"),
+    ("Pads", "Alias Pornography"), ("Pads", "Bell Pad"), ("Pads", "Bells and Sweep"),
+    ("Pads", "Choir Pad Thing"), ("Pads", "Bright"), ("Pads", "Burden"),
+    ("Pads", "Canadians"), ("Pads", "Assymetry"),
+    ("Basses", "Behemoth"), ("Basses", "Crush Bass"), ("Basses", "Attacky"),
+    ("Basses", "Bass 2"), ("Basses", "Bass 4"), ("Basses", "Bass 5"),
+    ("Plucks", "80s Gliss"), ("Plucks", "ACME"), ("Plucks", "Agropop"),
+    ("Plucks", "Ambient E-Guitar"), ("Plucks", "Bell 1"), ("Plucks", "Battered Beauty"),
+    ("Plucks", "Artificial"), ("Plucks", "Asymmetry"),
+    ("Polysynths", "1804"), ("Polysynths", "Ahh Polly"), ("Polysynths", "Analyse"),
+    ("Polysynths", "Anthemish 1"), ("Polysynths", "Anthemish 2"), ("Polysynths", "Anthemish 3"),
+    ("Polysynths", "Boss"), ("Polysynths", "Bolibompa"),
+    ("Brass", "Brassy"), ("Brass", "JX-10 Double Brass"), ("Brass", "OB-8 Jump"),
+    ("Brass", "Synth Brass 1"), ("Brass", "Plastic Brass"), ("Brass", "Reso Brassy"),
+    ("Winds", "Clarinet"), ("Winds", "Cyber Flute"), ("Winds", "Dreamy Flute"),
+    ("Winds", "Flute 1"), ("Winds", "Flute 2"), ("Winds", "Tragic Winds"),
+    ("Winds", "Low"),
+    ("Percussion", "Drum One"), ("Percussion", "Kick 909ish"),
+    ("Percussion", "Snare Tight"), ("Percussion", "Synth Tom 1"),
+    ("Sequences", "Acid Seq 1"), ("Sequences", "Acid Seq 2"),
+    ("Sequences", "Bell Seq"), ("Sequences", "Bit Seq"),
+    ("Chords", "Major 7 MkI"), ("Chords", "Major 7 MkII"),
+    ("Chords", "Minor 7"), ("Chords", "Inharmonic Stab"),
+    ("MPE", "Bloom"), ("MPE", "Lead With A Bell Attack"),
+    ("MPE", "Moving Day In The Caves"), ("MPE", "Pad Plink 'n' Move"),
+];
+
+/// Vrai si (catégorie, nom) fait partie du best-of.
+pub fn is_best_preset(category: &str, name: &str) -> bool {
+    BEST_PRESETS.iter().any(|(c, n)| *c == category && *n == name)
 }
 
 /// État partagé du moteur VST3 live (routes HTTP + callback d'entrée MIDI
@@ -85,12 +197,23 @@ impl Vst3LiveState {
 }
 
 /// Un preset Surge : nom affichable, chemin absolu, catégorie (dossier 1er
-/// niveau de patches_factory : Leads, Pads, Basses…).
+/// niveau de patches_factory : Leads, Pads, Basses…), best-of ⭐.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PresetInfo {
     pub name: String,
     pub path: String,
     pub category: String,
+    /// Vrai si le preset fait partie du best-of curaté.
+    pub best: bool,
+}
+
+/// Une SoundFont trouvée sur le système (.sf2/.sf3).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SoundfontInfo {
+    pub name: String,
+    pub path: String,
+    pub kind: String, // "sf2" | "sf3"
+    pub size: u64,
 }
 
 /// Racine des presets d'usine Surge XT (data extraites du .deb).
@@ -130,9 +253,10 @@ pub fn list_presets() -> Vec<PresetInfo> {
                         .to_string_lossy()
                         .into_owned();
                     out.push(PresetInfo {
-                        name,
+                        name: name.clone(),
                         path: p.display().to_string(),
                         category: category.clone(),
+                        best: is_best_preset(&category, &name),
                     });
                 }
             }
@@ -496,6 +620,75 @@ fn engine_stop(state: &Arc<Vst3LiveState>, live: &mut Option<(Vst3Host, cpal::St
     println!("🛑 Moteur VST3 live arrêté (thru MIDI de nouveau actif)");
 }
 
+/// Scan des SoundFonts .sf2/.sf3 sur le système : dossier système
+/// (/usr/share/sounds) + ~/soundfonts (banques ajoutées à la main).
+/// Retourne la SoundFont du serveur (MuseScore General Full) en premier.
+pub fn scan_soundfonts() -> Vec<SoundfontInfo> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut roots: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/usr/share/sounds"),
+        std::path::PathBuf::from(&home).join("soundfonts"),
+        std::path::PathBuf::from(&home).join(".local/share/soundfonts"),
+    ];
+    let mut out = Vec::new();
+    for root in roots.drain(..) {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if let Some(ext) = p.extension() {
+                        let kind = ext.to_string_lossy().to_lowercase();
+                        if kind == "sf2" || kind == "sf3" {
+                            if let Ok(meta) = std::fs::metadata(&p) {
+                                let name = p
+                                    .file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned();
+                                out.push(SoundfontInfo {
+                                    name,
+                                    path: p.display().to_string(),
+                                    kind,
+                                    size: meta.len(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // La SoundFont du serveur en premier (banque par défaut du moteur live
+    // FluidSynth) — les doublons de nom sont gardés (chemins différents).
+    if let Some(sf) = find_system_soundfont() {
+        if let Some(pos) = out.iter().position(|s| s.path == sf) {
+            let item = out.remove(pos);
+            out.insert(0, item);
+        }
+    }
+    out
+}
+
+/// Cherche la SoundFont principale du serveur (MuseScore General Full).
+fn find_system_soundfont() -> Option<String> {
+    for cand in [
+        "/usr/share/sounds/sf3/MuseScore_General_Full.sf3",
+        "/usr/share/sounds/sf3/MuseScore_General.sf3",
+        "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+    ] {
+        if std::path::Path::new(cand).exists() {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +766,51 @@ mod tests {
         assert_eq!(direct.0, resolved.0);
         // Introuvable → erreur
         assert!(resolve_preset("zzz_preset_inexistant_123").is_err());
+    }
+
+    #[test]
+    fn best_of_tous_les_presets_existent() {
+        // Chaque entrée du best-of doit exister dans patches_factory
+        // (catégorie + nom) — sinon le ⭐ ne mènerait nulle part.
+        let presets = list_presets();
+        let by_cat: std::collections::HashMap<&str, std::collections::HashSet<&str>> = presets
+            .iter()
+            .map(|p| (p.category.as_str(), p.name.as_str()))
+            .fold(std::collections::HashMap::new(), |mut m, (c, n)| {
+                m.entry(c).or_default().insert(n);
+                m
+            });
+        let mut missing = Vec::new();
+        for (cat, name) in BEST_PRESETS {
+            if !by_cat.get(cat).map(|s| s.contains(name)).unwrap_or(false) {
+                missing.push(format!("{cat}/{name}"));
+            }
+        }
+        assert!(missing.is_empty(), "best-of introuvables : {missing:?}");
+        // Tous marqués best dans le scan
+        let best_count = presets.iter().filter(|p| p.best).count();
+        assert_eq!(best_count, BEST_PRESETS.len());
+    }
+
+    #[test]
+    fn scan_soundfonts_trouve_des_banques() {
+        let sfs = scan_soundfonts();
+        assert!(sfs.len() >= 3, "attendu ≥ 3 soundfonts, trouvé {}", sfs.len());
+        // La SoundFont du serveur (MuseScore General Full) est en premier
+        assert!(sfs[0].path.contains("MuseScore_General_Full"));
+        for s in sfs.iter().take(5) {
+            assert!(s.kind == "sf2" || s.kind == "sf3");
+            assert!(s.size > 0);
+        }
+    }
+
+    #[test]
+    fn sources_parse_et_affichage() {
+        assert_eq!(LiveSource::from_str("thru"), Some(LiveSource::Thru));
+        assert_eq!(LiveSource::from_str("vst3"), Some(LiveSource::Vst3));
+        assert_eq!(LiveSource::from_str("fluid"), Some(LiveSource::Fluid));
+        assert_eq!(LiveSource::from_str("autre"), None);
+        assert_eq!(LiveSource::Thru.as_str(), "thru");
+        assert_eq!(LiveSource::Fluid.as_str(), "fluid");
     }
 }
