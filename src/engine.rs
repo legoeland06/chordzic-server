@@ -253,15 +253,77 @@ pub fn render_sfz(
 
 /// Rendu VST3 : notes → événements datés (frames) → plugin → WAV.
 ///
+/// **Isolé dans un sous-processus** (`--render-vst3-worker`, même binaire en
+/// mode worker) : le plugin Surge XT est chargé DANS LE WORKER, jamais dans
+/// le process serveur. C'est indispensable depuis que le moteur live charge
+/// AUSSI Surge XT in-process : deux instances du plugin dans le même process
+/// (moteur live temps réel + rendu offline) déstabilisaient le moteur live
+/// (plus de son du monitoring pendant les rendus VST3). Le worker isole
+/// aussi le serveur des crashs/chargements lourds du plugin.
+///
 /// Le chemin peut être un bundle `.vst3` (rendu avec le patch du plugin)
 /// OU un preset Surge `.fxp` (le plugin Surge XT est chargé puis le state
 /// XML du preset est appliqué — `load_preset` refuse le .fxp Surge, il faut
 /// extraire le XML depuis `<?xml` et passer par `load_state`).
+pub fn render_vst3(
+    notes: &[CustomNote],
+    tempo: u32,
+    plugin_path: &str,
+    duration_sec: f64,
+) -> Result<Vec<u8>, String> {
+    // Notes sérialisées en JSON compact ([[canal,start,pitch,dur,vel],…])
+    let mut json = String::from("[");
+    for (i, n) in notes.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "[{},{},{},{},{}]",
+            n.channel, n.start_time, n.pitch, n.duration, n.velocity
+        ));
+    }
+    json.push(']');
+
+    let tag = next_render_tag();
+    let json_path = std::env::temp_dir().join(format!("{tag}.json"));
+    let wav_path = std::env::temp_dir().join(format!("{tag}.wav"));
+    std::fs::write(&json_path, json)
+        .map_err(|e| format!("Écriture des notes temporaires impossible : {e}"))?;
+
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("current_exe : {e}"))?;
+    let output = std::process::Command::new(&exe)
+        .arg("--render-vst3-worker")
+        .arg(&json_path)
+        .arg(tempo.to_string())
+        .arg(plugin_path)
+        .arg(&wav_path)
+        .arg(duration_sec.to_string())
+        .output()
+        .map_err(|e| format!("Lancement du worker VST3 impossible : {e}"))?;
+    let _ = std::fs::remove_file(&json_path);
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&wav_path);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Rendu VST3 (worker) : {}", stderr.trim()));
+    }
+    let wav = std::fs::read(&wav_path)
+        .map_err(|e| format!("Lecture du WAV VST3 impossible : {e}"))?;
+    let _ = std::fs::remove_file(&wav_path);
+
+    Ok(fit_duration(&wav, duration_sec))
+}
+
+/// Corps du rendu VST3 offline — exécuté dans le SOUS-PROCESSUS worker
+/// (`--render-vst3-worker`) : chargement du plugin, application du preset,
+/// rendu sample-accurate, normalisation. Le process serveur ne charge
+/// jamais le plugin (conflit avec le moteur live).
 ///
 /// Scheduling maison (la 0.4.2 publiée n'a pas `transport::Timeline`) :
 /// chaque événement est envoyé avec son offset sample exact dans le block,
 /// via `Plugin::send_midi_event_at`.
-pub fn render_vst3(
+pub fn render_vst3_offline(
     notes: &[CustomNote],
     tempo: u32,
     plugin_path: &str,

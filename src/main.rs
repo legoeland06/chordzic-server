@@ -3085,8 +3085,60 @@ fn build_app(state: AppState) -> Router {
     app
 }
 
+/// Mode worker du rendu VST3 (`--render-vst3-worker`) : le plugin Surge XT
+/// est chargé dans CE sous-processus, jamais dans le serveur — le moteur
+/// live VST3 (qui charge AUSSI Surge in-process) n'est plus déstabilisé par
+/// les rendus offline. Args : <notes.json> <tempo> <plugin> <out.wav> <dur>.
+/// Retourne le code de sortie (0 = OK).
+fn render_vst3_worker_main(args: &[String]) -> i32 {
+    if args.len() < 5 {
+        eprintln!("usage : --render-vst3-worker <notes.json> <tempo> <plugin> <out.wav> <dur>");
+        return 2;
+    }
+    let result = (|| -> Result<(), String> {
+        let data = std::fs::read(&args[0]).map_err(|e| format!("notes : {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&data).map_err(|e| format!("JSON notes : {e}"))?;
+        let mut notes = Vec::new();
+        if let Some(arr) = v.as_array() {
+            for e in arr {
+                if let Some(a) = e.as_array() {
+                    if a.len() >= 5 {
+                        notes.push(render::CustomNote {
+                            channel: a[0].as_u64().unwrap_or(0) as u8,
+                            start_time: a[1].as_f64().unwrap_or(0.0),
+                            pitch: a[2].as_u64().unwrap_or(60) as u8,
+                            duration: a[3].as_f64().unwrap_or(1.0),
+                            velocity: a[4].as_u64().unwrap_or(100) as u8,
+                        });
+                    }
+                }
+            }
+        }
+        let tempo: u32 = args[1].parse().map_err(|_| "tempo invalide".to_string())?;
+        let duration: f64 = args[4].parse().map_err(|_| "durée invalide".to_string())?;
+        let wav = engine::render_vst3_offline(&notes, tempo, &args[2], duration)?;
+        std::fs::write(&args[3], &wav).map_err(|e| format!("écriture WAV : {e}"))?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("render_vst3_worker : {e}");
+            1
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // Mode worker du rendu VST3 (sous-processus — isole Surge XT du serveur) :
+    // traité AVANT tout démarrage du serveur.
+    let cli: Vec<String> = std::env::args().skip(1).collect();
+    if !cli.is_empty() && cli[0] == "--render-vst3-worker" {
+        std::process::exit(render_vst3_worker_main(&cli[1..]));
+    }
+
     println!("🚀 chordZIC backend — serveur de séquencement MIDI");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
