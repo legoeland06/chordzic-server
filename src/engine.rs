@@ -244,11 +244,48 @@ pub fn render_sfz(
     // normalisation RMS bornée par la crête (jamais de clipping — la
     // dynamique du piano/des percussions est préservée), réécriture i16,
     // ajustement de la durée exacte.
-    let (left, right) = read_stereo_f32(&wav)?;
+    let (rate, left, right) = read_stereo_f32(&wav)?;
+    // ⚠️ RESAMPLING vers 44 100 Hz : le brut sfizz peut sortir à une autre
+    // fréquence (ex. 35 280 Hz) — sans conversion, les samples seraient
+    // joués à 44 100 → hauteur fausse et durée raccourcie (sons « faux »).
+    let (left, right) = if rate != 44_100 {
+        resample_linear(&left, &right, rate, 44_100)
+    } else {
+        (left, right)
+    };
     let (left, right) = normalize_channels(&left, &right, -24.0);
     let wav16 = write_i16_wav_stereo(&left, &right, 44_100)?;
 
     Ok(fit_duration(&wav16, duration_sec))
+}
+
+/// Resampling linéaire (stéréo f32) d'un sample rate vers un autre. Simple
+/// et robuste pour les conversions de rendu (sfizz → 44,1 kHz). Le taux
+/// source est typiquement 0,8× ou 1,25× la cible — l'interpolation linéaire
+/// suffit (upsampling : aucune fréquence ne replie ; downsampling léger :
+/// l'atténuation de l'interpolation sert de filtre anti-repliement doux).
+fn resample_linear(
+    left: &[f32],
+    right: &[f32],
+    src_rate: u32,
+    dst_rate: u32,
+) -> (Vec<f32>, Vec<f32>) {
+    if src_rate == dst_rate || src_rate == 0 || left.is_empty() {
+        return (left.to_vec(), right.to_vec());
+    }
+    let n_out = (left.len() as f64 * dst_rate as f64 / src_rate as f64).round() as usize;
+    let ratio = src_rate as f64 / dst_rate as f64;
+    let mut l = Vec::with_capacity(n_out);
+    let mut r = Vec::with_capacity(n_out);
+    for i in 0..n_out {
+        let pos = i as f64 * ratio;
+        let idx = pos.floor() as usize;
+        let frac = (pos - idx as f64) as f32;
+        let idx2 = (idx + 1).min(left.len() - 1);
+        l.push(left[idx] * (1.0 - frac) + left[idx2] * frac);
+        r.push(right[idx] * (1.0 - frac) + right[idx2] * frac);
+    }
+    (l, r)
 }
 
 /// Rendu VST3 : notes → événements datés (frames) → plugin → WAV.
@@ -594,7 +631,10 @@ pub fn mix_tracks(tracks: &[crate::render::RenderedTrack], master_vol: u8) -> Re
 
 /// Lit un WAV (Int 8/16/24/32 ou Float, mono ou multi-canaux) en stéréo f32 :
 /// L = canal 1, R = canal 2 (mono → dupliqué, canaux supplémentaires ignorés).
-pub fn read_stereo_f32(wav: &[u8]) -> Result<(Vec<f32>, Vec<f32>), String> {
+/// Retourne (sample_rate, L, R) — le sample rate est INDISPENSABLE : sfizz
+/// peut écrire le brut à une fréquence inattendue (ex. 35280 Hz) ; joué tel
+/// quel, le son serait faux (hauteur + durée).
+pub fn read_stereo_f32(wav: &[u8]) -> Result<(u32, Vec<f32>, Vec<f32>), String> {
     use hound::{SampleFormat, WavReader};
     let mut reader = WavReader::new(std::io::Cursor::new(wav)).map_err(|e| e.to_string())?;
     let spec = reader.spec();
@@ -650,9 +690,9 @@ pub fn read_stereo_f32(wav: &[u8]) -> Result<(Vec<f32>, Vec<f32>), String> {
     if ch == 1 {
         // Mono : R = copie de L
         let r = left.clone();
-        return Ok((left, r));
+        return Ok((spec.sample_rate, left, r));
     }
-    Ok((left, right))
+    Ok((spec.sample_rate, left, right))
 }
 
 /// Normalise des canaux stéréo f32 à un niveau RMS cible (dBFS, négatif), en
@@ -791,7 +831,8 @@ mod tests {
             w.write_sample(-16_384i16).unwrap();
             w.finalize().unwrap();
         }
-        let (l, r) = read_stereo_f32(&buf).unwrap();
+        let (rate, l, r) = read_stereo_f32(&buf).unwrap();
+        assert_eq!(rate, 44_100);
         assert_eq!(l.len(), 2);
         assert_eq!(r.len(), 2);
         assert!((l[0] - 0.5).abs() < 1e-4);
@@ -993,6 +1034,72 @@ pub fn parse_drum_sfz(path: &str) -> Result<Vec<(u8, String)>, String> {
         assert_eq!(names.get(&36).map(|s| s.as_str()), Some("Kick"));
         assert_eq!(names.get(&38).map(|s| s.as_str()), Some("Snare"));
         assert_eq!(names.get(&42).map(|s| s.as_str()), Some("Hi-Hat (closed)"));
+    }
+
+    /// fit_duration comble le silence : 1 s → 2 s exactement.
+    #[test]
+    fn fit_duration_comble_le_silence() {
+        use hound::{SampleFormat, WavSpec, WavWriter};
+        let spec = WavSpec { channels: 2, sample_rate: 44_100, bits_per_sample: 16, sample_format: SampleFormat::Int };
+        let mut buf = Vec::new();
+        {
+            let mut w = WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for _ in 0..44_100 {
+                w.write_sample(1000i16).unwrap();
+                w.write_sample(-1000i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let out = fit_duration(&buf, 2.0);
+        assert_eq!(out.len(), 44_100 * 2 * 2 * 2 + 44); // 2 s × 44 100 × 2 canaux × 2 octets + header 44
+        // Et tronque : 3 s → 2 s
+        let mut buf3 = Vec::new();
+        {
+            let mut w = WavWriter::new(std::io::Cursor::new(&mut buf3), spec).unwrap();
+            for _ in 0..(44_100 * 3) {
+                w.write_sample(1000i16).unwrap();
+                w.write_sample(-1000i16).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let out3 = fit_duration(&buf3, 2.0);
+        assert_eq!(out3.len(), 44_100 * 2 * 2 * 2 + 44);
+    }
+
+    /// Le resampler linéaire conserve la durée et la fréquence perçues :
+    /// 8 s à 35 280 Hz → 8 s à 44 100 Hz (le même signal, plus d'échantillons).
+    #[test]
+    fn resampling_35280_vers_44100_conserve_la_hauteur() {
+        let src_rate = 35_280u32;
+        let dst_rate = 44_100u32;
+        let seconds = 8.0f64;
+        let n = (seconds * src_rate as f64) as usize;
+        // Sinus 440 Hz (A4) au sample rate source
+        let mut l = Vec::with_capacity(n);
+        let mut r = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = (2.0 * std::f64::consts::PI * 440.0 * i as f64 / src_rate as f64).sin() as f32 * 0.5;
+            l.push(v);
+            r.push(v);
+        }
+        let (nl, nr) = resample_linear(&l, &r, src_rate, dst_rate);
+        // Durée conservée (tolérance 1 sample)
+        let expect = (seconds * dst_rate as f64).round() as usize;
+        assert!((nl.len() as i64 - expect as i64).abs() <= 1, "{} vs {}", nl.len(), expect);
+        // La fréquence du signal resamplé reste ~440 Hz (passages par zéro
+        // sur la fenêtre [0.5 s, 1.5 s] — robuste pour un sinus pur).
+        let from = (0.5 * dst_rate as f64) as usize;
+        let to = (1.5 * dst_rate as f64) as usize;
+        let mut crossings = 0usize;
+        for i in (from + 1)..to {
+            if (nl[i - 1] < 0.0) != (nl[i] < 0.0) {
+                crossings += 1;
+            }
+        }
+        let freq = crossings as f64 / 2.0; // 2 passages par période
+        assert!((freq - 440.0).abs() < 8.0, "fréquence {freq} ≠ 440");
+        // Les deux canaux restent synchrones
+        assert_eq!(nl.len(), nr.len());
     }
 
     /// parse_drum_sfz sur le vrai kit Salamander (machine de dev).
