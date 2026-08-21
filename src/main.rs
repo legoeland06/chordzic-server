@@ -2431,6 +2431,34 @@ async fn soundfonts_list() -> impl IntoResponse {
     axum::Json(live_instrument::scan_soundfonts())
 }
 
+/// GET /drum-map?path=<kit.sfz> — Mapping pitch → nom de percussion d'un kit
+/// de batterie SFZ (sections commentées + key=). Affiché sur la marge du
+/// Piano Roll quand une piste drums utilise ce kit.
+async fn drum_map(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let Some(path) = params.get("path") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "paramètre path manquant"})),
+        )
+            .into_response();
+    };
+    match engine::parse_drum_sfz(path) {
+        Ok(map) => axum::Json(
+            map.iter()
+                .map(|(pitch, name)| serde_json::json!({"pitch": pitch, "name": name}))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /live-instrument — Source du monitoring des notes du pianiste :
 ///   {"source": "thru"}                    → Roland GM (défaut)
 ///   {"source": "vst3", "preset": …}      → Surge XT → audio USB → Roland
@@ -3050,6 +3078,7 @@ fn build_app(state: AppState) -> Router {
         .route("/live-echo", post(live_echo))
         .route("/vst3-presets", get(vst3_presets))
         .route("/soundfonts-list", get(soundfonts_list))
+        .route("/drum-map", get(drum_map))
         .route("/live-instrument", get(live_instrument_state).post(live_instrument))
         .route("/live-vst3", get(live_vst3_state).post(live_vst3))
         .route("/mpe", post(mpe))

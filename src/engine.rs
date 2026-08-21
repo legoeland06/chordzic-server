@@ -799,3 +799,226 @@ mod tests {
         assert!((l[1] + 0.5).abs() < 1e-4);
     }
 }
+
+/// Normalise un nom de section SFZ de batterie : « Hihat closed » →
+/// « Hi-Hat (closed) », « Rides » → « Ride », « Crashes and chinas… » →
+/// « Crash », « Kick2!!! ==2== » → « Kick 2 »… Retourne vide si rien de
+/// reconnaissable (les séparateurs « ===== » ne changent pas le nom courant).
+fn clean_drum_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '/')
+        .collect();
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    let joined = words.join(" ").to_lowercase();
+    // Règles de normalisation (les noms des kits Salamander/VSCO2…)
+    let mapped = if joined.starts_with("hihat") || joined.starts_with("hi-hat") {
+        let rest: Vec<&str> = words.iter().skip(1).copied().collect();
+        let rest = rest.join(" ");
+        match rest.to_lowercase().as_str() {
+            "" => "Hi-Hat".to_string(),
+            "closed" => "Hi-Hat (closed)".to_string(),
+            "open" => "Hi-Hat (open)".to_string(),
+            "foot" | "footstomp" => "Hi-Hat (foot)".to_string(),
+            "semiopen" => "Hi-Hat (semi-open)".to_string(),
+            _ => format!("Hi-Hat ({})", rest),
+        }
+    } else if joined.starts_with("kick") {
+        // Le numéro est celui ATTACHÉ au mot (Kick2) — pas les chiffres des
+        // séparateurs qui suivent (Kick2!!! ==2== → « Kick 2 », pas « 22 »).
+        let rest = joined.trim_start_matches("kick");
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if num.is_empty() { "Kick".to_string() } else { format!("Kick {}", num) }
+    } else if joined.starts_with("snare") {
+        let rest = joined.trim_start_matches("snare");
+        match rest {
+            "" => "Snare".to_string(),
+            "off" => "Snare (off)".to_string(),
+            "stick" => "Snare (stick)".to_string(),
+            "2" => "Snare 2".to_string(),
+            "2off" => "Snare 2 (off)".to_string(),
+            _ => format!("Snare{}", rest),
+        }
+    } else if joined.starts_with("hitom") {
+        "Hi Tom".to_string()
+    } else if joined.starts_with("lotom") {
+        "Lo Tom".to_string()
+    } else if joined.starts_with("tom") {
+        "Tom".to_string()
+    } else if joined.starts_with("ride") {
+        "Ride".to_string()
+    } else if joined.starts_with("crash") {
+        "Crash".to_string()
+    } else if joined.starts_with("cowbell") {
+        "Cowbell".to_string()
+    } else if joined.starts_with("clap") {
+        "Clap".to_string()
+    } else if joined.starts_with("tambourine") {
+        "Tambourine".to_string()
+    } else if joined.starts_with("shaker") {
+        "Shaker".to_string()
+    } else {
+        // Capitalisation simple mot à mot (ex. « Ze salamander drum library »)
+        words
+            .iter()
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    mapped
+}
+
+/// Extrait `key=N` d'une ligne SFZ (groupe ou région).
+fn sfz_key(line: &str) -> Option<u8> {
+    for part in line.split_whitespace() {
+        if let Some(v) = part.strip_prefix("key=") {
+            if let Ok(k) = v.parse::<u8>() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Extrait le nom de fichier sample d'une région (`sample=chemin`).
+fn sfz_sample_name(line: &str) -> Option<String> {
+    for part in line.split_whitespace() {
+        if let Some(v) = part.strip_prefix("sample=") {
+            let name = std::path::Path::new(v)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Parse un kit de batterie SFZ : sections commentées (`//Nom`) + `key=N`
+/// → mapping pitch → nom de percussion (kick, snare, hi-hat, ride, crash,
+/// toms…). Retourne la liste triée par pitch. Le nom de la section courante
+/// s'applique aux clés suivantes ; en l'absence de section, le nom est
+/// dérivé du fichier sample de la région.
+pub fn parse_drum_sfz(path: &str) -> Result<Vec<(u8, String)>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Lecture du SFZ impossible : {e}"))?;
+    let mut current_name = String::new();
+    let mut current_key: Option<u8> = None;
+    let mut map: std::collections::BTreeMap<u8, String> = std::collections::BTreeMap::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.starts_with("//") {
+            let name = clean_drum_name(t.trim_start_matches('/'));
+            if !name.is_empty() {
+                current_name = name;
+            }
+            continue;
+        }
+        if t.starts_with('<') || t.starts_with("key=") {
+            if let Some(k) = sfz_key(t) {
+                current_key = Some(k);
+            }
+        }
+        if let Some(k) = current_key {
+            if !map.contains_key(&k) {
+                let name = if !current_name.is_empty() {
+                    current_name.clone()
+                } else if let Some(sample) = sfz_sample_name(t) {
+                    clean_drum_name(&sample)
+                } else {
+                    continue;
+                };
+                if !name.is_empty() {
+                    map.insert(k, name);
+                }
+            }
+        }
+    }
+    Ok(map.into_iter().collect())
+}
+
+    /// clean_drum_name : noms des sections Salamander normalisés.
+    #[test]
+    fn noms_de_sections_drums_normalises() {
+        assert_eq!(clean_drum_name("Kick ====="), "Kick");
+        assert_eq!(clean_drum_name("Kick2!!! ==2=="), "Kick 2");
+        assert_eq!(clean_drum_name("snare"), "Snare");
+        assert_eq!(clean_drum_name("snareOFF"), "Snare (off)");
+        assert_eq!(clean_drum_name("snareStick"), "Snare (stick)");
+        assert_eq!(clean_drum_name("Hihat closed"), "Hi-Hat (closed)");
+        assert_eq!(clean_drum_name("Hihat open"), "Hi-Hat (open)");
+        assert_eq!(clean_drum_name("Hihat Foot"), "Hi-Hat (foot)");
+        assert_eq!(clean_drum_name("Hihat SemiOpen"), "Hi-Hat (semi-open)");
+        assert_eq!(clean_drum_name("HiTom"), "Hi Tom");
+        assert_eq!(clean_drum_name("loTom"), "Lo Tom");
+        assert_eq!(clean_drum_name("Rides"), "Ride");
+        assert_eq!(clean_drum_name("Crashes and chinas and other cymbals/effects"), "Crash");
+        assert_eq!(clean_drum_name("CowBell"), "Cowbell");
+        // Séparateur vide → nom inchangé (retourne vide)
+        assert_eq!(clean_drum_name("=========="), "");
+    }
+
+    /// parse_drum_sfz sur un mini-kit : sections + keys.
+    #[test]
+    fn parse_kit_sfz_mini() {
+        let dir = std::env::temp_dir().join(format!("chordj_drum_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kit.sfz");
+        std::fs::write(&path, "//Kick =====
+<group> key=36
+<region> sample=OH/kick.wav
+//snare
+<group> key=38
+<region> sample=OH/snare.wav
+//Hihat closed
+<group> key=42
+<region> sample=OH/hh.wav
+").unwrap();
+        let map = parse_drum_sfz(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let names: std::collections::HashMap<u8, String> = map.into_iter().collect();
+        assert_eq!(names.get(&36).map(|s| s.as_str()), Some("Kick"));
+        assert_eq!(names.get(&38).map(|s| s.as_str()), Some("Snare"));
+        assert_eq!(names.get(&42).map(|s| s.as_str()), Some("Hi-Hat (closed)"));
+    }
+
+    /// parse_drum_sfz sur le vrai kit Salamander (machine de dev).
+    #[test]
+    fn parse_kit_salamander_contient_les_essentiels() {
+        let kit = format!(
+            "{}/Dev/zic_dev/dev/vst3_instruments/salamander_drumkit/salamander_drumkit_v1/ALL.sfz",
+            std::env::var("HOME").unwrap_or_default()
+        );
+        if !std::path::Path::new(&kit).exists() {
+            return; // kit absent (autre machine) → test non bloquant
+        }
+        let map = parse_drum_sfz(&kit).unwrap();
+        let names: std::collections::HashMap<u8, String> = map.into_iter().collect();
+        for (pitch, wanted) in [
+            (35, "Kick"),
+            (36, "Kick 2"),
+            (38, "Snare"),
+            (42, "Hi-Hat (closed)"),
+            (46, "Hi-Hat (open)"),
+            (51, "Ride"),
+        ] {
+            let n = names.get(&pitch).map(|s| s.as_str()).unwrap_or("");
+            assert!(
+                n.starts_with(wanted),
+                "pitch {pitch} : attendu ~{wanted}, trouvé « {n} »"
+            );
+        }
+    }
