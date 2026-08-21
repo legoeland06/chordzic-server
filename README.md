@@ -1,9 +1,11 @@
 # chords-server-rs — Backend de chordZIC V2
 
 Serveur HTTP **Rust / Axum** qui convertit des requêtes JSON en **MIDI** (FluidSynth /
-Roland, lecture temps réel), produit des rendus **WAV** hors-ligne, écoute le
-clavier du pianiste (reconnaissance d'accords), relaie l'écho MIDI vers le
-périphérique (son de la piste) et sert la synthèse vocale **Piper**.
+Roland, lecture temps réel), produit des rendus **WAV** hors-ligne (FluidSynth,
+**SFZ** via Sfizz, **VST3** via Surge XT, **SoundFonts** .sf2/.sf3 par piste),
+écoute le clavier du pianiste (reconnaissance d'accords), relaie l'écho MIDI vers le
+périphérique (son de la piste), héberge le **moteur live** (thru Roland / Surge XT →
+audio USB → haut-parleurs du Roland / FluidSynth) et sert la synthèse vocale **Piper**.
 
 C'est le moteur de **chordZIC V2** : un séquenceur de grilles d'accords web avec
 piano 88 touches illuminé, piano rolls, pistes drums, boucles d'échantillons et
@@ -30,6 +32,17 @@ En mode **standalone**, le serveur embarque le frontend complet :
 - **🎹 Reconnaissance d'accords (mode Live)** : `GET /live-input` relaie les notes
   tenues sur le clavier du pianiste (Roland) — ordre d'arrivée **conservé** (l'ordre
   d'appui du pianiste est transmis tel quel, la reco trie elle-même ses classes)
+- **🎸 Moteur live multi-source** : `GET/POST /live-instrument` — ce que le pianiste
+  entend en jouant : **thru** (Roland GM, défaut) · **vst3** (Surge XT → audio USB →
+  haut-parleurs du Roland, 637 presets) · **fluid** (FluidSynth, instrument GM au
+  choix). Changement de preset à chaud, PC GM posé sur le canal cible, gain de
+  sécurité (−2 dB) contre la saturation de l'entrée USB. `/live-vst3` conservé en
+  compatibilité
+- **🎛️ Instruments du rendu** : `GET /instruments-list` (SFZ + plugins VST3),
+  `GET /vst3-presets` (637 presets Surge catégorisés, `best` = best-of ⭐),
+  `GET /soundfonts-list` (.sf2/.sf3 système + `~/soundfonts`) — assignables **par
+  piste** dans `/render-wav` ({engine: sfz|vst3|sf2, path}) ; un preset Surge .fxp
+  est chargé via Surge XT + son state XML (chemins normalisés : `~/`, relatifs)
 - **🎛 Écho MIDI / son de la piste (mode Navig)** : `POST /live-echo` — avec une piste
   sélectionnée, le serveur envoie au périphérique le **program change** de la piste
   (banque + PC, canal drums natif) et renvoie les notes du pianiste sur son canal
@@ -95,6 +108,11 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 | POST | `/render-notes` | Notes isolées (pré-remplissage piano roll) |
 | GET | `/live-input` | Notes tenues sur le clavier du pianiste (ordre d'arrivée) |
 | POST | `/live-echo` | Écho MIDI + program change de la piste sélectionnée |
+| GET/POST | `/live-instrument` | Moteur live : source thru/vst3/fluid (+ preset/program) |
+| GET | `/live-vst3` · POST | État/contrôle du sous-moteur VST3 (compat) |
+| GET | `/instruments-list` | Instruments du rendu : SFZ + plugins VST3 |
+| GET | `/vst3-presets` | 637 presets Surge XT (catégorie + best-of ⭐) |
+| GET | `/soundfonts-list` | SoundFonts .sf2/.sf3 disponibles |
 | POST | `/piano-note` | LivePiano cliquable : note-on/off vers le Roland (canal piste cible, sinon écho/1) |
 | POST | `/rec-midi` · GET `/rec-midi-state` | Enregistrement MIDI horodaté (mode Navig) |
 | POST | `/tts` | Synthèse vocale Piper (proxy, renvoie un WAV) |
@@ -124,6 +142,12 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 - `midi.rs` — sortie MIDI (midir), FluidSynth
 - `live_input.rs` — écoute du clavier (notes tenues, ordre d'arrivée), écho MIDI,
   pédale de sustain, program change, **session d'enregistrement MIDI** (RecSession)
+- `live_instrument.rs` — moteur live multi-source : thru / VST3 Surge XT (thread
+  moteur dédié, `cpal::Stream` non-Send, callback audio try_lock) / FluidSynth ;
+  scan des 637 presets (best-of ⭐), scan des SoundFonts
+- `engine.rs` — moteurs de rendu hors-ligne : FluidSynth, Sfz (sfizz_render), Vst3
+  (preset .fxp = Surge XT + state XML), Sf2 (SoundFont par piste) ; normalisation
+  RMS bornée par la crête (jamais de clipping, dynamique préservée)
 - `patterns.rs` — patterns batterie
 - `walking.rs` — walking bass
 - `render.rs` — rendu WAV hors-ligne (hound + synthèse)
@@ -136,8 +160,12 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 ## Dépendances principales
 
 `axum` 0.7 · `tokio` 1 · `serde`/`serde_json` · `tower-http` (CORS) · `midir` 0.9 ·
-`rodio` 0.18 · `cpal` 0.15 · `hound` 3.5 · `ureq` (proxy TTS) · `rust-embed` (standalone) ·
-`mime_guess`
+`rodio` 0.18 · `cpal` 0.15 · `hound` 3.5 · `vst3-host` 0.4 · `midly` 0.5 ·
+`ureq` (proxy TTS) · `rust-embed` (standalone) · `mime_guess`
+
+Prérequis rendus instruments : `sfizz_render` (Sfizz, dans le PATH ou
+`~/.local/bin`) pour les banques SFZ ; Surge XT installé dans `~/.vst3/` avec ses
+presets (`~/.local/share/Surge XT/patches_factory`) pour le VST3.
 
 ## Tests
 
@@ -145,12 +173,17 @@ des notes enregistrées (transport USB MIDI + ALSA, constant matériel — défa
 cargo test --release
 ```
 
-112 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
+124 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
 (ordre d'arrivée), écho MIDI, program change, enregistrement MIDI, TTS
-(serveur Piper factice).
+(serveur Piper factice), presets Surge (scan ≥ 600, best-of, résolution de
+chemins), SoundFonts, normalisation anti-saturation.
 
 ## Notes de version
 
+- **v2.7.3 (21/08/2026)** — 🎸 Moteur live multi-source (thru / Surge XT → audio
+  USB → haut-parleurs du Roland / FluidSynth) + rendu par piste (SFZ, presets
+  Surge .fxp, SoundFonts .sf2/.sf3, plugins VST3) + anti-saturation (normalisation
+  RMS bornée par la crête, marge −2 dBFS, gain live −2 dB).
 - **v2.7.2 (20/08/2026)** — 📱 Frontend embarqué : mode tactile (inhibition
   des réactions navigateur/OS sur écran tactile : appui long = clic droit,
   double-tap = zoom, sélection au glissé).
