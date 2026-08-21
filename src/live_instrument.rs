@@ -174,6 +174,9 @@ pub struct Vst3LiveState {
     pub preset_name: Mutex<Option<String>>,
     /// Dernière erreur (affichée par l'API — pas de panique silencieuse).
     pub last_error: Mutex<Option<String>>,
+    /// Le stream audio cpal a signalé une erreur (ex: POLLERR — device
+    /// ALSA mort) : le thread moteur le détecte et le redémarre (backoff).
+    pub stream_error: AtomicBool,
     /// File MIDI : alimentée par le callback d'entrée (live_input), vidée par
     /// le callback audio au début de chaque block (latence ≤ 1 buffer).
     queue: Arc<Mutex<VecDeque<MidiEvent>>>,
@@ -194,6 +197,7 @@ impl Vst3LiveState {
             preset_path: Mutex::new(None),
             preset_name: Mutex::new(None),
             last_error: Mutex::new(None),
+            stream_error: AtomicBool::new(false),
             queue: Arc::new(Mutex::new(VecDeque::new())),
             plugin: Arc::new(Mutex::new(None)),
             cmd_tx: Mutex::new(None),
@@ -556,20 +560,63 @@ pub fn status(state: &Arc<Vst3LiveState>) -> serde_json::Value {
 /// (il est `Send` — le callback audio ALSA le verrouille en try_lock).
 fn engine_loop(state: Arc<Vst3LiveState>, rx: Receiver<Cmd>) {
     let mut live: Option<(Vst3Host, cpal::Stream)> = None;
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Start { preset, reply } => {
+    // Backoff du redémarrage automatique du stream (1 s → 2 → 4 … max 30 s).
+    let mut restart_delay: u64 = 1;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(Cmd::Start { preset, reply }) => {
                 let res = engine_start(&state, &mut live, &preset);
+                if res.is_ok() {
+                    restart_delay = 1;
+                }
                 let _ = reply.send(res);
             }
-            Cmd::SetPreset { preset, reply } => {
+            Ok(Cmd::SetPreset { preset, reply }) => {
                 let res = engine_set_preset(&state, &preset);
                 let _ = reply.send(res);
             }
-            Cmd::Stop { reply } => {
+            Ok(Cmd::Stop { reply }) => {
                 engine_stop(&state, &mut live);
+                state.stream_error.store(false, Ordering::Relaxed);
                 let _ = reply.send(());
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // ── Surveillance : le stream audio est mort (POLLERR…) ? ──
+                // Le device ALSA du Roland peut être perdu (conflit PipeWire,
+                // xrun sévère, réinitialisation USB) : au lieu de rester
+                // muet « enabled », on redémarre le moteur avec backoff.
+                if state.stream_error.swap(false, Ordering::Relaxed) {
+                    let preset = state.preset_path.lock().unwrap().clone();
+                    match preset {
+                        Some(p) => {
+                            eprintln!("🔁 Stream audio VST3 live mort — redémarrage dans {restart_delay}s…");
+                            std::thread::sleep(std::time::Duration::from_secs(restart_delay));
+                            // Redémarrage complet : drop du stream/plugin, re-start.
+                            engine_stop(&state, &mut live);
+                            // Vide la file MIDI accumulée pendant la panne.
+                            state.queue.lock().unwrap().clear();
+                            let res = engine_start(&state, &mut live, &p);
+                            match res {
+                                Ok(()) => {
+                                    restart_delay = 1;
+                                    *state.last_error.lock().unwrap() = None;
+                                    eprintln!("✅ Stream audio VST3 live rétabli");
+                                }
+                                Err(e) => {
+                                    restart_delay = (restart_delay * 2).min(30);
+                                    *state.last_error.lock().unwrap() = Some(e);
+                                }
+                            }
+                        }
+                        None => {
+                            // Pas de preset connu : le moteur ne sert plus à
+                            // rien → arrêt propre (retour au thru MIDI).
+                            engine_stop(&state, &mut live);
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -630,7 +677,21 @@ fn engine_start(
     // zéro allocation, file vidée au début du block (latence ≤ 1 buffer).
     let plugin_rt = Arc::clone(&state.plugin);
     let q_rt = Arc::clone(&state.queue);
-    let err_fn = |e| eprintln!("⚠️ Erreur audio VST3 live : {e}");
+    // Callback d'ERREUR du stream : pose le flag (le thread moteur redémarre
+    // le stream avec backoff) + expose l'erreur à l'API. Throttle du log :
+    // POLLERR peut pleuvoir (device ALSA mort) — sans limite, le log gonfle
+    // à l'infini (9,6 Go observés !).
+    let err_state = Arc::clone(&state);
+    let mut last_err_log = std::time::Instant::now();
+    let err_fn = move |e: cpal::StreamError| {
+        err_state.stream_error.store(true, Ordering::Relaxed);
+        *err_state.last_error.lock().unwrap() =
+            Some(format!("Audio VST3 live : {e}"));
+        if last_err_log.elapsed().as_secs() >= 1 {
+            eprintln!("⚠️ Erreur audio VST3 live : {e}");
+            last_err_log = std::time::Instant::now();
+        }
+    };
     let stream = device
         .build_output_stream(
             &stream_cfg,
