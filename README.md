@@ -173,7 +173,7 @@ presets (`~/.local/share/Surge XT/patches_factory`) pour le VST3.
 cargo test --release
 ```
 
-124 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
+129 tests : parseur d'accords, patterns, walking bass, ticks SMF, entrée live
 (ordre d'arrivée), écho MIDI, program change, enregistrement MIDI, TTS
 (serveur Piper factice), presets Surge (scan ≥ 600, best-of, résolution de
 chemins), SoundFonts, normalisation anti-saturation.
@@ -183,7 +183,15 @@ chemins), SoundFonts, normalisation anti-saturation.
 - **v2.7.3 (21/08/2026)** — 🎸 Moteur live multi-source (thru / Surge XT → audio
   USB → haut-parleurs du Roland / FluidSynth) + rendu par piste (SFZ, presets
   Surge .fxp, SoundFonts .sf2/.sf3, plugins VST3) + anti-saturation (normalisation
-  RMS bornée par la crête, marge −2 dBFS, gain live −2 dB).
+  RMS bornée par la crête, marge −2 dBFS, gain live −2 dB) + rendu VST3 isolé en
+  sous-processus + `/drum-map` + garde-fou sample rate 44,1 kHz.
+  **Frontend embarqué** : badge 🎛️ du son du Roland sur le LivePiano (Live et
+  Navig — le pianiste change de son directement), feedback ⏳/⚠️ du chargement
+  du moteur live, PianoRoll modal plein écran (fit-to-height).
+  **🐛 Fix deadlock** : ordre des verrous `echo → mpe` uniformisé (le callback
+  MIDI IN + ticker LFO prenaient l'inverse de `/mpe-state` et `/mpe-reset` →
+  le thread MIDI IN se figeait, LivePiano mort avec backend OK) + callback
+  MIDI IN sans aucun `unwrap()` (un verrou empoisonné ne le tue plus).
 - **v2.7.2 (20/08/2026)** — 📱 Frontend embarqué : mode tactile (inhibition
   des réactions navigateur/OS sur écran tactile : appui long = clic droit,
   double-tap = zoom, sélection au glissé).
