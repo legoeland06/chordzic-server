@@ -3015,9 +3015,15 @@ async fn instruments_list() -> impl IntoResponse {
     }
     let mut out: Vec<Instrument> = Vec::new();
 
-    // SFZ : dossier d'instruments libres
+    // SFZ : dossier d'instruments libres — variable d'env CHORDZIC_SFZ_DIR
+    // (standalone Mac/Windows : le script d'installation la pose), défaut :
+    // chemin de dev du PC d'Eric.
     let home = std::env::var("HOME").unwrap_or_default();
-    let root = std::path::PathBuf::from(&home).join("Dev/zic_dev/dev/vst3_instruments");
+    let root = std::env::var("CHORDZIC_SFZ_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(&home).join("Dev/zic_dev/dev/vst3_instruments")
+        });
     if root.exists() {
         for (name, path) in engine::scan_sfz_instruments(&root) {
             out.push(Instrument {
@@ -3028,13 +3034,13 @@ async fn instruments_list() -> impl IntoResponse {
         }
     }
 
-    // VST3 : scan ~/.vst3 (in-process)
-    let vst3_dir = std::path::PathBuf::from(&home).join(".vst3");
-    match vst3_host::Vst3Host::builder()
-        .add_scan_path(vst3_dir)
-        .build()
-        .and_then(|mut h| h.discover_plugins())
-    {
+    // VST3 : scan des dossiers standards de la plateforme (~/.vst3, macOS
+    // ~/Library/Audio/Plug-Ins/VST3, Windows Program Files/Common Files/VST3)
+    let mut builder = vst3_host::Vst3Host::builder();
+    for dir in live_instrument::vst3_search_dirs() {
+        builder = builder.add_scan_path(dir);
+    }
+    match builder.build().and_then(|mut h| h.discover_plugins()) {
         Ok(plugins) => {
             for p in plugins {
                 out.push(Instrument {

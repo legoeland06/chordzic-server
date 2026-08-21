@@ -222,10 +222,25 @@ pub struct SoundfontInfo {
     pub size: u64,
 }
 
-/// Racine des presets d'usine Surge XT (data extraites du .deb).
+/// Racine des presets d'usine Surge XT — chemins standards par plateforme :
+/// Linux `~/.local/share/Surge XT/patches_factory`, macOS
+/// `~/Library/Application Support/Surge XT/patches_factory`, Windows
+/// `%APPDATA%/Surge XT/patches_factory`. Variable d'env SURGE_PATCHES_DIR
+/// prioritaire (le script d'installation des standalone peut la poser).
 pub fn patches_root() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".local/share/Surge XT/patches_factory")
+    if let Ok(d) = std::env::var("SURGE_PATCHES_DIR") {
+        return std::path::PathBuf::from(d);
+    }
+    match std::env::consts::OS {
+        "macos" => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("Library/Application Support/Surge XT/patches_factory"),
+        "windows" => {
+            let base = std::env::var("APPDATA").unwrap_or_default();
+            std::path::PathBuf::from(base).join("Surge XT/patches_factory")
+        }
+        _ => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".local/share/Surge XT/patches_factory"),
+    }
 }
 
 /// Scan récursif des presets `.fxp` — catégorie = dossier parent direct
@@ -285,28 +300,61 @@ pub fn extract_xml_state(data: &[u8]) -> Option<&[u8]> {
     data.windows(marker.len()).position(|w| w == marker).map(|pos| &data[pos..])
 }
 
-/// Cherche le chemin du plugin Surge XT : `~/.vst3/Surge XT.vst3` d'abord,
-/// sinon premier .vst3 de `~/.vst3` dont le nom contient « surge ».
-pub fn find_surge_plugin() -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let dir = std::path::PathBuf::from(&home).join(".vst3");
-    let direct = dir.join("Surge XT.vst3");
-    if direct.exists() {
-        return Ok(direct.display().to_string());
+/// Dossiers VST3 à scanner selon la plateforme (chemins standards) :
+/// - Linux : `~/.vst3`
+/// - macOS : `~/.vst3` + `~/Library/Audio/Plug-Ins/VST3` + `/Library/Audio/Plug-Ins/VST3`
+/// - Windows : `%USERPROFILE%\.vst3` + `%ProgramFiles%\Common Files\VST3` +
+///   `%ProgramFiles(x86)%\Common Files\VST3`
+/// (les installeurs officiels — Surge XT .dmg/.exe — déposent les plugins
+/// dans les dossiers standards de la plateforme, pas dans ~/.vst3).
+pub fn vst3_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+    if !home.is_empty() {
+        dirs.push(std::path::PathBuf::from(&home).join(".vst3"));
     }
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Err(format!("Dossier VST3 introuvable : {}", dir.display()));
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-        if p.extension().map(|x| x.eq_ignore_ascii_case("vst3")).unwrap_or(false)
-            && name.contains("surge")
-        {
-            return Ok(p.display().to_string());
+    match std::env::consts::OS {
+        "macos" => {
+            if !home.is_empty() {
+                dirs.push(std::path::PathBuf::from(&home).join("Library/Audio/Plug-Ins/VST3"));
+            }
+            dirs.push(std::path::PathBuf::from("/Library/Audio/Plug-Ins/VST3"));
+        }
+        "windows" => {
+            for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+                if let Ok(pf) = std::env::var(var) {
+                    dirs.push(std::path::PathBuf::from(pf).join("Common Files/VST3"));
+                }
+            }
+        }
+        _ => {}
+    }
+    dirs
+}
+
+/// Cherche le chemin du plugin Surge XT : `~/.vst3/Surge XT.vst3` d'abord,
+/// sinon premier .vst3 (dans tous les dossiers standards de la plateforme)
+/// dont le nom contient « surge ».
+pub fn find_surge_plugin() -> Result<String, String> {
+    for dir in vst3_search_dirs() {
+        let direct = dir.join("Surge XT.vst3");
+        if direct.exists() {
+            return Ok(direct.display().to_string());
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            if p.extension().map(|x| x.eq_ignore_ascii_case("vst3")).unwrap_or(false)
+                && name.contains("surge")
+            {
+                return Ok(p.display().to_string());
+            }
         }
     }
-    Err("Plugin Surge XT introuvable dans ~/.vst3 (installé ?)".into())
+    Err("Plugin Surge XT introuvable dans les dossiers VST3 standards (installé ?)".into())
 }
 
 /// Résout un preset : chemin direct existant, sinon recherche dans
