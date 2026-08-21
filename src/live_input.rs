@@ -383,9 +383,14 @@ pub fn start(shared: &Arc<LiveInputState>) {
             // d'autres et sont relâchés avant tout envoi (le ticker LFO et la
             // route /mpe prennent les mêmes verrous — un seul ordre global :
             // echo PUIS mpe — pas de deadlock possible).
+            // ⚠️ AUCUN unwrap() ici : ce callback tourne sur le thread MIDI IN
+            // (midir) — s'il panique, le thread meurt et le LivePiano se fige
+            // (l'état active n'est plus mis à jour) alors que le serveur HTTP
+            // continue de répondre. Un verrou empoisonné → on ignore le
+            // message et on survit.
             let (echo_cfg, mpe_state) = {
-                let cfg = shared2.echo.lock().unwrap();
-                let m = shared2.mpe.lock().unwrap();
+                let Ok(cfg) = shared2.echo.lock() else { return; };
+                let Ok(m) = shared2.mpe.lock() else { return; };
                 (*cfg, *m)
             };
             let route = monitor_output_target(&mpe_state, &echo_cfg);
@@ -405,9 +410,15 @@ pub fn start(shared: &Arc<LiveInputState>) {
             };
             let fluid = route == OutputTarget::Fluid;
             let sender_guard = if fluid {
-                shared2.fluid_sender.lock().unwrap()
+                match shared2.fluid_sender.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                }
             } else {
-                shared2.sender.lock().unwrap()
+                match shared2.sender.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                }
             };
             if let Some(sender) = sender_guard.as_ref() {
                 if let Some(m) = out {

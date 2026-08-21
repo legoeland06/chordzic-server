@@ -2836,8 +2836,12 @@ async fn mpe(State(s): State<AppState>, Json(b): Json<MpeReq>) -> impl IntoRespo
 /// GET /mpe-state — état courant de la modal MPE + notes tenues + canal
 /// cible résolu + session Rec active (affichage temps réel de la modal).
 async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
-    let mpe = *s.live_input.mpe.lock().unwrap();
+    // Ordre des verrous UNIFORME : echo PUIS mpe (même ordre que le callback
+    // MIDI IN et le ticker LFO — sinon deadlock : le callback tient echo et
+    // attend mpe pendant que cette route tient mpe et attend echo → le
+    // LivePiano se fige (thread MIDI IN bloqué) avec le backend toujours OK).
     let echo = *s.live_input.echo.lock().unwrap();
+    let mpe = *s.live_input.mpe.lock().unwrap();
     let ch = live_input::resolve_mpe_channel(&mpe, &echo);
     let route = live_input::monitor_output_target(&mpe, &echo);
     let active = s.live_input.active.lock().unwrap().clone();
@@ -2882,9 +2886,10 @@ async fn mpe_state(State(s): State<AppState>) -> impl IntoResponse {
 async fn mpe_reset(State(s): State<AppState>) -> impl IntoResponse {
     let ch;
     {
+        // Ordre des verrous UNIFORME : echo PUIS mpe (deadlock sinon, cf. mpe_state).
+        let e = s.live_input.echo.lock().unwrap();
         let mut m = s.live_input.mpe.lock().unwrap();
         m.reset();
-        let e = s.live_input.echo.lock().unwrap();
         ch = live_input::resolve_mpe_channel(&m, &e);
     }
     for msg in mpe::expression_messages(ch, mpe::BEND_CENTER, 0, mpe::TIMBRE_CENTER, None) {
